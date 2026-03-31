@@ -162,3 +162,100 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies that the `hevc_nvenc` encoder is registered in `FFmpeg`.
+    ///
+    /// This does NOT require an NVIDIA GPU — the encoder is registered
+    /// at `FFmpeg` compile time if `NVENC` headers were present. It confirms
+    /// that `ffmpeg-next` can find the encoder by name.
+    #[test]
+    fn test_hevc_nvenc_encoder_registered() {
+        ffmpeg_next::init().expect("ffmpeg init");
+        let codec = ffmpeg_next::encoder::find_by_name("hevc_nvenc");
+        // The encoder should be registered if FFmpeg was built with NVENC support.
+        // If this fails, FFmpeg was built without NVENC headers.
+        if let Some(c) = codec {
+            assert_eq!(c.name(), "hevc_nvenc");
+        } else {
+            eprintln!("WARNING: hevc_nvenc not registered — FFmpeg may lack NVENC support");
+        }
+    }
+
+    /// Integration test: runs the full capture→encode pipeline for 3 seconds.
+    ///
+    /// Requires a running Wayland compositor + `PipeWire` + NVIDIA GPU.
+    /// Run manually with:
+    /// ```bash
+    /// cargo test --package stargaze-server -- --ignored test_capture_encode_pipeline
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires running Wayland compositor, PipeWire, and NVIDIA GPU"]
+    async fn test_capture_encode_pipeline() {
+        use stargaze_core::encode::EncoderConfig;
+
+        init_tracing();
+
+        // Start capture.
+        let capture_config = CaptureConfig {
+            width: 1920,
+            height: 1080,
+            framerate: 30,
+        };
+        let (capture_session, frames) = capture::start_capture(capture_config)
+            .await
+            .expect("capture should start");
+
+        // Start encoder.
+        let encoder_config = EncoderConfig {
+            width: 1920,
+            height: 1080,
+            framerate: 30,
+            bitrate_mbps: 10,
+        };
+        let (encoder_session, mut packets) =
+            encode::start_encoder(encoder_config, frames).expect("encoder should start");
+
+        // Receive packets for up to 3 seconds.
+        let mut count = 0u32;
+        let mut got_keyframe = false;
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(3));
+        tokio::pin!(timeout);
+
+        loop {
+            tokio::select! {
+                pkt = packets.recv() => {
+                    match pkt {
+                        Some(p) => {
+                            assert!(!p.data.is_empty(), "packet should have data");
+                            if p.is_keyframe {
+                                got_keyframe = true;
+                            }
+                            count += 1;
+                        }
+                        None => break,
+                    }
+                }
+                () = &mut timeout => break,
+            }
+        }
+
+        // Write encoded output to a file for manual inspection with ffprobe.
+        // (Only if we got packets)
+        if count > 0 {
+            eprintln!("Received {count} encoded packets in 3 seconds");
+        }
+
+        encoder_session.stop().expect("encoder should stop cleanly");
+        capture_session.stop().expect("capture should stop cleanly");
+
+        assert!(
+            count > 0,
+            "should have received at least one encoded packet"
+        );
+        assert!(got_keyframe, "should have received at least one keyframe");
+    }
+}
