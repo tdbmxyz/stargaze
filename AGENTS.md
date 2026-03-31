@@ -49,7 +49,7 @@ This file provides guidance to LLM Code Assistants when working with code in thi
 - **Server** — captures screen and audio on the host machine, encodes them, and streams to the client over the network.
 - **Client** — receives and decodes video/audio streams, renders them locally, and forwards keyboard, mouse, and controller input back to the server.
 
-The project is inspired by the [Sunshine](https://github.com/LizardByte/Sunshine) (server) + [Moonlight](https://github.com/moonlight-stream/moonlight-qt) (client) ecosystem, reimplemented in Rust. It follows [rsonance](https://github.com/algora-io/rsonance)'s approach of a simple two-binary architecture rather than Sunshine/Moonlight's complex multi-protocol stack.
+The project is inspired by the [Sunshine](https://github.com/LizardByte/Sunshine) (server) + [Moonlight](https://github.com/moonlight-stream/moonlight-qt) (client) ecosystem, reimplemented in Rust. It follows [rsonance](https://github.com/tdbmxyz/rsonance)'s approach of a simple two-binary architecture rather than Sunshine/Moonlight's complex multi-protocol stack.
 
 The goal is **not** to be feature-complete with Sunshine+Moonlight. The MVP targets a single specific use case (see below).
 

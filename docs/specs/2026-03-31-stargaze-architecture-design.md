@@ -2,7 +2,7 @@
 
 ## Overview
 
-**Stargaze** is a Rust-native low-latency desktop/game streaming system consisting of two binaries (server and client) that share a common library crate. It reimplements the functionality of [Sunshine](https://github.com/LizardByte/Sunshine) (server) + [Moonlight](https://github.com/moonlight-stream/moonlight-qt) (client) in Rust, following [rsonance](https://github.com/algora-io/rsonance)'s approach of a simple two-binary architecture.
+**Stargaze** is a Rust-native low-latency desktop/game streaming system consisting of two binaries (server and client) that share a common library crate. It reimplements the functionality of [Sunshine](https://github.com/LizardByte/Sunshine) (server) + [Moonlight](https://github.com/moonlight-stream/moonlight-qt) (client) in Rust, following [rsonance](https://github.com/tdbmxyz/rsonance)'s approach of a simple two-binary architecture.
 
 The goal is **not** feature-completeness with Sunshine+Moonlight. The MVP targets a single environment: streaming from a Linux Wayland (Hyprland) headless server with an NVIDIA GPU to a Linux Wayland (Hyprland) laptop with an AMD CPU and no discrete GPU, over LAN.
 
@@ -162,6 +162,8 @@ stargaze-client [OPTIONS]
 
 ### Success Criteria
 
+#### Scaffolding (Sub-project 1)
+
 - `cargo build` succeeds for the whole workspace
 - `cargo test` passes
 - `stargaze-server --help` and `stargaze-client --help` print usage
@@ -170,3 +172,10 @@ stargaze-client [OPTIONS]
 - Config loading from TOML works, CLI overrides work
 - `cargo clippy -W clippy::pedantic` is clean
 - `cargo fmt` is clean
+
+#### End-to-End MVP (all sub-projects complete)
+
+- Client connects to the server and opens a streaming window displaying the server's screen in real time
+- Keyboard, mouse, and gamepad input from the client controls the server
+- Audio from the server is played back on the client
+- The full pipeline runs at low latency over LAN
