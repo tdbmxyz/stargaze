@@ -89,6 +89,7 @@ dependencies = [
  "getrandom 0.4.2",
  "pipewire",
  "serde",
+ "serde_repr",
  "tokio",
  "zbus",
 ]

@@ -3,6 +3,8 @@ use stargaze_core::config::{self, Codec, Resolution, ServerConfig};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod capture;
+
 /// Stargaze streaming server — captures screen and audio, encodes, and streams to clients.
 #[derive(Parser, Debug)]
 #[command(name = "stargaze-server", version, about)]
