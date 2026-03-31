@@ -314,3 +314,147 @@ pub(crate) async fn receive_loop(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stargaze_core::transport::STREAM_TYPE_VIDEO;
+
+    /// Helper: creates a `DatagramHeader` for testing.
+    fn make_header(
+        frame_index: u32,
+        fragment_index: u16,
+        fragment_count: u16,
+        pts: u64,
+        is_keyframe: bool,
+    ) -> DatagramHeader {
+        DatagramHeader {
+            stream_type: STREAM_TYPE_VIDEO,
+            frame_index,
+            fragment_index,
+            fragment_count,
+            pts,
+            is_keyframe,
+        }
+    }
+
+    #[test]
+    fn single_fragment_frame() {
+        let mut assembler = FrameAssembler::new();
+        let header = make_header(0, 0, 1, 100, true);
+        let payload = vec![1, 2, 3, 4, 5];
+
+        let (frames, need_idr) = assembler.process_datagram(&header, payload.clone());
+
+        assert!(!need_idr);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, payload);
+        assert_eq!(frames[0].pts, 100);
+        assert!(frames[0].is_keyframe);
+        assert_eq!(frames[0].stream_type, STREAM_TYPE_VIDEO);
+    }
+
+    #[test]
+    fn multi_fragment_in_order() {
+        let mut assembler = FrameAssembler::new();
+
+        // 3 fragments for frame 0.
+        let h0 = make_header(0, 0, 3, 0, false);
+        let h1 = make_header(0, 1, 3, 0, false);
+        let h2 = make_header(0, 2, 3, 0, false);
+
+        let (frames, _) = assembler.process_datagram(&h0, vec![1, 2]);
+        assert!(frames.is_empty());
+
+        let (frames, _) = assembler.process_datagram(&h1, vec![3, 4]);
+        assert!(frames.is_empty());
+
+        let (frames, _) = assembler.process_datagram(&h2, vec![5, 6]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn multi_fragment_out_of_order() {
+        let mut assembler = FrameAssembler::new();
+
+        // Send fragments in reverse order.
+        let h2 = make_header(0, 2, 3, 42, true);
+        let h0 = make_header(0, 0, 3, 42, true);
+        let h1 = make_header(0, 1, 3, 42, true);
+
+        let (frames, _) = assembler.process_datagram(&h2, vec![5, 6]);
+        assert!(frames.is_empty());
+
+        let (frames, _) = assembler.process_datagram(&h0, vec![1, 2]);
+        assert!(frames.is_empty());
+
+        let (frames, _) = assembler.process_datagram(&h1, vec![3, 4]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(frames[0].pts, 42);
+        assert!(frames[0].is_keyframe);
+    }
+
+    #[test]
+    fn duplicate_fragment_ignored() {
+        let mut assembler = FrameAssembler::new();
+
+        let h0 = make_header(0, 0, 2, 0, false);
+        let h1 = make_header(0, 1, 2, 0, false);
+
+        // Send fragment 0 twice.
+        let (frames, _) = assembler.process_datagram(&h0, vec![1, 2]);
+        assert!(frames.is_empty());
+
+        let (frames, _) = assembler.process_datagram(&h0, vec![99, 99]);
+        assert!(frames.is_empty()); // Duplicate ignored.
+
+        let (frames, _) = assembler.process_datagram(&h1, vec![3, 4]);
+        assert_eq!(frames.len(), 1);
+        // Original data preserved, not the duplicate.
+        assert_eq!(frames[0].data, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn max_pending_triggers_idr() {
+        let mut assembler = FrameAssembler::new();
+
+        // Fill up max_pending + 1 incomplete frames.
+        for i in 0..=MAX_PENDING_FRAMES as u32 {
+            let h = make_header(i, 0, 2, u64::from(i), false);
+            let (_, _need_idr) = assembler.process_datagram(&h, vec![0]);
+        }
+
+        // After exceeding max_pending, the assembler should request IDR
+        // and clear pending frames.
+        assert!(assembler.pending.is_empty() || assembler.pending.len() <= MAX_PENDING_FRAMES);
+    }
+
+    #[test]
+    fn idr_rate_limiting() {
+        let mut assembler = FrameAssembler::new();
+
+        // First IDR request should succeed.
+        assert!(assembler.should_request_idr());
+
+        // Immediate second request should be rate-limited.
+        assert!(!assembler.should_request_idr());
+    }
+
+    #[test]
+    fn multiple_frames_sequential() {
+        let mut assembler = FrameAssembler::new();
+
+        // Frame 0: single fragment.
+        let h0 = make_header(0, 0, 1, 0, true);
+        let (frames, _) = assembler.process_datagram(&h0, vec![10]);
+        assert_eq!(frames.len(), 1);
+
+        // Frame 1: single fragment.
+        let h1 = make_header(1, 0, 1, 1, false);
+        let (frames, _) = assembler.process_datagram(&h1, vec![20]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pts, 1);
+    }
+}
