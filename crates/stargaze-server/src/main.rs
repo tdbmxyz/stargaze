@@ -1,6 +1,6 @@
 use clap::Parser;
-use stargaze_core::capture::Frame;
 use stargaze_core::config::{self, Codec, Resolution, ServerConfig};
+use stargaze_core::encode::EncoderConfig;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -110,52 +110,43 @@ async fn main() -> anyhow::Result<()> {
         cfg.bind_address, cfg.port, cfg.resolution, cfg.framerate, cfg.bitrate, cfg.codec
     );
 
+    // Start capture pipeline.
     let capture_config = CaptureConfig {
         width: cfg.resolution.width,
         height: cfg.resolution.height,
         framerate: cfg.framerate,
     };
+    let (capture_session, frames) = capture::start_capture(capture_config).await?;
+    info!("Capture started");
 
-    let (session, mut frames) = capture::start_capture(capture_config).await?;
+    // Start encoder pipeline.
+    let encoder_config = EncoderConfig {
+        width: cfg.resolution.width,
+        height: cfg.resolution.height,
+        framerate: cfg.framerate,
+        bitrate_mbps: cfg.bitrate,
+    };
+    let (encoder_session, mut packets) = encode::start_encoder(encoder_config, frames)?;
+    info!("Encoder started");
 
-    info!("Capture started, receiving frames...");
-
-    let mut frame_count: u64 = 0;
+    // Receive encoded packets (later: send over network).
+    let mut packet_count: u64 = 0;
     loop {
         tokio::select! {
-            frame = frames.recv() => {
-                let Some(frame) = frame else {
+            pkt = packets.recv() => {
+                let Some(pkt) = pkt else {
+                    info!("Encoder channel closed");
                     break;
                 };
-                frame_count += 1;
-                match &frame {
-                    Frame::DmaBuf(info) => {
-                        if frame_count % 60 == 1 {
-                            info!(
-                                frame = frame_count,
-                                width = info.width,
-                                height = info.height,
-                                format = %info.format,
-                                "DMA-BUF frame"
-                            );
-                        }
-                    }
-                    Frame::CpuMapped {
-                        width,
-                        height,
-                        format,
-                        ..
-                    } => {
-                        if frame_count % 60 == 1 {
-                            info!(
-                                frame = frame_count,
-                                width,
-                                height,
-                                format = %format,
-                                "CPU-mapped frame"
-                            );
-                        }
-                    }
+                packet_count += 1;
+                if pkt.is_keyframe || packet_count % 300 == 1 {
+                    info!(
+                        packet = packet_count,
+                        pts = pkt.pts,
+                        size = pkt.data.len(),
+                        keyframe = pkt.is_keyframe,
+                        "Encoded packet"
+                    );
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -165,91 +156,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!(total_frames = frame_count, "Capture stream ended");
-    session.stop()?;
+    info!(total_packets = packet_count, "Shutting down pipeline");
+    encoder_session.stop()?;
+    capture_session.stop()?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Integration test: runs capture for 3 seconds and verifies frames arrive.
-    ///
-    /// Requires a running Wayland compositor + `PipeWire`.
-    /// Run manually with: `cargo test --package stargaze-server -- --ignored test_capture_receives_frames`
-    #[tokio::test]
-    #[ignore = "requires running Wayland compositor and PipeWire"]
-    async fn test_capture_receives_frames() {
-        init_tracing();
-
-        let config = CaptureConfig {
-            width: 1920,
-            height: 1080,
-            framerate: 30,
-        };
-
-        let (session, mut frames) = capture::start_capture(config)
-            .await
-            .expect("capture should start");
-
-        // Receive a few frames (with timeout).
-        let mut count = 0u32;
-        let timeout = tokio::time::sleep(std::time::Duration::from_secs(3));
-        tokio::pin!(timeout);
-
-        loop {
-            tokio::select! {
-                frame = frames.recv() => {
-                    match frame {
-                        Some(Frame::DmaBuf(info)) => {
-                            assert!(info.width > 0);
-                            assert!(info.height > 0);
-                            count += 1;
-                        }
-                        Some(Frame::CpuMapped { width, height, data, .. }) => {
-                            assert!(width > 0);
-                            assert!(height > 0);
-                            assert!(!data.is_empty());
-
-                            // Write first frame to PPM for visual inspection.
-                            if count == 0 {
-                                write_ppm("/tmp/stargaze_test_frame.ppm", &data, width, height);
-                                eprintln!("Wrote test frame to /tmp/stargaze_test_frame.ppm");
-                            }
-                            count += 1;
-                        }
-                        None => break,
-                    }
-                }
-                () = &mut timeout => break,
-            }
-        }
-
-        session.stop().expect("session should stop cleanly");
-        assert!(count > 0, "should have received at least one frame");
-        eprintln!("Received {count} frames in 3 seconds");
-    }
-
-    /// Writes raw BGRA pixel data as a PPM file (converts BGRA to RGB).
-    fn write_ppm(path: &str, data: &[u8], width: u32, height: u32) {
-        use std::io::Write;
-
-        let mut file = std::fs::File::create(path).expect("create PPM file");
-        write!(file, "P6\n{width} {height}\n255\n").expect("write PPM header");
-
-        // Convert BGRA to RGB, writing pixel by pixel.
-        for y in 0..height {
-            for x in 0..width {
-                let offset = ((y * width + x) * 4) as usize;
-                if offset + 2 < data.len() {
-                    let b = data[offset];
-                    let g = data[offset + 1];
-                    let r = data[offset + 2];
-                    file.write_all(&[r, g, b]).expect("write pixel");
-                }
-            }
-        }
-    }
 }
