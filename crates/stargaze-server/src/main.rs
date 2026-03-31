@@ -120,35 +120,46 @@ async fn main() -> anyhow::Result<()> {
     info!("Capture started, receiving frames...");
 
     let mut frame_count: u64 = 0;
-    while let Some(frame) = frames.recv().await {
-        frame_count += 1;
-        match &frame {
-            Frame::DmaBuf(info) => {
-                if frame_count % 60 == 1 {
-                    info!(
-                        frame = frame_count,
-                        width = info.width,
-                        height = info.height,
-                        format = %info.format,
-                        "DMA-BUF frame"
-                    );
-                }
-            }
-            Frame::CpuMapped {
-                width,
-                height,
-                format,
-                ..
-            } => {
-                if frame_count % 60 == 1 {
-                    info!(
-                        frame = frame_count,
+    loop {
+        tokio::select! {
+            frame = frames.recv() => {
+                let Some(frame) = frame else {
+                    break;
+                };
+                frame_count += 1;
+                match &frame {
+                    Frame::DmaBuf(info) => {
+                        if frame_count % 60 == 1 {
+                            info!(
+                                frame = frame_count,
+                                width = info.width,
+                                height = info.height,
+                                format = %info.format,
+                                "DMA-BUF frame"
+                            );
+                        }
+                    }
+                    Frame::CpuMapped {
                         width,
                         height,
-                        format = %format,
-                        "CPU-mapped frame"
-                    );
+                        format,
+                        ..
+                    } => {
+                        if frame_count % 60 == 1 {
+                            info!(
+                                frame = frame_count,
+                                width,
+                                height,
+                                format = %format,
+                                "CPU-mapped frame"
+                            );
+                        }
+                    }
                 }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT, shutting down gracefully");
+                break;
             }
         }
     }
