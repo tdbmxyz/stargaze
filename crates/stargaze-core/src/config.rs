@@ -1,1 +1,340 @@
+use std::fmt;
+use std::path::PathBuf;
+use std::str::FromStr;
 
+use directories::ProjectDirs;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::error::ConfigError;
+
+/// Default port for stargaze server/client communication.
+pub const DEFAULT_PORT: u16 = 9000;
+
+// --- Codec ---
+
+/// Supported video codecs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Codec {
+    /// H.265 / HEVC codec.
+    #[default]
+    H265,
+    /// AV1 codec.
+    Av1,
+}
+
+impl fmt::Display for Codec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::H265 => write!(f, "h265"),
+            Self::Av1 => write!(f, "av1"),
+        }
+    }
+}
+
+impl FromStr for Codec {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "h265" => Ok(Self::H265),
+            "av1" => Ok(Self::Av1),
+            other => Err(ConfigError::InvalidCodec(other.to_string())),
+        }
+    }
+}
+
+// --- Resolution ---
+
+/// Display resolution (width x height).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolution {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+impl Default for Resolution {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+        }
+    }
+}
+
+impl fmt::Display for Resolution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}x{}", self.width, self.height)
+    }
+}
+
+impl FromStr for Resolution {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('x').collect();
+        if parts.len() != 2 {
+            return Err(ConfigError::InvalidResolution(s.to_string()));
+        }
+        let width = parts[0]
+            .parse::<u32>()
+            .map_err(|_| ConfigError::InvalidResolution(s.to_string()))?;
+        let height = parts[1]
+            .parse::<u32>()
+            .map_err(|_| ConfigError::InvalidResolution(s.to_string()))?;
+        Ok(Self { width, height })
+    }
+}
+
+// --- ServerConfig ---
+
+/// Configuration for the stargaze server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    /// Address to bind the server to.
+    pub bind_address: String,
+    /// Port to listen on.
+    pub port: u16,
+    /// Capture/stream resolution.
+    pub resolution: Resolution,
+    /// Target framerate.
+    pub framerate: u32,
+    /// Target bitrate in Mbps.
+    pub bitrate: u32,
+    /// Video codec to use.
+    pub codec: Codec,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_address: "0.0.0.0".to_string(),
+            port: DEFAULT_PORT,
+            resolution: Resolution::default(),
+            framerate: 60,
+            bitrate: 20,
+            codec: Codec::default(),
+        }
+    }
+}
+
+// --- ClientConfig ---
+
+/// Configuration for the stargaze client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClientConfig {
+    /// Address of the server to connect to.
+    pub server_address: String,
+    /// Port to connect on.
+    pub port: u16,
+    /// Whether to start in fullscreen mode.
+    pub fullscreen: bool,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            server_address: String::new(),
+            port: DEFAULT_PORT,
+            fullscreen: true,
+        }
+    }
+}
+
+// --- Helper functions ---
+
+/// Returns the path to a config file for the given component name.
+///
+/// The file is located in the system config directory under `stargaze/`,
+/// e.g. `~/.config/stargaze/server.toml` on Linux.
+///
+/// # Panics
+///
+/// Panics if the system has no valid home directory.
+#[must_use]
+pub fn config_file_path(name: &str) -> PathBuf {
+    let proj_dirs =
+        ProjectDirs::from("", "", "stargaze").expect("could not determine config directory");
+    proj_dirs.config_dir().join(format!("{name}.toml"))
+}
+
+/// Loads a configuration from a TOML file.
+///
+/// If `path` is `Some`, loads from that path. If `None`, uses the default
+/// config file path for the type. If the file does not exist, returns the
+/// default configuration.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::ReadError`] if the file exists but cannot be read,
+/// or [`ConfigError::ParseError`] if the file contents are invalid TOML.
+pub fn load_config<T>(path: Option<&str>) -> Result<T, ConfigError>
+where
+    T: Default + DeserializeOwned,
+{
+    let path_str = match path {
+        Some(p) => p.to_string(),
+        None => return Ok(T::default()),
+    };
+
+    let contents = match std::fs::read_to_string(&path_str) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(e) => {
+            return Err(ConfigError::ReadError {
+                path: path_str,
+                reason: e.to_string(),
+            });
+        }
+    };
+
+    toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
+        path: path_str,
+        reason: e.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_config_defaults() {
+        let config = ServerConfig::default();
+        assert_eq!(config.bind_address, "0.0.0.0");
+        assert_eq!(config.port, 9000);
+        assert_eq!(
+            config.resolution,
+            Resolution {
+                width: 1920,
+                height: 1080
+            }
+        );
+        assert_eq!(config.framerate, 60);
+        assert_eq!(config.bitrate, 20);
+        assert_eq!(config.codec, Codec::H265);
+    }
+
+    #[test]
+    fn test_client_config_defaults() {
+        let config = ClientConfig::default();
+        assert_eq!(config.server_address, "");
+        assert_eq!(config.port, 9000);
+        assert!(config.fullscreen);
+    }
+
+    #[test]
+    fn test_server_config_from_toml() {
+        let toml_str = r#"
+            bind_address = "192.168.1.1"
+            port = 8080
+            framerate = 30
+            bitrate = 50
+            codec = "av1"
+
+            [resolution]
+            width = 2560
+            height = 1440
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.bind_address, "192.168.1.1");
+        assert_eq!(config.port, 8080);
+        assert_eq!(
+            config.resolution,
+            Resolution {
+                width: 2560,
+                height: 1440
+            }
+        );
+        assert_eq!(config.framerate, 30);
+        assert_eq!(config.bitrate, 50);
+        assert_eq!(config.codec, Codec::Av1);
+    }
+
+    #[test]
+    fn test_client_config_from_toml() {
+        let toml_str = r#"
+            server_address = "10.0.0.5"
+            port = 7000
+            fullscreen = false
+        "#;
+        let config: ClientConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server_address, "10.0.0.5");
+        assert_eq!(config.port, 7000);
+        assert!(!config.fullscreen);
+    }
+
+    #[test]
+    fn test_server_config_partial_toml_uses_defaults() {
+        let toml_str = r#"
+            port = 3000
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.bind_address, "0.0.0.0");
+        assert_eq!(config.port, 3000);
+        assert_eq!(config.framerate, 60);
+    }
+
+    #[test]
+    fn test_resolution_display() {
+        let res = Resolution {
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(res.to_string(), "1920x1080");
+    }
+
+    #[test]
+    fn test_resolution_from_str() {
+        let res: Resolution = "2560x1440".parse().unwrap();
+        assert_eq!(
+            res,
+            Resolution {
+                width: 2560,
+                height: 1440
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolution_from_str_invalid() {
+        assert!("not_a_resolution".parse::<Resolution>().is_err());
+        assert!("1920".parse::<Resolution>().is_err());
+        assert!("1920xabc".parse::<Resolution>().is_err());
+    }
+
+    #[test]
+    fn test_codec_display() {
+        assert_eq!(Codec::H265.to_string(), "h265");
+        assert_eq!(Codec::Av1.to_string(), "av1");
+    }
+
+    #[test]
+    fn test_codec_from_str() {
+        assert_eq!("h265".parse::<Codec>().unwrap(), Codec::H265);
+        assert_eq!("av1".parse::<Codec>().unwrap(), Codec::Av1);
+        assert!("vp9".parse::<Codec>().is_err());
+    }
+
+    #[test]
+    fn test_config_file_path_server() {
+        let path = config_file_path("server");
+        let path_str = path.to_string_lossy();
+        assert!(
+            path_str.ends_with("stargaze/server.toml")
+                || path_str.ends_with("stargaze\\server.toml")
+        );
+    }
+
+    #[test]
+    fn test_load_config_missing_file() {
+        let config: ServerConfig =
+            load_config(Some("/tmp/nonexistent_stargaze_test.toml")).unwrap();
+        assert_eq!(config, ServerConfig::default());
+    }
+}
