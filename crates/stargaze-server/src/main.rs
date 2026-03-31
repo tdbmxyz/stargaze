@@ -6,6 +6,7 @@ use tracing_subscriber::EnvFilter;
 
 mod capture;
 mod encode;
+mod transport;
 
 use capture::CaptureConfig;
 
