@@ -158,3 +158,86 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Integration test: runs capture for 3 seconds and verifies frames arrive.
+    ///
+    /// Requires a running Wayland compositor + `PipeWire`.
+    /// Run manually with: `cargo test --package stargaze-server -- --ignored test_capture_receives_frames`
+    #[tokio::test]
+    #[ignore = "requires running Wayland compositor and PipeWire"]
+    async fn test_capture_receives_frames() {
+        init_tracing();
+
+        let config = CaptureConfig {
+            width: 1920,
+            height: 1080,
+            framerate: 30,
+        };
+
+        let (session, mut frames) = capture::start_capture(config)
+            .await
+            .expect("capture should start");
+
+        // Receive a few frames (with timeout).
+        let mut count = 0u32;
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(3));
+        tokio::pin!(timeout);
+
+        loop {
+            tokio::select! {
+                frame = frames.recv() => {
+                    match frame {
+                        Some(Frame::DmaBuf(info)) => {
+                            assert!(info.width > 0);
+                            assert!(info.height > 0);
+                            count += 1;
+                        }
+                        Some(Frame::CpuMapped { width, height, data, .. }) => {
+                            assert!(width > 0);
+                            assert!(height > 0);
+                            assert!(!data.is_empty());
+
+                            // Write first frame to PPM for visual inspection.
+                            if count == 0 {
+                                write_ppm("/tmp/stargaze_test_frame.ppm", &data, width, height);
+                                eprintln!("Wrote test frame to /tmp/stargaze_test_frame.ppm");
+                            }
+                            count += 1;
+                        }
+                        None => break,
+                    }
+                }
+                () = &mut timeout => break,
+            }
+        }
+
+        session.stop().expect("session should stop cleanly");
+        assert!(count > 0, "should have received at least one frame");
+        eprintln!("Received {count} frames in 3 seconds");
+    }
+
+    /// Writes raw BGRA pixel data as a PPM file (converts BGRA to RGB).
+    fn write_ppm(path: &str, data: &[u8], width: u32, height: u32) {
+        use std::io::Write;
+
+        let mut file = std::fs::File::create(path).expect("create PPM file");
+        write!(file, "P6\n{width} {height}\n255\n").expect("write PPM header");
+
+        // Convert BGRA to RGB, writing pixel by pixel.
+        for y in 0..height {
+            for x in 0..width {
+                let offset = ((y * width + x) * 4) as usize;
+                if offset + 2 < data.len() {
+                    let b = data[offset];
+                    let g = data[offset + 1];
+                    let r = data[offset + 2];
+                    file.write_all(&[r, g, b]).expect("write pixel");
+                }
+            }
+        }
+    }
+}
