@@ -4,6 +4,8 @@ use stargaze_core::config::{self, ClientConfig};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+pub mod transport;
+
 /// Stargaze streaming client — connects to a server, decodes video/audio, and forwards input.
 #[derive(Parser, Debug)]
 #[command(name = "stargaze-client", version, about)]
