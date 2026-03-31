@@ -1,9 +1,12 @@
 use clap::Parser;
+use stargaze_core::capture::Frame;
 use stargaze_core::config::{self, Codec, Resolution, ServerConfig};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 mod capture;
+
+use capture::CaptureConfig;
 
 /// Stargaze streaming server — captures screen and audio, encodes, and streams to clients.
 #[derive(Parser, Debug)]
@@ -105,6 +108,53 @@ async fn main() -> anyhow::Result<()> {
         "Starting stargaze server on {}:{} ({}@{}fps, {} Mbps, {})",
         cfg.bind_address, cfg.port, cfg.resolution, cfg.framerate, cfg.bitrate, cfg.codec
     );
+
+    let capture_config = CaptureConfig {
+        width: cfg.resolution.width,
+        height: cfg.resolution.height,
+        framerate: cfg.framerate,
+    };
+
+    let (session, mut frames) = capture::start_capture(capture_config).await?;
+
+    info!("Capture started, receiving frames...");
+
+    let mut frame_count: u64 = 0;
+    while let Some(frame) = frames.recv().await {
+        frame_count += 1;
+        match &frame {
+            Frame::DmaBuf(info) => {
+                if frame_count % 60 == 1 {
+                    info!(
+                        frame = frame_count,
+                        width = info.width,
+                        height = info.height,
+                        format = %info.format,
+                        "DMA-BUF frame"
+                    );
+                }
+            }
+            Frame::CpuMapped {
+                width,
+                height,
+                format,
+                ..
+            } => {
+                if frame_count % 60 == 1 {
+                    info!(
+                        frame = frame_count,
+                        width,
+                        height,
+                        format = %format,
+                        "CPU-mapped frame"
+                    );
+                }
+            }
+        }
+    }
+
+    info!(total_frames = frame_count, "Capture stream ended");
+    session.stop()?;
 
     Ok(())
 }
