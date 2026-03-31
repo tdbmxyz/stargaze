@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
         framerate: cfg.framerate,
         bitrate_mbps: cfg.bitrate,
     };
-    let (encoder_session, mut packets) = encode::start_encoder(encoder_config, frames)?;
+    let (encoder_session, mut packets, _idr_tx) = encode::start_encoder(encoder_config, frames)?;
     info!("Encoder started");
 
     // Receive encoded packets (later: send over network).
@@ -217,7 +217,7 @@ mod tests {
             framerate: 30,
             bitrate_mbps: 10,
         };
-        let (encoder_session, mut packets) =
+        let (encoder_session, mut packets, _idr_tx) =
             encode::start_encoder(encoder_config, frames).expect("encoder should start");
 
         // Receive packets for up to 3 seconds.

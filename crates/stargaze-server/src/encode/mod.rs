@@ -12,7 +12,7 @@ use std::thread;
 
 use stargaze_core::capture::Frame;
 use stargaze_core::encode::{EncodeError, EncodedPacket, EncoderConfig};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
 /// Channel capacity for encoded packet delivery.
@@ -73,8 +73,14 @@ impl Drop for EncoderSession {
 
 /// Starts the video encoder.
 ///
-/// Takes ownership of the frame receiver from capture and returns
-/// an encoder session handle plus a channel receiver for encoded packets.
+/// Takes ownership of the frame receiver from capture and returns a
+/// 3-tuple: an encoder session handle, a channel receiver for encoded
+/// packets, and a `watch::Sender<u64>` for IDR keyframe requests.
+///
+/// To request an IDR keyframe (e.g., after the client detects packet
+/// loss), increment the value sent through the `watch::Sender`. The
+/// encoder checks the watch channel before each frame and forces a
+/// keyframe whenever the value changes.
 ///
 /// `FFmpeg` initialization (CUDA device, NVENC codec) happens on the
 /// spawned thread. If initialization fails, the error is sent back
@@ -87,10 +93,18 @@ impl Drop for EncoderSession {
 pub fn start_encoder(
     config: EncoderConfig,
     frames: mpsc::Receiver<Frame>,
-) -> Result<(EncoderSession, mpsc::Receiver<EncodedPacket>), EncodeError> {
+) -> Result<
+    (
+        EncoderSession,
+        mpsc::Receiver<EncodedPacket>,
+        watch::Sender<u64>,
+    ),
+    EncodeError,
+> {
     let (packets_tx, packets_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
+    let (idr_tx, idr_rx) = watch::channel(0u64);
 
     // Use a oneshot channel to report initialization errors back to the caller.
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), EncodeError>>();
@@ -114,9 +128,13 @@ pub fn start_encoder(
             let mut frames = frames;
 
             // Run the encode loop until shutdown or channel close.
-            if let Err(e) =
-                ffmpeg::run_encode_loop(&mut encoder, &mut frames, &packets_tx, &shutdown_clone)
-            {
+            if let Err(e) = ffmpeg::run_encode_loop(
+                &mut encoder,
+                &mut frames,
+                &packets_tx,
+                &shutdown_clone,
+                idr_rx,
+            ) {
                 error!("Encoder loop failed: {e}");
             }
 
@@ -140,5 +158,6 @@ pub fn start_encoder(
             shutdown,
         },
         packets_rx,
+        idr_tx,
     ))
 }

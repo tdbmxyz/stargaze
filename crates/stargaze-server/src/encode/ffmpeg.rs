@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use stargaze_core::capture::Frame;
 use stargaze_core::encode::{EncodeError, EncodedPacket, EncoderConfig};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, trace, warn};
 
 /// Opaque handle to initialized `FFmpeg` encoder state.
@@ -196,6 +196,10 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
 /// This function blocks until `shutdown` is signaled or the input channel closes.
 /// It is meant to run on a dedicated `std::thread`.
 ///
+/// The `idr_rx` watch channel is checked before each frame. When its value
+/// changes (incremented by the transport layer), the next frame is forced
+/// to be an IDR keyframe by setting `AV_PICTURE_TYPE_I`.
+///
 /// # Errors
 ///
 /// Returns `EncodeError` if a fatal encoding error occurs. Non-fatal errors
@@ -206,8 +210,10 @@ pub(crate) fn run_encode_loop(
     frames: &mut mpsc::Receiver<Frame>,
     packets_tx: &mpsc::Sender<EncodedPacket>,
     shutdown: &Arc<AtomicBool>,
+    mut idr_rx: watch::Receiver<u64>,
 ) -> Result<(), EncodeError> {
     let mut frame_counter: u64 = 0;
+    let mut last_idr_value: u64 = 0;
     let mut packet = ffmpeg_next::Packet::empty();
 
     loop {
@@ -223,8 +229,19 @@ pub(crate) fn run_encode_loop(
             break;
         };
 
+        // Check if an IDR keyframe was requested.
+        let current_idr = *idr_rx.borrow_and_update();
+        let force_idr = current_idr != last_idr_value;
+        if force_idr {
+            last_idr_value = current_idr;
+            debug!(
+                frame = frame_counter,
+                "Forcing IDR keyframe (requested by client)"
+            );
+        }
+
         // Upload frame to GPU and encode.
-        match upload_and_encode(encoder, &frame, frame_counter) {
+        match upload_and_encode(encoder, &frame, frame_counter, force_idr) {
             Ok(()) => {}
             Err(e) => {
                 warn!(frame = frame_counter, "Skipping frame: {e}");
@@ -254,6 +271,7 @@ fn upload_and_encode(
     encoder: &mut FfmpegEncoder,
     frame: &Frame,
     pts: u64,
+    force_idr: bool,
 ) -> Result<(), EncodeError> {
     let (data, width, height, stride) = match frame {
         Frame::CpuMapped {
@@ -264,7 +282,7 @@ fn upload_and_encode(
             ..
         } => (data.as_slice(), *width, *height, *stride),
         Frame::DmaBuf(info) => {
-            return upload_dmabuf_and_encode(encoder, info, pts);
+            return upload_dmabuf_and_encode(encoder, info, pts, force_idr);
         }
     };
 
@@ -310,6 +328,11 @@ fn upload_and_encode(
 
     // Set PTS and send to encoder.
     hw_frame.set_pts(Some(pts.cast_signed()));
+    if force_idr {
+        unsafe {
+            (*hw_frame.as_mut_ptr()).pict_type = ffmpeg_sys_next::AVPictureType::AV_PICTURE_TYPE_I;
+        }
+    }
     encoder
         .encoder
         .send_frame(&hw_frame)
@@ -326,6 +349,7 @@ fn upload_dmabuf_and_encode(
     encoder: &mut FfmpegEncoder,
     info: &stargaze_core::capture::DmaBufInfo,
     pts: u64,
+    force_idr: bool,
 ) -> Result<(), EncodeError> {
     use std::os::unix::io::AsRawFd;
 
@@ -400,6 +424,11 @@ fn upload_dmabuf_and_encode(
     }
 
     hw_frame.set_pts(Some(pts.cast_signed()));
+    if force_idr {
+        unsafe {
+            (*hw_frame.as_mut_ptr()).pict_type = ffmpeg_sys_next::AVPictureType::AV_PICTURE_TYPE_I;
+        }
+    }
     encoder
         .encoder
         .send_frame(&hw_frame)
