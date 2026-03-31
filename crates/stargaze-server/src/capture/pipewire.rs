@@ -33,6 +33,11 @@ struct CaptureCallbackData {
     height: u32,
     /// Negotiated pixel format (defaults to `Bgra8`).
     format: PixelFormat,
+    /// Negotiated DRM format modifier (e.g. tiling/compression layout).
+    ///
+    /// Extracted from `PipeWire` format negotiation. Critical for correct
+    /// interpretation of `DMA-BUF` frames by downstream consumers (e.g. NVENC).
+    modifier: u64,
 }
 
 /// Maps a SPA video format to our internal `PixelFormat`.
@@ -158,6 +163,7 @@ pub fn run_capture_stream(
         width: config.width,
         height: config.height,
         format: PixelFormat::Bgra8,
+        modifier: 0,
     };
 
     // We need a reference to the mainloop inside callbacks.
@@ -199,10 +205,13 @@ pub fn run_capture_stream(
                     data.format = pf;
                 }
 
+                data.modifier = video_info.modifier();
+
                 info!(
                     width = data.width,
                     height = data.height,
                     format = %data.format,
+                    modifier = data.modifier,
                     "PipeWire format negotiated"
                 );
             }
@@ -277,7 +286,7 @@ pub fn run_capture_stream(
                     width: data.width,
                     height: data.height,
                     format: data.format,
-                    modifier: 0, // Not available from chunk metadata.
+                    modifier: data.modifier,
                     stride,
                     offset: chunk_offset,
                 })
