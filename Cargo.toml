@@ -1,6 +1,11 @@
-[package]
-name = "stargaze"
+[workspace]
+members = [
+    "crates/stargaze-core",
+    "crates/stargaze-server",
+    "crates/stargaze-client",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
