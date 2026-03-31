@@ -1106,6 +1106,7 @@ name = "stargaze-core"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "libc",
  "serde",
  "thiserror",
  "toml 0.8.23",

@@ -139,4 +139,73 @@ mod tests {
         assert_eq!(PixelFormat::Rgba8.to_string(), "RGBA8");
         assert_eq!(PixelFormat::Nv12.to_string(), "NV12");
     }
+
+    #[test]
+    fn test_frame_cpu_mapped_construction() {
+        let data = vec![0u8; 1920 * 1080 * 4];
+        let frame = Frame::CpuMapped {
+            data,
+            width: 1920,
+            height: 1080,
+            stride: 1920 * 4,
+            format: PixelFormat::Bgra8,
+        };
+
+        match &frame {
+            Frame::CpuMapped {
+                width,
+                height,
+                stride,
+                format,
+                data,
+            } => {
+                assert_eq!(*width, 1920);
+                assert_eq!(*height, 1080);
+                assert_eq!(*stride, 1920 * 4);
+                assert_eq!(*format, PixelFormat::Bgra8);
+                assert_eq!(data.len(), 1920 * 1080 * 4);
+            }
+            Frame::DmaBuf(_) => panic!("expected CpuMapped variant"),
+        }
+    }
+
+    #[test]
+    fn test_frame_dmabuf_construction_with_memfd() {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::io::FromRawFd;
+
+        // Create a synthetic fd using memfd_create (no real DMA-BUF needed)
+        let name = std::ffi::CString::new("test-dmabuf").unwrap();
+        let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+        assert!(raw_fd >= 0, "memfd_create failed");
+
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        // Verify the fd is valid before wrapping
+        let raw = fd.as_raw_fd();
+        assert!(raw >= 0);
+
+        let frame = Frame::DmaBuf(DmaBufInfo {
+            fd,
+            width: 1920,
+            height: 1080,
+            format: PixelFormat::Bgra8,
+            modifier: 0,
+            stride: 1920 * 4,
+            offset: 0,
+        });
+
+        match &frame {
+            Frame::DmaBuf(info) => {
+                assert_eq!(info.width, 1920);
+                assert_eq!(info.height, 1080);
+                assert_eq!(info.format, PixelFormat::Bgra8);
+                assert_eq!(info.modifier, 0);
+                assert_eq!(info.stride, 1920 * 4);
+                assert_eq!(info.offset, 0);
+            }
+            Frame::CpuMapped { .. } => panic!("expected DmaBuf variant"),
+        }
+        // fd is closed when frame is dropped
+    }
 }
