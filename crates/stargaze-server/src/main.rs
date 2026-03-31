@@ -5,6 +5,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 mod capture;
+mod encode;
 
 use capture::CaptureConfig;
 
