@@ -31,9 +31,10 @@ impl ServerTransport {
             .map_err(|e| TransportError::ConnectionError(format!("transport task panicked: {e}")))
     }
 
-    /// Aborts the transport task.
-    pub fn abort(&self) {
-        self.task_handle.abort();
+    /// Returns an `AbortHandle` that can be used to abort the transport task
+    /// independently of the `ServerTransport` value.
+    pub fn abort_handle(&self) -> tokio::task::AbortHandle {
+        self.task_handle.abort_handle()
     }
 }
 

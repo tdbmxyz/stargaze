@@ -127,37 +127,29 @@ async fn main() -> anyhow::Result<()> {
         framerate: cfg.framerate,
         bitrate_mbps: cfg.bitrate,
     };
-    let (encoder_session, mut packets, _idr_tx) = encode::start_encoder(encoder_config, frames)?;
+    let (encoder_session, packets, idr_tx) = encode::start_encoder(encoder_config, frames)?;
     info!("Encoder started");
 
-    // Receive encoded packets (later: send over network).
-    let mut packet_count: u64 = 0;
-    loop {
-        tokio::select! {
-            pkt = packets.recv() => {
-                let Some(pkt) = pkt else {
-                    info!("Encoder channel closed");
-                    break;
-                };
-                packet_count += 1;
-                if pkt.is_keyframe || packet_count % 300 == 1 {
-                    info!(
-                        packet = packet_count,
-                        pts = pkt.pts,
-                        size = pkt.data.len(),
-                        keyframe = pkt.is_keyframe,
-                        "Encoded packet"
-                    );
-                }
+    // Start transport — accepts client connection and streams packets.
+    let server_transport = transport::start_server_transport(&cfg, packets, idr_tx)?;
+    let abort_handle = server_transport.abort_handle();
+    info!("Transport started, waiting for client connection...");
+
+    // Wait for transport to finish (client disconnect or error) or Ctrl+C.
+    tokio::select! {
+        result = server_transport.join() => {
+            if let Err(e) = result {
+                tracing::warn!("Transport error: {e}");
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT, shutting down gracefully");
-                break;
-            }
+            info!("Transport finished");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received SIGINT, shutting down gracefully");
+            abort_handle.abort();
         }
     }
 
-    info!(total_packets = packet_count, "Shutting down pipeline");
+    info!("Shutting down pipeline");
     encoder_session.stop()?;
     capture_session.stop()?;
 

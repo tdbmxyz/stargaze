@@ -91,5 +91,50 @@ async fn main() -> anyhow::Result<()> {
         cfg.server_address, cfg.port, cfg.fullscreen
     );
 
+    // Connect to server.
+    // TODO: derive session parameters from ClientConfig instead of hardcoding.
+    // The server currently ignores the client's request and uses its own config,
+    // but these should match once session negotiation is implemented.
+    let session_request = transport::SessionRequest {
+        width: 1920,
+        height: 1080,
+        framerate: 60,
+        codec: stargaze_core::config::Codec::H265,
+    };
+
+    let (client_transport, mut frames) = transport::connect(&cfg, session_request).await?;
+
+    info!("Connected, receiving frames...");
+
+    // Receive frames until disconnect or Ctrl+C.
+    let mut frame_count: u64 = 0;
+    loop {
+        tokio::select! {
+            frame = frames.recv() => {
+                let Some(frame) = frame else {
+                    info!("Frame channel closed");
+                    break;
+                };
+                frame_count += 1;
+                if frame.is_keyframe || frame_count % 300 == 1 {
+                    info!(
+                        frame = frame_count,
+                        pts = frame.pts,
+                        size = frame.data.len(),
+                        keyframe = frame.is_keyframe,
+                        "Received frame"
+                    );
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT, disconnecting");
+                client_transport.abort();
+                break;
+            }
+        }
+    }
+
+    info!(total_frames = frame_count, "Client shutting down");
+
     Ok(())
 }
