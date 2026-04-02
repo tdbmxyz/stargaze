@@ -2,33 +2,22 @@
 ///
 /// The `ffmpeg-sys-next` build script discovers `FFmpeg` libraries via `pkg-config` but
 /// only links the top-level libraries (avcodec, avformat, etc.) without their transitive
-/// static dependencies.  When `FFmpeg` is built as static archives (`.a` files), the
-/// linker also needs every library that `FFmpeg` itself depends on (libxml2, gnutls,
-/// x264, x265, etc.).
+/// dependencies.  When `FFmpeg` is installed as shared libraries (the typical system
+/// package case), dynamic linking handles transitive deps automatically at runtime.
+/// When `FFmpeg` is statically linked, the linker needs every transitive dependency
+/// explicitly.
 ///
-/// This build script re-queries `pkg-config` with the `--static` flag to obtain the
-/// complete set of linker flags and emits them via `cargo:rustc-link-lib`.
+/// This build script re-queries `pkg-config` to obtain any additional linker flags
+/// beyond the top-level `FFmpeg` libraries and emits them via `cargo:rustc-link-lib`.
+/// It uses dynamic (non-`--static`) flags by default, which is correct for system
+/// packages that provide shared libraries.
 fn main() {
-    // Add the ffmpeg-deps directory which contains unversioned .so symlinks
-    // for system libraries that FFmpeg depends on transitively.
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/vscode".to_string());
-    let deps_dir = format!("{home}/.local/usr/lib/x86_64-linux-gnu/ffmpeg-deps");
-    if std::path::Path::new(&deps_dir).is_dir() {
-        println!("cargo:rustc-link-search=native={deps_dir}");
-    }
-
     // Inherit LD_LIBRARY_PATH so the child pkg-config process can find libpkgconf.
     let ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
 
-    // Only run the extra static-link fixup when pkg-config is available.
+    // Only run the extra link fixup when pkg-config is available.
     let Ok(output) = std::process::Command::new("pkg-config")
-        .args([
-            "--libs",
-            "--static",
-            "libavformat",
-            "libavcodec",
-            "libavutil",
-        ])
+        .args(["--libs", "libavformat", "libavcodec", "libavutil"])
         .env(
             "PKG_CONFIG_PATH",
             std::env::var("PKG_CONFIG_PATH").unwrap_or_default(),
