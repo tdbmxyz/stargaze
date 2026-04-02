@@ -1,10 +1,11 @@
 use anyhow::bail;
 use clap::Parser;
-use stargaze_core::config::{self, ClientConfig};
+use stargaze_core::config::{self, Codec, ClientConfig};
+use stargaze_core::decode::DecoderConfig;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use stargaze_client::transport;
+use stargaze_client::{decode, render, transport};
 
 /// Stargaze streaming client — connects to a server, decodes video/audio, and forwards input.
 #[derive(Parser, Debug)]
@@ -99,42 +100,33 @@ async fn main() -> anyhow::Result<()> {
         width: 1920,
         height: 1080,
         framerate: 60,
-        codec: stargaze_core::config::Codec::H265,
+        codec: Codec::H265,
     };
 
-    let (client_transport, mut frames) = transport::connect(&cfg, session_request).await?;
+    let decoder_config = DecoderConfig {
+        width: session_request.width,
+        height: session_request.height,
+        codec: session_request.codec,
+    };
 
-    info!("Connected, receiving frames...");
+    let (client_transport, frames) = transport::connect(&cfg, session_request).await?;
 
-    // Receive frames until disconnect or Ctrl+C.
-    let mut frame_count: u64 = 0;
-    loop {
-        tokio::select! {
-            frame = frames.recv() => {
-                let Some(frame) = frame else {
-                    info!("Frame channel closed");
-                    break;
-                };
-                frame_count += 1;
-                if frame.is_keyframe || frame_count % 300 == 1 {
-                    info!(
-                        frame = frame_count,
-                        pts = frame.pts,
-                        size = frame.data.len(),
-                        keyframe = frame.is_keyframe,
-                        "Received frame"
-                    );
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT, disconnecting");
-                client_transport.abort();
-                break;
-            }
-        }
-    }
+    info!("Connected, starting decoder and renderer...");
 
-    info!(total_frames = frame_count, "Client shutting down");
+    let (decoder_session, decoded_rx) =
+        decode::start_decoder(decoder_config.clone(), frames)?;
+
+    // SDL2 event loop must run on the main OS thread. Use block_in_place
+    // to allow blocking within the tokio runtime without starving it.
+    tokio::task::block_in_place(|| {
+        render::start_renderer(&decoder_config, decoded_rx, cfg.fullscreen)
+    })?;
+
+    info!("Renderer closed, shutting down");
+    decoder_session.stop().ok();
+    client_transport.abort();
+
+    info!("Client shut down");
 
     Ok(())
 }
