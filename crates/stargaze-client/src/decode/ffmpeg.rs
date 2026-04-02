@@ -195,9 +195,7 @@ fn drain_decoded_frames(
             nv12_data.extend_from_slice(&uv_data[src..src + width_usize]);
         }
 
-        let pts = decoded_frame
-            .pts()
-            .map_or(0, i64::cast_unsigned);
+        let pts = decoded_frame.pts().map_or(0, i64::cast_unsigned);
 
         let output_frame = DecodedFrame {
             data: nv12_data,
@@ -213,4 +211,40 @@ fn drain_decoded_frames(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stargaze_core::config::Codec;
+
+    #[test]
+    fn decoder_init_h265_succeeds() {
+        let config = DecoderConfig {
+            width: 1920,
+            height: 1080,
+            codec: Codec::H265,
+        };
+        let result = init_decoder(&config);
+        assert!(
+            result.is_ok(),
+            "H.265 decoder should initialize successfully"
+        );
+    }
+
+    #[test]
+    fn decoder_init_rejects_av1() {
+        let config = DecoderConfig {
+            width: 1920,
+            height: 1080,
+            codec: Codec::Av1,
+        };
+        let result = init_decoder(&config);
+        assert!(result.is_err(), "AV1 should be rejected");
+        match result {
+            Err(DecodeError::UnsupportedCodec(_)) => {}
+            Err(e) => panic!("Expected UnsupportedCodec, got: {e:?}"),
+            Ok(_) => panic!("Expected error for AV1 codec"),
+        }
+    }
 }

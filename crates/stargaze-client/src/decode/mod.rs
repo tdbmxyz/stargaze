@@ -110,12 +110,9 @@ pub fn start_decoder(
             let mut frames_rx = frames_rx;
 
             // Run the decode loop until shutdown or channel close.
-            if let Err(e) = ffmpeg::run_decode_loop(
-                &mut decoder,
-                &mut frames_rx,
-                &decoded_tx,
-                &shutdown_clone,
-            ) {
+            if let Err(e) =
+                ffmpeg::run_decode_loop(&mut decoder, &mut frames_rx, &decoded_tx, &shutdown_clone)
+            {
                 error!("Decoder loop failed: {e}");
             }
 

@@ -9,7 +9,9 @@ pub(super) fn run_sdl_loop(
     fullscreen: bool,
 ) -> Result<(), anyhow::Error> {
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
-    let video = sdl.video().map_err(|e| anyhow!("SDL2 video init failed: {e}"))?;
+    let video = sdl
+        .video()
+        .map_err(|e| anyhow!("SDL2 video init failed: {e}"))?;
 
     let mut window_builder = video.window("Stargaze", config.width, config.height);
     window_builder.position_centered();

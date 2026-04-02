@@ -1,6 +1,6 @@
 use anyhow::bail;
 use clap::Parser;
-use stargaze_core::config::{self, Codec, ClientConfig};
+use stargaze_core::config::{self, ClientConfig, Codec};
 use stargaze_core::decode::DecoderConfig;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -113,8 +113,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Connected, starting decoder and renderer...");
 
-    let (decoder_session, decoded_rx) =
-        decode::start_decoder(decoder_config.clone(), frames)?;
+    let (decoder_session, decoded_rx) = decode::start_decoder(decoder_config.clone(), frames)?;
 
     // SDL2 event loop must run on the main OS thread. Use block_in_place
     // to allow blocking within the tokio runtime without starving it.
