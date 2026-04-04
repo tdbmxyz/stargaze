@@ -1,9 +1,11 @@
 use clap::Parser;
+use stargaze_core::audio::{AudioApplication, AudioCaptureConfig, AudioEncoderConfig};
 use stargaze_core::config::{self, Codec, Resolution, ServerConfig};
 use stargaze_core::encode::EncoderConfig;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod audio;
 mod capture;
 mod encode;
 mod transport;
@@ -131,8 +133,27 @@ async fn main() -> anyhow::Result<()> {
     let (encoder_session, packets, idr_tx) = encode::start_encoder(encoder_config, frames)?;
     info!("Encoder started");
 
-    // Start transport — accepts client connection and streams packets.
-    let server_transport = transport::start_server_transport(&cfg, packets, idr_tx)?;
+    // Start audio capture pipeline.
+    let audio_capture_config = AudioCaptureConfig {
+        sample_rate: 48_000,
+        channels: 2,
+    };
+    let (audio_capture_session, audio_frames) = audio::start_audio_capture(audio_capture_config)?;
+    info!("Audio capture started");
+
+    // Start audio encoder pipeline.
+    let audio_encoder_config = AudioEncoderConfig {
+        sample_rate: 48_000,
+        channels: 2,
+        bitrate: 128_000,
+        application: AudioApplication::Audio,
+    };
+    let (audio_encoder_session, audio_packets) =
+        encode::start_audio_encoder(audio_encoder_config, audio_frames)?;
+    info!("Audio encoder started");
+
+    // Start transport — accepts client connection and streams video + audio packets.
+    let server_transport = transport::start_server_transport(&cfg, packets, audio_packets, idr_tx)?;
     let abort_handle = server_transport.abort_handle();
     info!("Transport started, waiting for client connection...");
 
@@ -151,6 +172,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("Shutting down pipeline");
+    audio_encoder_session.stop()?;
+    audio_capture_session.stop()?;
     encoder_session.stop()?;
     capture_session.stop()?;
 
