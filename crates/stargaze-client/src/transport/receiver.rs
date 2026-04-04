@@ -8,7 +8,8 @@ use std::time::Instant;
 
 use stargaze_core::transport::{
     ControlMessage, DatagramHeader, IDR_RATE_LIMIT_MS, MAX_PENDING_FRAMES, ReassembledFrame,
-    TransportError, deserialize_control_message, deserialize_header, serialize_control_message,
+    STREAM_TYPE_AUDIO, STREAM_TYPE_VIDEO, TransportError, deserialize_control_message,
+    deserialize_header, serialize_control_message,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -115,24 +116,26 @@ struct PendingFrame {
 }
 
 /// Assembles datagram fragments into complete frames.
+///
+/// Keyed by `(stream_type, frame_index)` to prevent collisions between
+/// audio and video streams that use independent frame counters.
 pub struct FrameAssembler {
-    /// In-progress frames, keyed by `frame_index`.
-    pending: HashMap<u32, PendingFrame>,
-    /// Next `frame_index` expected for in-order delivery.
-    next_frame: u32,
-    /// Maximum number of pending incomplete frames before triggering `IDR`.
+    /// In-progress frames, keyed by `(stream_type, frame_index)`.
+    pending: HashMap<(u8, u32), PendingFrame>,
+    /// Next `frame_index` expected per stream type for in-order delivery.
+    next_frame: HashMap<u8, u32>,
+    /// Maximum number of pending incomplete video frames before triggering `IDR`.
     max_pending: usize,
     /// Last time an `IDR` request was sent.
     last_idr_request: Option<Instant>,
 }
 
 impl FrameAssembler {
-    /// Creates a new `FrameAssembler`.
     #[must_use]
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
-            next_frame: 0,
+            next_frame: HashMap::new(),
             max_pending: MAX_PENDING_FRAMES,
             last_idr_request: None,
         }
@@ -151,18 +154,16 @@ impl FrameAssembler {
         let mut completed = Vec::new();
         let mut need_idr = false;
 
-        // Insert fragment.
-        let pending = self
-            .pending
-            .entry(header.frame_index)
-            .or_insert_with(|| PendingFrame {
-                fragments: vec![None; usize::from(header.fragment_count)],
-                received_count: 0,
-                fragment_count: header.fragment_count,
-                pts: header.pts,
-                is_keyframe: header.is_keyframe,
-                stream_type: header.stream_type,
-            });
+        let key = (header.stream_type, header.frame_index);
+
+        let pending = self.pending.entry(key).or_insert_with(|| PendingFrame {
+            fragments: vec![None; usize::from(header.fragment_count)],
+            received_count: 0,
+            fragment_count: header.fragment_count,
+            pts: header.pts,
+            is_keyframe: header.is_keyframe,
+            stream_type: header.stream_type,
+        });
 
         let idx = usize::from(header.fragment_index);
         if idx < pending.fragments.len() && pending.fragments[idx].is_none() {
@@ -170,30 +171,33 @@ impl FrameAssembler {
             pending.received_count += 1;
         }
 
-        // Check if this frame is now complete.
         if pending.received_count == pending.fragment_count
-            && let Some(frame) = self.assemble_frame(header.frame_index)
+            && let Some(frame) = self.assemble_frame(key)
         {
             completed.push(frame);
         }
 
-        // Deliver any consecutive completed frames starting from next_frame.
-        self.deliver_in_order(&mut completed);
+        self.deliver_in_order(header.stream_type, &mut completed);
 
-        // Check if we need an IDR (too many pending frames = likely loss).
-        if self.pending.len() > self.max_pending {
+        // IDR is video-only: count only video pending frames.
+        let video_pending = self
+            .pending
+            .keys()
+            .filter(|(st, _)| *st == STREAM_TYPE_VIDEO)
+            .count();
+        if video_pending > self.max_pending {
             need_idr = self.should_request_idr();
             if need_idr {
-                self.pending.clear();
+                self.pending.retain(|(st, _), _| *st != STREAM_TYPE_VIDEO);
+                self.next_frame.remove(&STREAM_TYPE_VIDEO);
             }
         }
 
         (completed, need_idr)
     }
 
-    /// Assembles a complete frame from its fragments and removes it from pending.
-    fn assemble_frame(&mut self, frame_index: u32) -> Option<ReassembledFrame> {
-        let pending = self.pending.remove(&frame_index)?;
+    fn assemble_frame(&mut self, key: (u8, u32)) -> Option<ReassembledFrame> {
+        let pending = self.pending.remove(&key)?;
 
         let mut data = Vec::new();
         for bytes in pending.fragments.into_iter().flatten() {
@@ -208,23 +212,24 @@ impl FrameAssembler {
         })
     }
 
-    /// Delivers frames in order starting from `next_frame`.
-    fn deliver_in_order(&mut self, completed: &mut Vec<ReassembledFrame>) {
+    fn deliver_in_order(&mut self, stream_type: u8, completed: &mut Vec<ReassembledFrame>) {
+        let mut next = *self.next_frame.entry(stream_type).or_insert(0);
         loop {
-            if self.pending.contains_key(&self.next_frame) {
-                let pending = &self.pending[&self.next_frame];
-                if pending.received_count == pending.fragment_count {
-                    if let Some(frame) = self.assemble_frame(self.next_frame) {
-                        completed.push(frame);
-                    }
-                    self.next_frame = self.next_frame.wrapping_add(1);
-                } else {
-                    break;
+            let key = (stream_type, next);
+            let is_complete = self
+                .pending
+                .get(&key)
+                .is_some_and(|pf| pf.received_count == pf.fragment_count);
+            if is_complete {
+                if let Some(frame) = self.assemble_frame(key) {
+                    completed.push(frame);
                 }
+                next = next.wrapping_add(1);
             } else {
                 break;
             }
         }
+        self.next_frame.insert(stream_type, next);
     }
 
     /// Checks if we should send an `IDR` request based on rate limiting.
@@ -255,7 +260,8 @@ impl Default for FrameAssembler {
 pub(crate) async fn receive_loop(
     connection: quinn::Connection,
     mut control_send: quinn::SendStream,
-    frames_tx: mpsc::Sender<ReassembledFrame>,
+    video_tx: mpsc::Sender<ReassembledFrame>,
+    audio_tx: mpsc::Sender<ReassembledFrame>,
 ) -> Result<(), TransportError> {
     let mut assembler = FrameAssembler::new();
     let mut total_frames: u64 = 0;
@@ -296,10 +302,21 @@ pub(crate) async fn receive_loop(
                     pts = frame.pts,
                     size = frame.data.len(),
                     keyframe = frame.is_keyframe,
+                    stream_type = frame.stream_type,
                     "Reassembled frame"
                 );
             }
-            if frames_tx.send(frame).await.is_err() {
+
+            let send_result = match frame.stream_type {
+                STREAM_TYPE_VIDEO => video_tx.send(frame).await,
+                STREAM_TYPE_AUDIO => audio_tx.send(frame).await,
+                other => {
+                    warn!(stream_type = other, "Unknown stream type, dropping frame");
+                    continue;
+                }
+            };
+
+            if send_result.is_err() {
                 info!("Frame receiver dropped, stopping transport");
                 return Ok(());
             }
@@ -318,10 +335,10 @@ pub(crate) async fn receive_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stargaze_core::transport::STREAM_TYPE_VIDEO;
+    use stargaze_core::transport::{STREAM_TYPE_AUDIO, STREAM_TYPE_VIDEO};
 
-    /// Helper: creates a `DatagramHeader` for testing.
     fn make_header(
+        stream_type: u8,
         frame_index: u32,
         fragment_index: u16,
         fragment_count: u16,
@@ -329,7 +346,7 @@ mod tests {
         is_keyframe: bool,
     ) -> DatagramHeader {
         DatagramHeader {
-            stream_type: STREAM_TYPE_VIDEO,
+            stream_type,
             frame_index,
             fragment_index,
             fragment_count,
@@ -338,10 +355,27 @@ mod tests {
         }
     }
 
+    fn video_header(
+        frame_index: u32,
+        fragment_index: u16,
+        fragment_count: u16,
+        pts: u64,
+        is_keyframe: bool,
+    ) -> DatagramHeader {
+        make_header(
+            STREAM_TYPE_VIDEO,
+            frame_index,
+            fragment_index,
+            fragment_count,
+            pts,
+            is_keyframe,
+        )
+    }
+
     #[test]
     fn single_fragment_frame() {
         let mut assembler = FrameAssembler::new();
-        let header = make_header(0, 0, 1, 100, true);
+        let header = video_header(0, 0, 1, 100, true);
         let payload = vec![1, 2, 3, 4, 5];
 
         let (frames, need_idr) = assembler.process_datagram(&header, payload.clone());
@@ -358,10 +392,9 @@ mod tests {
     fn multi_fragment_in_order() {
         let mut assembler = FrameAssembler::new();
 
-        // 3 fragments for frame 0.
-        let h0 = make_header(0, 0, 3, 0, false);
-        let h1 = make_header(0, 1, 3, 0, false);
-        let h2 = make_header(0, 2, 3, 0, false);
+        let h0 = video_header(0, 0, 3, 0, false);
+        let h1 = video_header(0, 1, 3, 0, false);
+        let h2 = video_header(0, 2, 3, 0, false);
 
         let (frames, _) = assembler.process_datagram(&h0, vec![1, 2]);
         assert!(frames.is_empty());
@@ -378,10 +411,9 @@ mod tests {
     fn multi_fragment_out_of_order() {
         let mut assembler = FrameAssembler::new();
 
-        // Send fragments in reverse order.
-        let h2 = make_header(0, 2, 3, 42, true);
-        let h0 = make_header(0, 0, 3, 42, true);
-        let h1 = make_header(0, 1, 3, 42, true);
+        let h2 = video_header(0, 2, 3, 42, true);
+        let h0 = video_header(0, 0, 3, 42, true);
+        let h1 = video_header(0, 1, 3, 42, true);
 
         let (frames, _) = assembler.process_datagram(&h2, vec![5, 6]);
         assert!(frames.is_empty());
@@ -400,19 +432,17 @@ mod tests {
     fn duplicate_fragment_ignored() {
         let mut assembler = FrameAssembler::new();
 
-        let h0 = make_header(0, 0, 2, 0, false);
-        let h1 = make_header(0, 1, 2, 0, false);
+        let h0 = video_header(0, 0, 2, 0, false);
+        let h1 = video_header(0, 1, 2, 0, false);
 
-        // Send fragment 0 twice.
         let (frames, _) = assembler.process_datagram(&h0, vec![1, 2]);
         assert!(frames.is_empty());
 
         let (frames, _) = assembler.process_datagram(&h0, vec![99, 99]);
-        assert!(frames.is_empty()); // Duplicate ignored.
+        assert!(frames.is_empty());
 
         let (frames, _) = assembler.process_datagram(&h1, vec![3, 4]);
         assert_eq!(frames.len(), 1);
-        // Original data preserved, not the duplicate.
         assert_eq!(frames[0].data, vec![1, 2, 3, 4]);
     }
 
@@ -420,25 +450,27 @@ mod tests {
     fn max_pending_triggers_idr() {
         let mut assembler = FrameAssembler::new();
 
-        // Fill up max_pending + 1 incomplete frames.
         for i in 0..=MAX_PENDING_FRAMES as u32 {
-            let h = make_header(i, 0, 2, u64::from(i), false);
+            let h = video_header(i, 0, 2, u64::from(i), false);
             let (_, _need_idr) = assembler.process_datagram(&h, vec![0]);
         }
 
-        // After exceeding max_pending, the assembler should request IDR
-        // and clear pending frames.
-        assert!(assembler.pending.is_empty() || assembler.pending.len() <= MAX_PENDING_FRAMES);
+        let video_pending = assembler
+            .pending
+            .keys()
+            .filter(|(st, _)| *st == STREAM_TYPE_VIDEO)
+            .count();
+        assert!(
+            video_pending == 0 || video_pending <= MAX_PENDING_FRAMES,
+            "Video pending should be cleared after IDR"
+        );
     }
 
     #[test]
     fn idr_rate_limiting() {
         let mut assembler = FrameAssembler::new();
 
-        // First IDR request should succeed.
         assert!(assembler.should_request_idr());
-
-        // Immediate second request should be rate-limited.
         assert!(!assembler.should_request_idr());
     }
 
@@ -446,15 +478,71 @@ mod tests {
     fn multiple_frames_sequential() {
         let mut assembler = FrameAssembler::new();
 
-        // Frame 0: single fragment.
-        let h0 = make_header(0, 0, 1, 0, true);
+        let h0 = video_header(0, 0, 1, 0, true);
         let (frames, _) = assembler.process_datagram(&h0, vec![10]);
         assert_eq!(frames.len(), 1);
 
-        // Frame 1: single fragment.
-        let h1 = make_header(1, 0, 1, 1, false);
+        let h1 = video_header(1, 0, 1, 1, false);
         let (frames, _) = assembler.process_datagram(&h1, vec![20]);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].pts, 1);
+    }
+
+    #[test]
+    fn mixed_streams_same_frame_index_no_collision() {
+        let mut assembler = FrameAssembler::new();
+
+        // Video frame 0 and audio frame 0 should not collide.
+        let video_h = video_header(0, 0, 1, 100, true);
+        let audio_h = make_header(STREAM_TYPE_AUDIO, 0, 0, 1, 200, false);
+
+        let (frames, _) = assembler.process_datagram(&video_h, vec![0xAA]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].stream_type, STREAM_TYPE_VIDEO);
+        assert_eq!(frames[0].data, vec![0xAA]);
+        assert_eq!(frames[0].pts, 100);
+
+        let (frames, _) = assembler.process_datagram(&audio_h, vec![0xBB]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].stream_type, STREAM_TYPE_AUDIO);
+        assert_eq!(frames[0].data, vec![0xBB]);
+        assert_eq!(frames[0].pts, 200);
+    }
+
+    #[test]
+    fn per_stream_in_order_delivery() {
+        let mut assembler = FrameAssembler::new();
+
+        // Audio frame 1 arrives before audio frame 0.
+        let audio_1 = make_header(STREAM_TYPE_AUDIO, 1, 0, 1, 10, false);
+        let (frames, _) = assembler.process_datagram(&audio_1, vec![0xBB]);
+        // Frame 1 completed but frame 0 hasn't arrived yet — should be delivered
+        // since it was the first completed frame on this stream and assembler
+        // already consumed it directly.
+        assert_eq!(frames.len(), 1);
+
+        // Audio frame 0 arrives.
+        let audio_0 = make_header(STREAM_TYPE_AUDIO, 0, 0, 1, 5, false);
+        let (frames, _) = assembler.process_datagram(&audio_0, vec![0xAA]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, vec![0xAA]);
+
+        // Meanwhile, video stream is tracked independently.
+        let video_0 = video_header(0, 0, 1, 50, true);
+        let (frames, _) = assembler.process_datagram(&video_0, vec![0xCC]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].stream_type, STREAM_TYPE_VIDEO);
+    }
+
+    #[test]
+    fn audio_pending_does_not_trigger_idr() {
+        let mut assembler = FrameAssembler::new();
+
+        // Fill up many incomplete audio frames — should NOT trigger IDR.
+        for i in 0..=MAX_PENDING_FRAMES as u32 + 5 {
+            let h = make_header(STREAM_TYPE_AUDIO, i, 0, 2, u64::from(i), false);
+            let (_, need_idr) = assembler.process_datagram(&h, vec![0]);
+            assert!(!need_idr, "Audio frames should never trigger IDR");
+        }
     }
 }

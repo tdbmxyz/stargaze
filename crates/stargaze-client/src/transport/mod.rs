@@ -49,8 +49,8 @@ pub struct SessionRequest {
 
 /// Connects to the server and starts receiving frames.
 ///
-/// Returns a `ClientTransport` handle and an `mpsc::Receiver` for
-/// reassembled frames.
+/// Returns a `ClientTransport` handle and two `mpsc::Receiver`s —
+/// one for video frames and one for audio frames.
 ///
 /// # Errors
 ///
@@ -58,7 +58,14 @@ pub struct SessionRequest {
 pub async fn connect(
     config: &ClientConfig,
     session_request: SessionRequest,
-) -> Result<(ClientTransport, mpsc::Receiver<ReassembledFrame>), TransportError> {
+) -> Result<
+    (
+        ClientTransport,
+        mpsc::Receiver<ReassembledFrame>,
+        mpsc::Receiver<ReassembledFrame>,
+    ),
+    TransportError,
+> {
     let server_addr: std::net::SocketAddr = format!("{}:{}", config.server_address, config.port)
         .parse()
         .map_err(|e| TransportError::ConnectionError(format!("invalid server address: {e}")))?;
@@ -86,14 +93,14 @@ pub async fn connect(
         session_response.max_datagram_size,
     );
 
-    // Create frame delivery channel.
-    let (frames_tx, frames_rx) = mpsc::channel::<ReassembledFrame>(16);
+    let (video_tx, video_rx) = mpsc::channel::<ReassembledFrame>(16);
+    let (audio_tx, audio_rx) = mpsc::channel::<ReassembledFrame>(16);
 
     let task_handle = tokio::spawn(async move {
-        if let Err(e) = receiver::receive_loop(connection, send_stream, frames_tx).await {
+        if let Err(e) = receiver::receive_loop(connection, send_stream, video_tx, audio_tx).await {
             error!("Client transport error: {e}");
         }
     });
 
-    Ok((ClientTransport { task_handle }, frames_rx))
+    Ok((ClientTransport { task_handle }, video_rx, audio_rx))
 }
