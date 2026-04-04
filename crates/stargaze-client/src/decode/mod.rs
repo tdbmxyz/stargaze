@@ -1,15 +1,17 @@
-//! Video decoding module — public API.
+//! Video and audio decoding module — public API.
 //!
-//! Provides `start_decoder()` which spawns a dedicated thread for
-//! `FFmpeg` H.265 software decoding and returns a `DecoderSession` handle
-//! plus a channel receiver for decoded frames.
+//! Provides [`start_decoder()`] for `FFmpeg` H.265 video decoding and
+//! [`start_audio_decoder()`] for Opus audio decoding. Both return a
+//! session handle that can be used to stop the decoder thread.
 
 pub(crate) mod ffmpeg;
+pub(crate) mod opus_dec;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use stargaze_core::audio::{AudioDecoderConfig, AudioError};
 use stargaze_core::decode::{DecodeError, DecodedFrame, DecoderConfig};
 use stargaze_core::transport::ReassembledFrame;
 use tokio::sync::mpsc;
@@ -65,16 +67,6 @@ impl Drop for DecoderSession {
 }
 
 /// Starts the video decoder.
-///
-/// Takes ownership of the reassembled frame receiver from transport and returns
-/// a `DecoderSession` handle plus a channel receiver for decoded frames ready
-/// for rendering.
-///
-/// The decoder→renderer channel uses `std::sync::mpsc` (not tokio) because
-/// the renderer runs synchronously.
-///
-/// `FFmpeg` initialization happens on the spawned thread. If initialization fails,
-/// the error is sent back via a oneshot channel and returned from this function.
 ///
 /// # Errors
 ///
@@ -136,5 +128,115 @@ pub fn start_decoder(
             shutdown,
         },
         decoded_rx,
+    ))
+}
+
+/// Handle to a running audio decoder session.
+pub struct AudioDecoderSession {
+    thread_handle: Option<thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl AudioDecoderSession {
+    /// Gracefully stops decoding and waits for the thread to exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AudioError::DecoderInit` if the audio decoder thread panicked.
+    pub fn stop(mut self) -> Result<(), AudioError> {
+        self.signal_shutdown();
+        self.join_thread()
+    }
+
+    fn signal_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    fn join_thread(&mut self) -> Result<(), AudioError> {
+        if let Some(handle) = self.thread_handle.take() {
+            handle.join().map_err(|_| {
+                AudioError::DecoderInit("audio decoder thread panicked".to_string())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AudioDecoderSession {
+    fn drop(&mut self) {
+        self.signal_shutdown();
+        if let Some(handle) = self.thread_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Starts the Opus audio decoder.
+///
+/// Spawns a dedicated thread that reads [`ReassembledFrame`]s from `frames_rx`,
+/// decodes them with Opus, and sends decoded PCM samples to the returned receiver.
+///
+/// # Errors
+///
+/// Returns [`AudioError::DecoderInit`] if Opus initialization fails or the
+/// thread cannot be spawned.
+pub fn start_audio_decoder(
+    config: AudioDecoderConfig,
+    frames_rx: mpsc::Receiver<ReassembledFrame>,
+) -> Result<(AudioDecoderSession, std::sync::mpsc::Receiver<Vec<f32>>), AudioError> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = Arc::clone(&shutdown);
+    let channels = config.channels;
+
+    let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+    let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), AudioError>>();
+
+    let thread_handle = thread::Builder::new()
+        .name("stargaze-audio-decoder".to_string())
+        .spawn(move || {
+            let mut decoder = match opus_dec::init_opus_decoder(&config) {
+                Ok(dec) => {
+                    let _ = init_tx.send(Ok(()));
+                    dec
+                }
+                Err(e) => {
+                    error!("Audio decoder initialization failed: {e}");
+                    let _ = init_tx.send(Err(e));
+                    return;
+                }
+            };
+
+            let mut frames_rx = frames_rx;
+
+            if let Err(e) = opus_dec::run_opus_decode_loop(
+                &mut decoder,
+                &mut frames_rx,
+                &pcm_tx,
+                channels,
+                &shutdown_clone,
+            ) {
+                error!("Audio decoder loop failed: {e}");
+            }
+
+            info!("Audio decoder thread exiting");
+        })
+        .map_err(|e| {
+            AudioError::DecoderInit(format!("failed to spawn audio decoder thread: {e}"))
+        })?;
+
+    let init_result = init_rx.recv().map_err(|_| {
+        AudioError::DecoderInit("audio decoder thread exited during initialization".to_string())
+    })?;
+
+    init_result?;
+
+    info!("Audio decoder started on dedicated thread");
+
+    Ok((
+        AudioDecoderSession {
+            thread_handle: Some(thread_handle),
+            shutdown,
+        },
+        pcm_rx,
     ))
 }
