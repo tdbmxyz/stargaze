@@ -61,13 +61,19 @@ fn spa_format_to_pixel_format(raw: u32) -> Option<PixelFormat> {
 /// the configured resolution, and a framerate of `0/1` (variable) so the
 /// portal node can drive timing.
 ///
-/// `VideoMaxFramerate` is intentionally omitted — some portal backends
-/// (notably xdg-desktop-portal-hyprland) reject it during format
-/// negotiation, causing "no more input formats" errors.
+/// Includes a `VideoModifier` property with `MANDATORY | DONT_FIXATE` flags
+/// so that portal backends using DMA-BUF (e.g. xdg-desktop-portal-hyprland)
+/// can negotiate modifiers. Without this, format intersection fails with
+/// "no more input formats".
 fn build_format_params(config: &CaptureConfig) -> Vec<u8> {
     use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+    use pipewire::spa::pod::{ChoiceValue, Property, PropertyFlags, Value};
+    use pipewire::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
 
-    let format_obj = object! {
+    // DRM_FORMAT_MOD_INVALID signals "accept any modifier the source offers".
+    const DRM_FORMAT_MOD_INVALID: i64 = (1 << 56) - 1;
+
+    let mut format_obj = object! {
         SpaTypes::ObjectParamFormat,
         pipewire::spa::param::ParamType::EnumFormat,
         property!(
@@ -115,6 +121,18 @@ fn build_format_params(config: &CaptureConfig) -> Vec<u8> {
             Fraction { num: 0, denom: 1 }
         ),
     };
+
+    format_obj.properties.push(Property {
+        key: FormatProperties::VideoModifier.as_raw(),
+        flags: PropertyFlags::MANDATORY | PropertyFlags::DONT_FIXATE,
+        value: Value::Choice(ChoiceValue::Long(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::Enum {
+                default: DRM_FORMAT_MOD_INVALID,
+                alternatives: vec![DRM_FORMAT_MOD_INVALID],
+            },
+        ))),
+    });
 
     let pod_value = pod::Value::Object(format_obj);
     let cursor = Cursor::new(Vec::new());

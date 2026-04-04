@@ -12,7 +12,7 @@ ffmpeg-next = "7"
 ffmpeg-sys-next = "7"
 libc = "0.2"
 opus = "0.3"
-pipewire = "0.9"
+pipewire = { version = "0.9", features = ["v0_3_33"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
