@@ -21,6 +21,8 @@ pub struct CaptureConfig {
     pub height: u32,
     /// Desired capture framerate.
     pub framerate: u32,
+    /// Whether to include the cursor in captured frames.
+    pub show_cursor: bool,
 }
 
 /// Handle to a running capture session.
@@ -85,7 +87,7 @@ pub async fn start_capture(
     config: CaptureConfig,
 ) -> Result<(CaptureSession, mpsc::Receiver<Frame>), CaptureError> {
     // Step 1: Portal handshake (async, runs on tokio).
-    let (pw_fd, pw_node_id) = portal::create_screencast_session().await?;
+    let (pw_fd, pw_node_id) = portal::create_screencast_session(config.show_cursor).await?;
 
     info!(
         node_id = pw_node_id,

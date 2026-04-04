@@ -89,6 +89,32 @@ impl FromStr for Resolution {
     }
 }
 
+// --- CursorConfig ---
+
+/// Configuration for cursor rendering in the captured stream.
+///
+/// Controls whether the cursor is composited into captured video frames
+/// by the Wayland compositor (via `CursorMode::Embedded`).
+///
+/// When `show_cursor` is `true` (default), the compositor embeds the cursor
+/// into each captured frame. When `false`, frames contain no cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CursorConfig {
+    /// Whether the cursor should be visible in the captured stream.
+    ///
+    /// - `true` (default): cursor is composited into video frames
+    ///   (`CursorMode::Embedded`)
+    /// - `false`: cursor is hidden from capture (`CursorMode::Hidden`)
+    pub show_cursor: bool,
+}
+
+impl Default for CursorConfig {
+    fn default() -> Self {
+        Self { show_cursor: true }
+    }
+}
+
 // --- MicForwardConfig ---
 
 /// Default port for rsonance mic forwarding (separate from stargaze's QUIC port).
@@ -140,6 +166,8 @@ pub struct ServerConfig {
     pub codec: Codec,
     /// Mic forwarding configuration.
     pub mic_forward: MicForwardConfig,
+    /// Cursor rendering configuration.
+    pub cursor: CursorConfig,
 }
 
 impl Default for ServerConfig {
@@ -152,6 +180,7 @@ impl Default for ServerConfig {
             bitrate: 20,
             codec: Codec::default(),
             mic_forward: MicForwardConfig::default(),
+            cursor: CursorConfig::default(),
         }
     }
 }
@@ -258,6 +287,7 @@ mod tests {
         assert!(!config.mic_forward.enabled);
         assert_eq!(config.mic_forward.port, 9001);
         assert_eq!(config.mic_forward.rsonance_binary, "rsonance");
+        assert!(config.cursor.show_cursor);
     }
 
     #[test]
@@ -324,6 +354,7 @@ mod tests {
         assert_eq!(config.port, 3000);
         assert_eq!(config.framerate, 60);
         assert!(!config.mic_forward.enabled);
+        assert!(config.cursor.show_cursor);
     }
 
     #[test]
@@ -428,5 +459,33 @@ mod tests {
         let config: ServerConfig =
             load_config(Some("/tmp/nonexistent_stargaze_test.toml")).unwrap();
         assert_eq!(config, ServerConfig::default());
+    }
+
+    #[test]
+    fn test_cursor_config_defaults() {
+        let config = CursorConfig::default();
+        assert!(config.show_cursor);
+    }
+
+    #[test]
+    fn test_server_config_with_cursor_toml() {
+        let toml_str = r#"
+            bind_address = "0.0.0.0"
+            port = 9000
+
+            [cursor]
+            show_cursor = false
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.cursor.show_cursor);
+    }
+
+    #[test]
+    fn test_server_config_cursor_default_when_absent() {
+        let toml_str = r#"
+            port = 3000
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.cursor.show_cursor);
     }
 }

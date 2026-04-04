@@ -73,6 +73,8 @@ pub enum ControlMessage {
         codec: Codec,
         /// Maximum datagram payload size for the connection.
         max_datagram_size: u16,
+        /// Whether the cursor is embedded in video frames.
+        cursor_embedded: bool,
     },
     /// Client -> Server: request an IDR keyframe (after packet loss).
     IdrRequest,
@@ -245,6 +247,7 @@ mod tests {
             bitrate_mbps: 50,
             codec: Codec::Av1,
             max_datagram_size: 1200,
+            cursor_embedded: true,
         };
         let bytes = serialize_control_message(&msg).unwrap();
         let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
@@ -255,6 +258,23 @@ mod tests {
     #[test]
     fn control_message_idr_request_round_trip() {
         let msg = ControlMessage::IdrRequest;
+        let bytes = serialize_control_message(&msg).unwrap();
+        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn control_message_session_response_cursor_hidden_round_trip() {
+        let msg = ControlMessage::SessionResponse {
+            width: 1920,
+            height: 1080,
+            framerate: 60,
+            bitrate_mbps: 20,
+            codec: Codec::H265,
+            max_datagram_size: 1200,
+            cursor_embedded: false,
+        };
         let bytes = serialize_control_message(&msg).unwrap();
         let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
         let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();

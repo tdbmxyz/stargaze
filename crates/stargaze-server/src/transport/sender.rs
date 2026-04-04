@@ -82,6 +82,7 @@ pub(crate) async fn handle_session_handshake(
         bitrate_mbps: config.bitrate,
         codec: config.codec,
         max_datagram_size: max_datagram_size_u16,
+        cursor_embedded: config.cursor.show_cursor,
     };
 
     let response_bytes = serialize_control_message(&response)?;

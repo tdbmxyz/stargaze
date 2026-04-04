@@ -50,6 +50,10 @@ struct Cli {
     #[arg(long)]
     mic_forward_port: Option<u16>,
 
+    /// Show the cursor in the captured stream [default: true].
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    show_cursor: bool,
+
     /// Path to config file (default: ~/.config/stargaze/server.toml).
     #[arg(long)]
     config: Option<String>,
@@ -114,6 +118,7 @@ fn build_config(cli: &Cli) -> anyhow::Result<ServerConfig> {
     if let Some(port) = cli.mic_forward_port {
         cfg.mic_forward.port = port;
     }
+    cfg.cursor.show_cursor = cli.show_cursor;
 
     Ok(cfg)
 }
@@ -126,8 +131,18 @@ async fn main() -> anyhow::Result<()> {
     let cfg = build_config(&cli)?;
 
     info!(
-        "Starting stargaze server on {}:{} ({}@{}fps, {} Mbps, {})",
-        cfg.bind_address, cfg.port, cfg.resolution, cfg.framerate, cfg.bitrate, cfg.codec
+        "Starting stargaze server on {}:{} ({}@{}fps, {} Mbps, {}, cursor: {})",
+        cfg.bind_address,
+        cfg.port,
+        cfg.resolution,
+        cfg.framerate,
+        cfg.bitrate,
+        cfg.codec,
+        if cfg.cursor.show_cursor {
+            "embedded"
+        } else {
+            "hidden"
+        }
     );
 
     // Start capture pipeline.
@@ -135,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         width: cfg.resolution.width,
         height: cfg.resolution.height,
         framerate: cfg.framerate,
+        show_cursor: cfg.cursor.show_cursor,
     };
     let (capture_session, frames) = capture::start_capture(capture_config).await?;
     info!("Capture started");
@@ -265,6 +281,7 @@ mod tests {
             width: 1920,
             height: 1080,
             framerate: 30,
+            show_cursor: true,
         };
         let (capture_session, frames) = capture::start_capture(capture_config)
             .await

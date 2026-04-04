@@ -87,6 +87,7 @@ pub(crate) async fn perform_handshake(
             bitrate_mbps,
             codec: _,
             max_datagram_size,
+            cursor_embedded: _,
         } => Ok(SessionParams {
             width,
             height,
