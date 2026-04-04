@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::Codec;
+use crate::input::InputEvent;
 
 /// Stream type tag for video datagrams.
 pub const STREAM_TYPE_VIDEO: u8 = 0;
@@ -85,6 +86,8 @@ pub enum ControlMessage {
         /// Echoed timestamp from the original `Ping`.
         timestamp_ms: u64,
     },
+    /// Client -> Server: input event from keyboard, mouse, or gamepad.
+    Input(InputEvent),
 }
 
 /// A fully reassembled frame ready for decoding.
@@ -306,5 +309,77 @@ mod tests {
         assert_eq!(STREAM_TYPE_VIDEO, 0);
         assert_eq!(STREAM_TYPE_AUDIO, 1);
         assert_ne!(STREAM_TYPE_VIDEO, STREAM_TYPE_AUDIO);
+    }
+
+    #[test]
+    fn control_message_input_keyboard_round_trip() {
+        use crate::input::InputEvent;
+        let msg = ControlMessage::Input(InputEvent::Keyboard {
+            scancode: 4,
+            pressed: true,
+        });
+        let bytes = serialize_control_message(&msg).unwrap();
+        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn control_message_input_mouse_move_round_trip() {
+        use crate::input::InputEvent;
+        let msg = ControlMessage::Input(InputEvent::MouseMove { dx: -10, dy: 5 });
+        let bytes = serialize_control_message(&msg).unwrap();
+        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn control_message_input_mouse_button_round_trip() {
+        use crate::input::{InputEvent, MouseButton};
+        let msg = ControlMessage::Input(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        let bytes = serialize_control_message(&msg).unwrap();
+        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn control_message_input_mouse_wheel_round_trip() {
+        use crate::input::InputEvent;
+        let msg = ControlMessage::Input(InputEvent::MouseWheel { dx: 0, dy: 3 });
+        let bytes = serialize_control_message(&msg).unwrap();
+        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn control_message_input_gamepad_axis_round_trip() {
+        use crate::input::{GamepadAxis, InputEvent};
+        let msg = ControlMessage::Input(InputEvent::GamepadAxis {
+            axis: GamepadAxis::LeftX,
+            value: -16000,
+        });
+        let bytes = serialize_control_message(&msg).unwrap();
+        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn control_message_input_gamepad_button_round_trip() {
+        use crate::input::{GamepadButton, InputEvent};
+        let msg = ControlMessage::Input(InputEvent::GamepadButton {
+            button: GamepadButton::South,
+            pressed: true,
+        });
+        let bytes = serialize_control_message(&msg).unwrap();
+        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();
+        assert_eq!(decoded, msg);
     }
 }
