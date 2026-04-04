@@ -50,7 +50,7 @@ struct Cli {
     #[arg(long)]
     mic_forward_port: Option<u16>,
 
-    /// Show the cursor in the captured stream [default: true].
+    /// Show the cursor in the captured stream.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     show_cursor: bool,
 
