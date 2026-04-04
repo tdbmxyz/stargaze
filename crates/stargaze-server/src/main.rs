@@ -149,7 +149,6 @@ async fn main() -> anyhow::Result<()> {
     let capture_config = CaptureConfig {
         width: cfg.resolution.width,
         height: cfg.resolution.height,
-        framerate: cfg.framerate,
         show_cursor: cfg.cursor.show_cursor,
     };
     let (capture_session, frames) = capture::start_capture(capture_config).await?;
@@ -280,7 +279,6 @@ mod tests {
         let capture_config = CaptureConfig {
             width: 1920,
             height: 1080,
-            framerate: 30,
             show_cursor: true,
         };
         let (capture_session, frames) = capture::start_capture(capture_config)

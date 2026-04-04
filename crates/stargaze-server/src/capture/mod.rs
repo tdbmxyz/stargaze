@@ -19,8 +19,6 @@ pub struct CaptureConfig {
     pub width: u32,
     /// Desired capture height in pixels.
     pub height: u32,
-    /// Desired capture framerate.
-    pub framerate: u32,
     /// Whether to include the cursor in captured frames.
     pub show_cursor: bool,
 }

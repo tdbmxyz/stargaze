@@ -58,9 +58,12 @@ fn spa_format_to_pixel_format(raw: u32) -> Option<PixelFormat> {
 /// Builds the SPA format pod for video stream negotiation.
 ///
 /// Offers `Video/Raw` with a choice of pixel formats, a size range up to
-/// the configured resolution, and a max-framerate range up to the configured
-/// fps.  The actual framerate is set to `0/1` (variable) so the portal node
-/// can drive timing.
+/// the configured resolution, and a framerate of `0/1` (variable) so the
+/// portal node can drive timing.
+///
+/// `VideoMaxFramerate` is intentionally omitted — some portal backends
+/// (notably xdg-desktop-portal-hyprland) reject it during format
+/// negotiation, causing "no more input formats" errors.
 fn build_format_params(config: &CaptureConfig) -> Vec<u8> {
     use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
 
@@ -110,21 +113,6 @@ fn build_format_params(config: &CaptureConfig) -> Vec<u8> {
             FormatProperties::VideoFramerate,
             Fraction,
             Fraction { num: 0, denom: 1 }
-        ),
-        property!(
-            FormatProperties::VideoMaxFramerate,
-            Choice,
-            Range,
-            Fraction,
-            Fraction {
-                num: config.framerate,
-                denom: 1,
-            },
-            Fraction { num: 1, denom: 1 },
-            Fraction {
-                num: config.framerate,
-                denom: 1,
-            }
         ),
     };
 
