@@ -1,5 +1,6 @@
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use clap::Parser;
+use stargaze_core::audio::AudioDecoderConfig;
 use stargaze_core::config::{self, ClientConfig, Codec};
 use stargaze_core::decode::DecoderConfig;
 use tracing::info;
@@ -28,9 +29,6 @@ struct Cli {
     config: Option<String>,
 }
 
-/// Initializes the tracing subscriber with an env filter.
-///
-/// Uses the `RUST_LOG` environment variable if set, otherwise defaults to `info`.
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -38,12 +36,6 @@ fn init_tracing() {
 }
 
 /// Builds the final [`ClientConfig`] by loading from file and applying CLI overrides.
-///
-/// Config resolution order:
-/// 1. If `--config` is provided, load from that path.
-/// 2. Otherwise, if the default config file exists, load from it.
-/// 3. If no file is found, use [`ClientConfig::default()`].
-/// 4. Any CLI arguments that are `Some` override the loaded config values.
 ///
 /// # Errors
 ///
@@ -94,8 +86,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Connect to server.
     // TODO: derive session parameters from ClientConfig instead of hardcoding.
-    // The server currently ignores the client's request and uses its own config,
-    // but these should match once session negotiation is implemented.
     let session_request = transport::SessionRequest {
         width: 1920,
         height: 1080,
@@ -109,20 +99,42 @@ async fn main() -> anyhow::Result<()> {
         codec: session_request.codec,
     };
 
-    let (client_transport, frames) = transport::connect(&cfg, session_request).await?;
+    let audio_decoder_config = AudioDecoderConfig {
+        sample_rate: 48_000,
+        channels: 2,
+    };
 
-    info!("Connected, starting decoder and renderer...");
+    let (client_transport, video_frames, audio_frames) =
+        transport::connect(&cfg, session_request).await?;
 
-    let (decoder_session, decoded_rx) = decode::start_decoder(decoder_config.clone(), frames)?;
+    info!("Connected, starting decoders and renderer...");
 
-    // SDL2 event loop must run on the main OS thread. Use block_in_place
-    // to allow blocking within the tokio runtime without starving it.
+    // SDL2 must be initialized on the main thread.
+    let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
+
+    // Start the audio decoder thread — sends decoded PCM to a channel.
+    let (audio_decoder_session, audio_pcm_rx) =
+        decode::start_audio_decoder(audio_decoder_config, audio_frames)?;
+
+    // Start the video decoder thread.
+    let (video_decoder_session, decoded_rx) =
+        decode::start_decoder(decoder_config.clone(), video_frames)?;
+
+    // SDL2 event loop must run on the main OS thread.
+    // Audio PCM is queued to the SDL2 AudioQueue inside the event loop.
     tokio::task::block_in_place(|| {
-        render::start_renderer(&decoder_config, decoded_rx, cfg.fullscreen)
+        render::start_renderer(
+            &sdl,
+            &decoder_config,
+            decoded_rx,
+            audio_pcm_rx,
+            cfg.fullscreen,
+        )
     })?;
 
     info!("Renderer closed, shutting down");
-    decoder_session.stop().ok();
+    video_decoder_session.stop().ok();
+    audio_decoder_session.stop().ok();
     client_transport.abort();
 
     info!("Client shut down");
