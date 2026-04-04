@@ -1,15 +1,17 @@
-//! Video encoding module — public API.
+//! Video and audio encoding module — public API.
 //!
-//! Provides `start_encoder()` which spawns a dedicated thread for
-//! `FFmpeg` NVENC encoding and returns an `EncoderSession` handle
-//! plus a channel receiver for encoded packets.
+//! Provides [`start_encoder()`] for `FFmpeg` NVENC video encoding and
+//! [`start_audio_encoder()`] for Opus audio encoding. Both return a
+//! session handle plus a channel receiver for encoded packets.
 
 pub(crate) mod ffmpeg;
+pub(crate) mod opus_enc;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use stargaze_core::audio::{AudioEncoderConfig, AudioError, AudioFrame};
 use stargaze_core::capture::Frame;
 use stargaze_core::encode::{EncodeError, EncodedPacket, EncoderConfig};
 use tokio::sync::{mpsc, watch};
@@ -159,5 +161,120 @@ pub fn start_encoder(
         },
         packets_rx,
         idr_tx,
+    ))
+}
+
+/// Handle to a running audio encoder session.
+///
+/// Signals the audio encoder thread to shut down on drop.
+pub struct AudioEncoderSession {
+    /// Join handle for the dedicated audio encoder thread.
+    thread_handle: Option<thread::JoinHandle<()>>,
+    /// Shared flag to signal the audio encoder thread to stop.
+    shutdown: Arc<AtomicBool>,
+}
+
+impl AudioEncoderSession {
+    /// Gracefully stops encoding: signals shutdown and waits for the thread to exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AudioError::EncoderInit` if the audio encoder thread panicked.
+    pub fn stop(mut self) -> Result<(), AudioError> {
+        self.signal_shutdown();
+        self.join_thread()
+    }
+
+    fn signal_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    fn join_thread(&mut self) -> Result<(), AudioError> {
+        if let Some(handle) = self.thread_handle.take() {
+            handle.join().map_err(|_| {
+                AudioError::EncoderInit("audio encoder thread panicked".to_string())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AudioEncoderSession {
+    fn drop(&mut self) {
+        self.signal_shutdown();
+        if let Some(handle) = self.thread_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Starts the Opus audio encoder.
+///
+/// Spawns a dedicated thread that reads [`AudioFrame`]s from `frames`,
+/// encodes them with Opus, and sends [`EncodedPacket`]s to the returned receiver.
+///
+/// Initialization happens on the spawned thread. If it fails, the error is
+/// propagated back to the caller via a oneshot channel.
+///
+/// # Errors
+///
+/// Returns [`AudioError::EncoderInit`] if Opus initialization fails or the
+/// thread cannot be spawned.
+pub fn start_audio_encoder(
+    config: AudioEncoderConfig,
+    frames: mpsc::Receiver<AudioFrame>,
+) -> Result<(AudioEncoderSession, mpsc::Receiver<EncodedPacket>), AudioError> {
+    let (packets_tx, packets_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = Arc::clone(&shutdown);
+
+    let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), AudioError>>();
+
+    let thread_handle = thread::Builder::new()
+        .name("stargaze-audio-encoder".to_string())
+        .spawn(move || {
+            let mut encoder = match opus_enc::init_opus_encoder(&config) {
+                Ok(enc) => {
+                    let _ = init_tx.send(Ok(()));
+                    enc
+                }
+                Err(e) => {
+                    error!("Audio encoder initialization failed: {e}");
+                    let _ = init_tx.send(Err(e));
+                    return;
+                }
+            };
+
+            let mut frames = frames;
+
+            if let Err(e) = opus_enc::run_opus_encode_loop(
+                &mut encoder,
+                &mut frames,
+                &packets_tx,
+                &shutdown_clone,
+            ) {
+                error!("Audio encoder loop failed: {e}");
+            }
+
+            info!("Audio encoder thread exiting");
+        })
+        .map_err(|e| {
+            AudioError::EncoderInit(format!("failed to spawn audio encoder thread: {e}"))
+        })?;
+
+    let init_result = init_rx.recv().map_err(|_| {
+        AudioError::EncoderInit("audio encoder thread exited during initialization".to_string())
+    })?;
+
+    init_result?;
+
+    info!("Audio encoder started on dedicated thread");
+
+    Ok((
+        AudioEncoderSession {
+            thread_handle: Some(thread_handle),
+            shutdown,
+        },
+        packets_rx,
     ))
 }
