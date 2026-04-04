@@ -4,8 +4,8 @@
 //! All `opus` crate interaction is confined to this module.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use stargaze_core::audio::{AudioApplication, AudioEncoderConfig, AudioError, AudioFrame};
 use stargaze_core::encode::EncodedPacket;
