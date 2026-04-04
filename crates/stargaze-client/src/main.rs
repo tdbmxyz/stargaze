@@ -3,6 +3,7 @@ use clap::Parser;
 use stargaze_core::audio::AudioDecoderConfig;
 use stargaze_core::config::{self, ClientConfig, Codec};
 use stargaze_core::decode::DecoderConfig;
+use stargaze_core::mic_forward;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -23,6 +24,14 @@ struct Cli {
     /// Whether to run in fullscreen mode.
     #[arg(long)]
     fullscreen: Option<bool>,
+
+    /// Enable microphone forwarding via rsonance.
+    #[arg(long)]
+    mic_forward: bool,
+
+    /// Port for rsonance mic forwarding [default: 9001].
+    #[arg(long)]
+    mic_forward_port: Option<u16>,
 
     /// Path to config file (default: ~/.config/stargaze/client.toml).
     #[arg(long)]
@@ -63,6 +72,12 @@ fn build_config(cli: &Cli) -> anyhow::Result<ClientConfig> {
     }
     if let Some(fullscreen) = cli.fullscreen {
         cfg.fullscreen = fullscreen;
+    }
+    if cli.mic_forward {
+        cfg.mic_forward.enabled = true;
+    }
+    if let Some(port) = cli.mic_forward_port {
+        cfg.mic_forward.port = port;
     }
 
     if cfg.server_address.is_empty() {
@@ -109,6 +124,22 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Connected, starting decoders and renderer...");
 
+    // Optionally start rsonance transmitter for mic forwarding.
+    let mut rsonance_child = if cfg.mic_forward.enabled {
+        match mic_forward::spawn_rsonance_transmitter(&cfg.mic_forward, &cfg.server_address) {
+            Ok(child) => {
+                info!("Mic forwarding enabled (rsonance transmitter)");
+                Some(child)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start rsonance transmitter: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // SDL2 must be initialized on the main thread.
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
 
@@ -146,6 +177,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Renderer closed, shutting down");
     bridge_handle.abort();
+    if let Some(ref mut child) = rsonance_child {
+        mic_forward::stop_rsonance(child).await;
+    }
     video_decoder_session.stop().ok();
     audio_decoder_session.stop().ok();
     client_transport.abort();
