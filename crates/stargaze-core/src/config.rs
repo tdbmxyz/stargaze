@@ -89,6 +89,37 @@ impl FromStr for Resolution {
     }
 }
 
+// --- MicForwardConfig ---
+
+/// Default port for rsonance mic forwarding (separate from stargaze's QUIC port).
+pub const DEFAULT_MIC_FORWARD_PORT: u16 = 9001;
+
+/// Configuration for microphone forwarding via rsonance subprocess.
+///
+/// When enabled, stargaze spawns `rsonance receiver` on the server and
+/// `rsonance transmitter` on the client to forward the client's microphone
+/// audio to a virtual `PulseAudio` microphone on the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MicForwardConfig {
+    /// Whether mic forwarding is enabled.
+    pub enabled: bool,
+    /// TCP port for rsonance audio streaming.
+    pub port: u16,
+    /// Path to the rsonance binary.
+    pub rsonance_binary: String,
+}
+
+impl Default for MicForwardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: DEFAULT_MIC_FORWARD_PORT,
+            rsonance_binary: "rsonance".to_string(),
+        }
+    }
+}
+
 // --- ServerConfig ---
 
 /// Configuration for the stargaze server.
@@ -107,6 +138,8 @@ pub struct ServerConfig {
     pub bitrate: u32,
     /// Video codec to use.
     pub codec: Codec,
+    /// Mic forwarding configuration.
+    pub mic_forward: MicForwardConfig,
 }
 
 impl Default for ServerConfig {
@@ -118,6 +151,7 @@ impl Default for ServerConfig {
             framerate: 60,
             bitrate: 20,
             codec: Codec::default(),
+            mic_forward: MicForwardConfig::default(),
         }
     }
 }
@@ -134,6 +168,8 @@ pub struct ClientConfig {
     pub port: u16,
     /// Whether to start in fullscreen mode.
     pub fullscreen: bool,
+    /// Mic forwarding configuration.
+    pub mic_forward: MicForwardConfig,
 }
 
 impl Default for ClientConfig {
@@ -142,6 +178,7 @@ impl Default for ClientConfig {
             server_address: String::new(),
             port: DEFAULT_PORT,
             fullscreen: true,
+            mic_forward: MicForwardConfig::default(),
         }
     }
 }
@@ -218,6 +255,9 @@ mod tests {
         assert_eq!(config.framerate, 60);
         assert_eq!(config.bitrate, 20);
         assert_eq!(config.codec, Codec::H265);
+        assert!(!config.mic_forward.enabled);
+        assert_eq!(config.mic_forward.port, 9001);
+        assert_eq!(config.mic_forward.rsonance_binary, "rsonance");
     }
 
     #[test]
@@ -226,6 +266,8 @@ mod tests {
         assert_eq!(config.server_address, "");
         assert_eq!(config.port, 9000);
         assert!(config.fullscreen);
+        assert!(!config.mic_forward.enabled);
+        assert_eq!(config.mic_forward.port, 9001);
     }
 
     #[test]
@@ -267,6 +309,9 @@ mod tests {
         assert_eq!(config.server_address, "10.0.0.5");
         assert_eq!(config.port, 7000);
         assert!(!config.fullscreen);
+        // mic_forward should use defaults when absent from TOML.
+        assert!(!config.mic_forward.enabled);
+        assert_eq!(config.mic_forward.port, 9001);
     }
 
     #[test]
@@ -278,6 +323,53 @@ mod tests {
         assert_eq!(config.bind_address, "0.0.0.0");
         assert_eq!(config.port, 3000);
         assert_eq!(config.framerate, 60);
+        assert!(!config.mic_forward.enabled);
+    }
+
+    #[test]
+    fn test_mic_forward_config_defaults() {
+        let config = MicForwardConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.port, DEFAULT_MIC_FORWARD_PORT);
+        assert_eq!(config.rsonance_binary, "rsonance");
+    }
+
+    #[test]
+    fn test_server_config_with_mic_forward_toml() {
+        let toml_str = r#"
+            bind_address = "0.0.0.0"
+            port = 9000
+
+            [mic_forward]
+            enabled = true
+            port = 8888
+            rsonance_binary = "/usr/local/bin/rsonance"
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.mic_forward.enabled);
+        assert_eq!(config.mic_forward.port, 8888);
+        assert_eq!(
+            config.mic_forward.rsonance_binary,
+            "/usr/local/bin/rsonance"
+        );
+    }
+
+    #[test]
+    fn test_client_config_with_mic_forward_toml() {
+        let toml_str = r#"
+            server_address = "192.168.1.10"
+            port = 9000
+
+            [mic_forward]
+            enabled = true
+            port = 7777
+        "#;
+        let config: ClientConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server_address, "192.168.1.10");
+        assert!(config.mic_forward.enabled);
+        assert_eq!(config.mic_forward.port, 7777);
+        // rsonance_binary should default when not specified.
+        assert_eq!(config.mic_forward.rsonance_binary, "rsonance");
     }
 
     #[test]

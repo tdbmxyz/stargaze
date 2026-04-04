@@ -5,4 +5,5 @@ pub mod decode;
 pub mod encode;
 pub mod error;
 pub mod input;
+pub mod mic_forward;
 pub mod transport;
