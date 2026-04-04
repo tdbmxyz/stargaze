@@ -6,7 +6,7 @@
 use stargaze_core::config::ServerConfig;
 use stargaze_core::encode::EncodedPacket;
 use stargaze_core::transport::{
-    ControlMessage, DatagramHeader, STREAM_TYPE_VIDEO, TransportError, deserialize_control_message,
+    ControlMessage, DatagramHeader, TransportError, deserialize_control_message,
     serialize_control_message, serialize_header,
 };
 use tokio::sync::{mpsc, watch};
@@ -166,6 +166,7 @@ pub(crate) async fn handle_control_messages(
 pub(crate) async fn send_packets(
     connection: &quinn::Connection,
     packets: &mut mpsc::Receiver<EncodedPacket>,
+    stream_type: u8,
 ) -> Result<(), TransportError> {
     use bytes::Bytes;
 
@@ -176,7 +177,7 @@ pub(crate) async fn send_packets(
 
         // Serialize a sample header to determine header size.
         let sample_header = DatagramHeader {
-            stream_type: STREAM_TYPE_VIDEO,
+            stream_type,
             frame_index,
             fragment_index: 0,
             fragment_count: 1,
@@ -204,7 +205,7 @@ pub(crate) async fn send_packets(
             let payload = &pkt.data[start..end];
 
             let header = DatagramHeader {
-                stream_type: STREAM_TYPE_VIDEO,
+                stream_type,
                 frame_index,
                 fragment_index: u16::try_from(i).unwrap_or(u16::MAX),
                 fragment_count: fragment_count_u16,

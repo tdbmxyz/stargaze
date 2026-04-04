@@ -9,7 +9,7 @@ pub(crate) mod sender;
 
 use stargaze_core::config::ServerConfig;
 use stargaze_core::encode::EncodedPacket;
-use stargaze_core::transport::TransportError;
+use stargaze_core::transport::{STREAM_TYPE_AUDIO, STREAM_TYPE_VIDEO, TransportError};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
@@ -41,20 +41,22 @@ impl ServerTransport {
 /// Starts the server transport.
 ///
 /// Binds a `QUIC` endpoint, waits for a client connection, performs
-/// session handshake, and starts streaming encoded packets.
+/// session handshake, and starts streaming encoded video and audio packets.
 ///
 /// # Arguments
 ///
 /// * `config` — Server configuration (bind address, port, resolution, etc.)
-/// * `packets` — Receiver for encoded packets from the encoder
-/// * `idr_tx` — Sender to signal the encoder to produce IDR keyframes
+/// * `video_packets` — Receiver for encoded video packets from the video encoder
+/// * `audio_packets` — Receiver for encoded audio packets from the audio encoder
+/// * `idr_tx` — Sender to signal the video encoder to produce IDR keyframes
 ///
 /// # Errors
 ///
 /// Returns `TransportError` if `QUIC` endpoint setup fails.
 pub fn start_server_transport(
     config: &ServerConfig,
-    packets: mpsc::Receiver<EncodedPacket>,
+    video_packets: mpsc::Receiver<EncodedPacket>,
+    audio_packets: mpsc::Receiver<EncodedPacket>,
     idr_tx: watch::Sender<u64>,
 ) -> Result<ServerTransport, TransportError> {
     let bind_addr: std::net::SocketAddr = format!("{}:{}", config.bind_address, config.port)
@@ -69,7 +71,9 @@ pub fn start_server_transport(
 
     let config = config.clone();
     let task_handle = tokio::spawn(async move {
-        if let Err(e) = run_server_loop(endpoint, config, packets, idr_tx).await {
+        if let Err(e) =
+            run_server_loop(endpoint, config, video_packets, audio_packets, idr_tx).await
+        {
             error!("Server transport error: {e}");
         }
     });
@@ -81,7 +85,8 @@ pub fn start_server_transport(
 async fn run_server_loop(
     endpoint: quinn::Endpoint,
     config: ServerConfig,
-    mut packets: mpsc::Receiver<EncodedPacket>,
+    mut video_packets: mpsc::Receiver<EncodedPacket>,
+    mut audio_packets: mpsc::Receiver<EncodedPacket>,
     idr_tx: watch::Sender<u64>,
 ) -> Result<(), TransportError> {
     // Accept one connection (MVP: single client).
@@ -112,19 +117,40 @@ async fn run_server_loop(
         session_response.0, session_response.1, session_response.2, session_response.3
     );
 
-    // Start the sender + control listener concurrently.
     let control_handle = tokio::spawn(async move {
         if let Err(e) = sender::handle_control_messages(&mut recv_stream, &idr_tx).await {
             warn!("Control stream error: {e}");
         }
     });
 
-    let send_result = sender::send_packets(&connection, &mut packets).await;
+    // Run video and audio senders concurrently.
+    let video_conn = connection.clone();
+    let video_handle = tokio::spawn(async move {
+        if let Err(e) =
+            sender::send_packets(&video_conn, &mut video_packets, STREAM_TYPE_VIDEO).await
+        {
+            warn!("Video send error: {e}");
+        }
+    });
 
-    // Clean up.
+    let audio_handle = tokio::spawn(async move {
+        if let Err(e) =
+            sender::send_packets(&connection, &mut audio_packets, STREAM_TYPE_AUDIO).await
+        {
+            warn!("Audio send error: {e}");
+        }
+    });
+
+    let (video_result, audio_result) = tokio::join!(video_handle, audio_handle);
+    if let Err(e) = video_result {
+        warn!("Video send task panicked: {e}");
+    }
+    if let Err(e) = audio_result {
+        warn!("Audio send task panicked: {e}");
+    }
+
     control_handle.abort();
-    connection.close(quinn::VarInt::from_u32(0), b"server shutdown");
     endpoint.close(quinn::VarInt::from_u32(0), b"server shutdown");
 
-    send_result
+    Ok(())
 }
