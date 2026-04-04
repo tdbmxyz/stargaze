@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 mod audio;
 mod capture;
 mod encode;
+mod input;
 mod transport;
 
 use capture::CaptureConfig;
@@ -152,8 +153,14 @@ async fn main() -> anyhow::Result<()> {
         encode::start_audio_encoder(audio_encoder_config, audio_frames)?;
     info!("Audio encoder started");
 
+    // Start input injection pipeline.
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<stargaze_core::input::InputEvent>(64);
+    let input_session = input::start_input_injection(input_rx)?;
+    info!("Input injection started");
+
     // Start transport — accepts client connection and streams video + audio packets.
-    let server_transport = transport::start_server_transport(&cfg, packets, audio_packets, idr_tx)?;
+    let server_transport =
+        transport::start_server_transport(&cfg, packets, audio_packets, idr_tx, input_tx)?;
     let abort_handle = server_transport.abort_handle();
     info!("Transport started, waiting for client connection...");
 
@@ -176,6 +183,9 @@ async fn main() -> anyhow::Result<()> {
     audio_capture_session.stop()?;
     encoder_session.stop()?;
     capture_session.stop()?;
+    input_session
+        .stop()
+        .map_err(|e| anyhow::anyhow!("input session shutdown: {e}"))?;
 
     Ok(())
 }

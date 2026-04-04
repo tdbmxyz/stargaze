@@ -140,9 +140,8 @@ pub(super) fn run_sdl_loop(
                 }
 
                 sdl2::event::Event::ControllerAxisMotion { axis, value, .. } => {
-                    if let Some(ga) = map_gamepad_axis(axis) {
-                        let _ = input_tx.send(InputEvent::GamepadAxis { axis: ga, value });
-                    }
+                    let ga = map_gamepad_axis(axis);
+                    let _ = input_tx.send(InputEvent::GamepadAxis { axis: ga, value });
                 }
 
                 sdl2::event::Event::ControllerButtonDown { button, .. } => {
@@ -228,18 +227,18 @@ fn map_mouse_button(btn: sdl2::mouse::MouseButton) -> Option<MouseButton> {
         sdl2::mouse::MouseButton::Middle => Some(MouseButton::Middle),
         sdl2::mouse::MouseButton::X1 => Some(MouseButton::Side),
         sdl2::mouse::MouseButton::X2 => Some(MouseButton::Extra),
-        _ => None,
+        sdl2::mouse::MouseButton::Unknown => None,
     }
 }
 
-fn map_gamepad_axis(axis: sdl2::controller::Axis) -> Option<GamepadAxis> {
+fn map_gamepad_axis(axis: sdl2::controller::Axis) -> GamepadAxis {
     match axis {
-        sdl2::controller::Axis::LeftX => Some(GamepadAxis::LeftX),
-        sdl2::controller::Axis::LeftY => Some(GamepadAxis::LeftY),
-        sdl2::controller::Axis::RightX => Some(GamepadAxis::RightX),
-        sdl2::controller::Axis::RightY => Some(GamepadAxis::RightY),
-        sdl2::controller::Axis::TriggerLeft => Some(GamepadAxis::TriggerLeft),
-        sdl2::controller::Axis::TriggerRight => Some(GamepadAxis::TriggerRight),
+        sdl2::controller::Axis::LeftX => GamepadAxis::LeftX,
+        sdl2::controller::Axis::LeftY => GamepadAxis::LeftY,
+        sdl2::controller::Axis::RightX => GamepadAxis::RightX,
+        sdl2::controller::Axis::RightY => GamepadAxis::RightY,
+        sdl2::controller::Axis::TriggerLeft => GamepadAxis::TriggerLeft,
+        sdl2::controller::Axis::TriggerRight => GamepadAxis::TriggerRight,
     }
 }
 

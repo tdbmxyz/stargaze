@@ -104,13 +104,24 @@ async fn main() -> anyhow::Result<()> {
         channels: 2,
     };
 
-    let (client_transport, video_frames, audio_frames) =
+    let (client_transport, video_frames, audio_frames, transport_input_tx) =
         transport::connect(&cfg, session_request).await?;
 
     info!("Connected, starting decoders and renderer...");
 
     // SDL2 must be initialized on the main thread.
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
+
+    // Bridge: SDL event loop (std::sync::mpsc) → tokio channel → transport.
+    let (sdl_input_tx, sdl_input_rx) =
+        std::sync::mpsc::channel::<stargaze_core::input::InputEvent>();
+    let bridge_handle = tokio::spawn(async move {
+        while let Ok(event) = sdl_input_rx.recv() {
+            if transport_input_tx.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
 
     // Start the audio decoder thread — sends decoded PCM to a channel.
     let (audio_decoder_session, audio_pcm_rx) =
@@ -129,10 +140,12 @@ async fn main() -> anyhow::Result<()> {
             decoded_rx,
             audio_pcm_rx,
             cfg.fullscreen,
+            sdl_input_tx,
         )
     })?;
 
     info!("Renderer closed, shutting down");
+    bridge_handle.abort();
     video_decoder_session.stop().ok();
     audio_decoder_session.stop().ok();
     client_transport.abort();

@@ -101,5 +101,10 @@ pub async fn connect(
         }
     });
 
-    Ok((ClientTransport { task_handle }, video_rx, audio_rx, input_tx))
+    Ok((
+        ClientTransport { task_handle },
+        video_rx,
+        audio_rx,
+        input_tx,
+    ))
 }
