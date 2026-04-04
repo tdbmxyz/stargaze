@@ -34,6 +34,15 @@ pub enum AudioApplication {
     LowDelay,
 }
 
+/// Configuration for the Opus audio decoder.
+#[derive(Debug, Clone)]
+pub struct AudioDecoderConfig {
+    /// Sample rate in Hz (must be 48000 for Opus).
+    pub sample_rate: u32,
+    /// Number of channels (1 or 2).
+    pub channels: u16,
+}
+
 /// Configuration for the Opus audio encoder.
 #[derive(Debug, Clone)]
 pub struct AudioEncoderConfig {
@@ -61,6 +70,12 @@ pub enum AudioError {
 
     #[error("audio encoding failed: {0}")]
     EncodeFailed(String),
+
+    #[error("audio decoder initialization failed: {0}")]
+    DecoderInit(String),
+
+    #[error("audio decoding failed: {0}")]
+    DecodeFailed(String),
 
     #[error("audio channel closed: {0}")]
     ChannelClosed(String),
@@ -140,5 +155,27 @@ mod tests {
         assert_ne!(AudioApplication::Audio, AudioApplication::Voip);
         assert_ne!(AudioApplication::Voip, AudioApplication::LowDelay);
         assert_ne!(AudioApplication::Audio, AudioApplication::LowDelay);
+    }
+
+    #[test]
+    fn audio_decoder_config_construction() {
+        let cfg = AudioDecoderConfig {
+            sample_rate: 48000,
+            channels: 2,
+        };
+        assert_eq!(cfg.sample_rate, 48000);
+        assert_eq!(cfg.channels, 2);
+    }
+
+    #[test]
+    fn audio_error_decoder_variants_display() {
+        let err = AudioError::DecoderInit("opus init failed".to_string());
+        assert_eq!(
+            err.to_string(),
+            "audio decoder initialization failed: opus init failed"
+        );
+
+        let err = AudioError::DecodeFailed("corrupt packet".to_string());
+        assert_eq!(err.to_string(), "audio decoding failed: corrupt packet");
     }
 }
