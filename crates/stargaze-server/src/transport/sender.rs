@@ -5,6 +5,7 @@
 
 use stargaze_core::config::ServerConfig;
 use stargaze_core::encode::EncodedPacket;
+use stargaze_core::input::InputEvent;
 use stargaze_core::transport::{
     ControlMessage, DatagramHeader, TransportError, deserialize_control_message,
     serialize_control_message, serialize_header,
@@ -107,6 +108,7 @@ pub(crate) async fn handle_session_handshake(
 pub(crate) async fn handle_control_messages(
     recv_stream: &mut quinn::RecvStream,
     idr_tx: &watch::Sender<u64>,
+    input_tx: &mpsc::Sender<InputEvent>,
 ) -> Result<(), TransportError> {
     loop {
         // Read length prefix.
@@ -148,6 +150,12 @@ pub(crate) async fn handle_control_messages(
             }
             ControlMessage::Ping { timestamp_ms } => {
                 debug!(timestamp_ms, "Received ping (pong not yet implemented)");
+            }
+            ControlMessage::Input(event) => {
+                debug!("Received input event from client");
+                if input_tx.try_send(event).is_err() {
+                    debug!("Input channel full or closed, dropping event");
+                }
             }
             other => {
                 warn!("Unexpected control message: {other:?}");

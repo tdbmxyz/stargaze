@@ -9,6 +9,7 @@ pub(crate) mod sender;
 
 use stargaze_core::config::ServerConfig;
 use stargaze_core::encode::EncodedPacket;
+use stargaze_core::input::InputEvent;
 use stargaze_core::transport::{STREAM_TYPE_AUDIO, STREAM_TYPE_VIDEO, TransportError};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
@@ -49,6 +50,7 @@ impl ServerTransport {
 /// * `video_packets` — Receiver for encoded video packets from the video encoder
 /// * `audio_packets` — Receiver for encoded audio packets from the audio encoder
 /// * `idr_tx` — Sender to signal the video encoder to produce IDR keyframes
+/// * `input_tx` — Sender to forward client input events to the input injection pipeline
 ///
 /// # Errors
 ///
@@ -58,6 +60,7 @@ pub fn start_server_transport(
     video_packets: mpsc::Receiver<EncodedPacket>,
     audio_packets: mpsc::Receiver<EncodedPacket>,
     idr_tx: watch::Sender<u64>,
+    input_tx: mpsc::Sender<InputEvent>,
 ) -> Result<ServerTransport, TransportError> {
     let bind_addr: std::net::SocketAddr = format!("{}:{}", config.bind_address, config.port)
         .parse()
@@ -71,8 +74,15 @@ pub fn start_server_transport(
 
     let config = config.clone();
     let task_handle = tokio::spawn(async move {
-        if let Err(e) =
-            run_server_loop(endpoint, config, video_packets, audio_packets, idr_tx).await
+        if let Err(e) = run_server_loop(
+            endpoint,
+            config,
+            video_packets,
+            audio_packets,
+            idr_tx,
+            input_tx,
+        )
+        .await
         {
             error!("Server transport error: {e}");
         }
@@ -88,6 +98,7 @@ async fn run_server_loop(
     mut video_packets: mpsc::Receiver<EncodedPacket>,
     mut audio_packets: mpsc::Receiver<EncodedPacket>,
     idr_tx: watch::Sender<u64>,
+    input_tx: mpsc::Sender<InputEvent>,
 ) -> Result<(), TransportError> {
     // Accept one connection (MVP: single client).
     let incoming = endpoint.accept().await.ok_or_else(|| {
@@ -118,7 +129,8 @@ async fn run_server_loop(
     );
 
     let control_handle = tokio::spawn(async move {
-        if let Err(e) = sender::handle_control_messages(&mut recv_stream, &idr_tx).await {
+        if let Err(e) = sender::handle_control_messages(&mut recv_stream, &idr_tx, &input_tx).await
+        {
             warn!("Control stream error: {e}");
         }
     });
