@@ -89,6 +89,11 @@ fn build_config(cli: &Cli) -> anyhow::Result<ClientConfig> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install the ring crypto provider for rustls/quinn before any TLS operation.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     init_tracing();
 
     let cli = Cli::parse();
