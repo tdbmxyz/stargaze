@@ -2,6 +2,7 @@ use clap::Parser;
 use stargaze_core::audio::{AudioApplication, AudioCaptureConfig, AudioEncoderConfig};
 use stargaze_core::config::{self, Codec, Resolution, ServerConfig};
 use stargaze_core::encode::EncoderConfig;
+use stargaze_core::mic_forward;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -40,6 +41,14 @@ struct Cli {
     /// Video codec (h265, av1).
     #[arg(long)]
     codec: Option<Codec>,
+
+    /// Enable microphone forwarding via rsonance.
+    #[arg(long)]
+    mic_forward: bool,
+
+    /// Port for rsonance mic forwarding [default: 9001].
+    #[arg(long)]
+    mic_forward_port: Option<u16>,
 
     /// Path to config file (default: ~/.config/stargaze/server.toml).
     #[arg(long)]
@@ -98,6 +107,12 @@ fn build_config(cli: &Cli) -> anyhow::Result<ServerConfig> {
     }
     if let Some(codec) = cli.codec {
         cfg.codec = codec;
+    }
+    if cli.mic_forward {
+        cfg.mic_forward.enabled = true;
+    }
+    if let Some(port) = cli.mic_forward_port {
+        cfg.mic_forward.port = port;
     }
 
     Ok(cfg)
@@ -158,6 +173,22 @@ async fn main() -> anyhow::Result<()> {
     let input_session = input::start_input_injection(input_rx)?;
     info!("Input injection started");
 
+    // Optionally start rsonance receiver for mic forwarding.
+    let mut rsonance_child = if cfg.mic_forward.enabled {
+        match mic_forward::spawn_rsonance_receiver(&cfg.mic_forward) {
+            Ok(child) => {
+                info!("Mic forwarding enabled (rsonance receiver)");
+                Some(child)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start rsonance receiver: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Start transport — accepts client connection and streams video + audio packets.
     let server_transport =
         transport::start_server_transport(&cfg, packets, audio_packets, idr_tx, input_tx)?;
@@ -179,6 +210,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("Shutting down pipeline");
+    if let Some(ref mut child) = rsonance_child {
+        mic_forward::stop_rsonance(child).await;
+    }
     audio_encoder_session.stop()?;
     audio_capture_session.stop()?;
     encoder_session.stop()?;
