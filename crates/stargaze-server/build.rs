@@ -9,20 +9,25 @@
 ///
 /// This build script re-queries `pkg-config` to obtain any additional linker flags
 /// beyond the top-level `FFmpeg` libraries and emits them via `cargo:rustc-link-lib`.
+/// It also queries `opus` for linker paths so `audiopus_sys` can find `libopus`.
 /// It uses dynamic (non-`--static`) flags by default, which is correct for system
 /// packages that provide shared libraries.
 fn main() {
     // Inherit LD_LIBRARY_PATH so the child pkg-config process can find libpkgconf.
     let ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    let pkg_config_path = std::env::var("PKG_CONFIG_PATH").unwrap_or_default();
 
+    emit_ffmpeg_link_flags(&ld_path, &pkg_config_path);
+    emit_opus_link_paths(&ld_path, &pkg_config_path);
+}
+
+/// Queries `pkg-config` for `FFmpeg` transitive link flags and emits them.
+fn emit_ffmpeg_link_flags(ld_path: &str, pkg_config_path: &str) {
     // Only run the extra link fixup when pkg-config is available.
     let Ok(output) = std::process::Command::new("pkg-config")
         .args(["--libs", "libavformat", "libavcodec", "libavutil"])
-        .env(
-            "PKG_CONFIG_PATH",
-            std::env::var("PKG_CONFIG_PATH").unwrap_or_default(),
-        )
-        .env("LD_LIBRARY_PATH", &ld_path)
+        .env("PKG_CONFIG_PATH", pkg_config_path)
+        .env("LD_LIBRARY_PATH", ld_path)
         .output()
     else {
         return;
@@ -50,6 +55,29 @@ fn main() {
                 println!("cargo:rustc-link-lib={lib}");
             }
         } else if let Some(path) = token.strip_prefix("-L") {
+            println!("cargo:rustc-link-search=native={path}");
+        }
+    }
+}
+
+/// Queries `pkg-config` for `opus` library paths so `audiopus_sys` can find `libopus`.
+fn emit_opus_link_paths(ld_path: &str, pkg_config_path: &str) {
+    let Ok(output) = std::process::Command::new("pkg-config")
+        .args(["--libs", "opus"])
+        .env("PKG_CONFIG_PATH", pkg_config_path)
+        .env("LD_LIBRARY_PATH", ld_path)
+        .output()
+    else {
+        return;
+    };
+
+    if !output.status.success() {
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for token in stdout.split_whitespace() {
+        if let Some(path) = token.strip_prefix("-L") {
             println!("cargo:rustc-link-search=native={path}");
         }
     }
