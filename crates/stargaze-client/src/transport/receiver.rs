@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use stargaze_core::input::InputEvent;
 use stargaze_core::transport::{
     ControlMessage, DatagramHeader, IDR_RATE_LIMIT_MS, MAX_PENDING_FRAMES, ReassembledFrame,
     STREAM_TYPE_AUDIO, STREAM_TYPE_VIDEO, TransportError, deserialize_control_message,
@@ -262,71 +263,89 @@ pub(crate) async fn receive_loop(
     mut control_send: quinn::SendStream,
     video_tx: mpsc::Sender<ReassembledFrame>,
     audio_tx: mpsc::Sender<ReassembledFrame>,
+    mut input_rx: mpsc::Receiver<InputEvent>,
 ) -> Result<(), TransportError> {
     let mut assembler = FrameAssembler::new();
     let mut total_frames: u64 = 0;
 
     loop {
-        let datagram = match connection.read_datagram().await {
-            Ok(bytes) => bytes,
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                info!("Server closed connection");
-                return Ok(());
-            }
-            Err(quinn::ConnectionError::LocallyClosed) => {
-                info!("Connection closed locally");
-                return Ok(());
-            }
-            Err(e) => {
-                return Err(TransportError::ConnectionError(format!(
-                    "read datagram: {e}"
-                )));
-            }
-        };
+        tokio::select! {
+            datagram_result = connection.read_datagram() => {
+                let datagram = match datagram_result {
+                    Ok(bytes) => bytes,
+                    Err(quinn::ConnectionError::ApplicationClosed(_)) => {
+                        info!("Server closed connection");
+                        return Ok(());
+                    }
+                    Err(quinn::ConnectionError::LocallyClosed) => {
+                        info!("Connection closed locally");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        return Err(TransportError::ConnectionError(format!(
+                            "read datagram: {e}"
+                        )));
+                    }
+                };
 
-        let (header, payload) = match deserialize_header(&datagram) {
-            Ok(result) => result,
-            Err(e) => {
-                warn!("Failed to deserialize datagram header: {e}");
-                continue;
-            }
-        };
+                let (header, payload) = match deserialize_header(&datagram) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warn!("Failed to deserialize datagram header: {e}");
+                        continue;
+                    }
+                };
 
-        let (completed_frames, need_idr) = assembler.process_datagram(&header, payload.to_vec());
+                let (completed_frames, need_idr) =
+                    assembler.process_datagram(&header, payload.to_vec());
 
-        for frame in completed_frames {
-            total_frames += 1;
-            if frame.is_keyframe || total_frames % 300 == 1 {
-                info!(
-                    frame = total_frames,
-                    pts = frame.pts,
-                    size = frame.data.len(),
-                    keyframe = frame.is_keyframe,
-                    stream_type = frame.stream_type,
-                    "Reassembled frame"
-                );
-            }
+                for frame in completed_frames {
+                    total_frames += 1;
+                    if frame.is_keyframe || total_frames % 300 == 1 {
+                        info!(
+                            frame = total_frames,
+                            pts = frame.pts,
+                            size = frame.data.len(),
+                            keyframe = frame.is_keyframe,
+                            stream_type = frame.stream_type,
+                            "Reassembled frame"
+                        );
+                    }
 
-            let send_result = match frame.stream_type {
-                STREAM_TYPE_VIDEO => video_tx.send(frame).await,
-                STREAM_TYPE_AUDIO => audio_tx.send(frame).await,
-                other => {
-                    warn!(stream_type = other, "Unknown stream type, dropping frame");
-                    continue;
+                    let send_result = match frame.stream_type {
+                        STREAM_TYPE_VIDEO => video_tx.send(frame).await,
+                        STREAM_TYPE_AUDIO => audio_tx.send(frame).await,
+                        other => {
+                            warn!(stream_type = other, "Unknown stream type, dropping frame");
+                            continue;
+                        }
+                    };
+
+                    if send_result.is_err() {
+                        info!("Frame receiver dropped, stopping transport");
+                        return Ok(());
+                    }
                 }
-            };
 
-            if send_result.is_err() {
-                info!("Frame receiver dropped, stopping transport");
-                return Ok(());
+                if need_idr {
+                    debug!("Requesting IDR keyframe");
+                    let idr_msg = serialize_control_message(&ControlMessage::IdrRequest)?;
+                    if let Err(e) = control_send.write_all(&idr_msg).await {
+                        warn!("Failed to send IDR request: {e}");
+                    }
+                }
             }
-        }
 
-        if need_idr {
-            debug!("Requesting IDR keyframe");
-            let idr_msg = serialize_control_message(&ControlMessage::IdrRequest)?;
-            if let Err(e) = control_send.write_all(&idr_msg).await {
-                warn!("Failed to send IDR request: {e}");
+            input_event = input_rx.recv() => {
+                let Some(event) = input_event else {
+                    debug!("Input channel closed");
+                    continue;
+                };
+                let msg = ControlMessage::Input(event);
+                let bytes = serialize_control_message(&msg)?;
+                if let Err(e) = control_send.write_all(&bytes).await {
+                    warn!("Failed to send input event: {e}");
+                }
             }
         }
     }

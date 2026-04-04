@@ -7,6 +7,7 @@ pub(crate) mod quic;
 pub mod receiver;
 
 use stargaze_core::config::{ClientConfig, Codec};
+use stargaze_core::input::InputEvent;
 use stargaze_core::transport::{ReassembledFrame, TransportError};
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -47,11 +48,6 @@ pub struct SessionRequest {
     pub codec: Codec,
 }
 
-/// Connects to the server and starts receiving frames.
-///
-/// Returns a `ClientTransport` handle and two `mpsc::Receiver`s —
-/// one for video frames and one for audio frames.
-///
 /// # Errors
 ///
 /// Returns `TransportError` if connection or handshake fails.
@@ -63,6 +59,7 @@ pub async fn connect(
         ClientTransport,
         mpsc::Receiver<ReassembledFrame>,
         mpsc::Receiver<ReassembledFrame>,
+        mpsc::Sender<InputEvent>,
     ),
     TransportError,
 > {
@@ -76,7 +73,6 @@ pub async fn connect(
         "Connected to server"
     );
 
-    // Open control stream and perform handshake.
     let (mut send_stream, mut recv_stream) = connection.open_bi().await.map_err(|e| {
         TransportError::ConnectionError(format!("failed to open control stream: {e}"))
     })?;
@@ -95,12 +91,15 @@ pub async fn connect(
 
     let (video_tx, video_rx) = mpsc::channel::<ReassembledFrame>(16);
     let (audio_tx, audio_rx) = mpsc::channel::<ReassembledFrame>(16);
+    let (input_tx, input_rx) = mpsc::channel::<InputEvent>(64);
 
     let task_handle = tokio::spawn(async move {
-        if let Err(e) = receiver::receive_loop(connection, send_stream, video_tx, audio_tx).await {
+        if let Err(e) =
+            receiver::receive_loop(connection, send_stream, video_tx, audio_tx, input_rx).await
+        {
             error!("Client transport error: {e}");
         }
     });
 
-    Ok((ClientTransport { task_handle }, video_rx, audio_rx))
+    Ok((ClientTransport { task_handle }, video_rx, audio_rx, input_tx))
 }
