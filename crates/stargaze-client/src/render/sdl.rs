@@ -1,14 +1,20 @@
 use anyhow::anyhow;
+use sdl2::audio::AudioQueue;
 use stargaze_core::decode::{DecodedFrame, DecoderConfig};
-use tracing::info;
+use tracing::{info, warn};
+
+use super::audio::create_audio_queue;
 
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn run_sdl_loop(
+    sdl: &sdl2::Sdl,
     config: &DecoderConfig,
     decoded_rx: std::sync::mpsc::Receiver<DecodedFrame>,
+    audio_pcm_rx: std::sync::mpsc::Receiver<Vec<f32>>,
     fullscreen: bool,
 ) -> Result<(), anyhow::Error> {
-    let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
+    let audio_queue: AudioQueue<f32> = create_audio_queue(sdl)?;
+
     let video = sdl
         .video()
         .map_err(|e| anyhow!("SDL2 video init failed: {e}"))?;
@@ -59,6 +65,7 @@ pub(super) fn run_sdl_loop(
             }
         }
 
+        // Drain decoded video frames, keeping only the latest.
         let mut latest_frame: Option<DecodedFrame> = None;
         while let Ok(frame) = decoded_rx.try_recv() {
             latest_frame = Some(frame);
@@ -74,6 +81,14 @@ pub(super) fn run_sdl_loop(
             canvas
                 .copy(&texture, None, None)
                 .map_err(|e| anyhow!("canvas copy failed: {e}"))?;
+        }
+
+        // Drain decoded audio PCM and queue for playback.
+        while let Ok(pcm) = audio_pcm_rx.try_recv() {
+            if let Err(e) = audio_queue.queue_audio(&pcm) {
+                warn!("Failed to queue audio: {e}");
+                break;
+            }
         }
 
         canvas.present();
