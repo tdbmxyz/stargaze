@@ -3,8 +3,9 @@
 //! Handles encoder initialization and the synchronous encode loop.
 //! All `opus` crate interaction is confined to this module.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use stargaze_core::audio::{AudioApplication, AudioEncoderConfig, AudioError, AudioFrame};
 use stargaze_core::encode::EncodedPacket;
@@ -69,13 +70,18 @@ pub(crate) fn init_opus_encoder(config: &AudioEncoderConfig) -> Result<opus::Enc
 
 /// Runs the Opus encode loop: receives [`AudioFrame`]s, encodes them, sends [`EncodedPacket`]s.
 ///
+/// `PipeWire` delivers audio buffers of arbitrary size, but Opus requires
+/// exactly `OPUS_FRAME_SAMPLES` samples per channel per encode call.  This
+/// loop accumulates incoming PCM data in a ring buffer and drains it in
+/// correctly-sized chunks so no audio is dropped.
+///
 /// Blocks until `shutdown` is signaled or the input channel closes.
 /// Meant to run on a dedicated [`std::thread`].
 ///
 /// # Errors
 ///
 /// Returns [`AudioError::EncodeFailed`] if a fatal encode error occurs.
-/// Non-fatal per-frame errors (wrong size) are logged and skipped.
+/// Non-fatal per-frame errors are logged and skipped.
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn run_opus_encode_loop(
     encoder: &mut opus::Encoder,
@@ -85,6 +91,9 @@ pub(crate) fn run_opus_encode_loop(
 ) -> Result<(), AudioError> {
     let mut output_buf = vec![0u8; OPUS_MAX_PACKET_SIZE];
     let mut frame_counter: u64 = 0;
+    let mut sample_buf: VecDeque<f32> = VecDeque::new();
+    let mut samples_consumed: u64 = 0;
+    let mut channels: u16 = 0;
 
     loop {
         // Check shutdown flag before blocking.
@@ -105,42 +114,46 @@ pub(crate) fn run_opus_encode_loop(
             break;
         }
 
-        let expected_samples = OPUS_FRAME_SAMPLES * usize::from(frame.channels);
-        if frame.data.len() != expected_samples {
-            warn!(
-                frame = frame_counter,
-                got = frame.data.len(),
-                expected = expected_samples,
-                "Audio frame has wrong sample count, skipping"
-            );
-            frame_counter += 1;
-            continue;
+        if channels == 0 {
+            channels = frame.channels;
         }
 
-        let len = match encoder.encode_float(&frame.data, &mut output_buf) {
-            Ok(n) => n,
-            Err(e) => {
-                warn!(
-                    frame = frame_counter,
-                    "Opus encode error: {e}, skipping frame"
-                );
-                frame_counter += 1;
-                continue;
+        sample_buf.extend(&frame.data);
+
+        let chunk_size = OPUS_FRAME_SAMPLES * usize::from(channels);
+
+        while sample_buf.len() >= chunk_size {
+            let chunk: Vec<f32> = sample_buf.drain(..chunk_size).collect();
+
+            let pts = samples_consumed / u64::from(channels);
+
+            let len = match encoder.encode_float(&chunk, &mut output_buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(
+                        frame = frame_counter,
+                        "Opus encode error: {e}, skipping frame"
+                    );
+                    frame_counter += 1;
+                    samples_consumed += chunk_size as u64;
+                    continue;
+                }
+            };
+
+            let packet = EncodedPacket {
+                data: output_buf[..len].to_vec(),
+                pts,
+                is_keyframe: false,
+            };
+
+            if packets_tx.blocking_send(packet).is_err() {
+                debug!("Audio packet receiver dropped, stopping encoder");
+                return Ok(());
             }
-        };
 
-        let packet = EncodedPacket {
-            data: output_buf[..len].to_vec(),
-            pts: frame.pts,
-            is_keyframe: false,
-        };
-
-        if packets_tx.blocking_send(packet).is_err() {
-            debug!("Audio packet receiver dropped, stopping encoder");
-            break;
+            frame_counter += 1;
+            samples_consumed += chunk_size as u64;
         }
-
-        frame_counter += 1;
     }
 
     info!(total_frames = frame_counter, "Opus encoder loop finished");
