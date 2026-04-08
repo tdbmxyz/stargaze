@@ -89,7 +89,27 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
 
     info!("Found hevc_nvenc encoder: {}", codec.name());
 
-    // Step 2: Create CUDA hardware device context.
+    // Step 2: Pre-validate CUDA availability via cudarc before FFmpeg tries
+    // to create a CUDA device context.  FFmpeg's av_hwdevice_ctx_create can
+    // segfault if the CUDA driver is missing or broken rather than returning
+    // an error code.  Calling cuInit(0) first surfaces the problem cleanly.
+    match std::panic::catch_unwind(cudarc::driver::result::init) {
+        Ok(Ok(())) => debug!("CUDA pre-check passed (cuInit succeeded)"),
+        Ok(Err(e)) => {
+            return Err(EncodeError::InitError(format!(
+                "CUDA driver error during cuInit: {e:?} — is the NVIDIA driver loaded?"
+            )));
+        }
+        Err(_) => {
+            return Err(EncodeError::InitError(
+                "CUDA driver library (libcuda.so) not found — \
+                 is the NVIDIA driver installed and LD_LIBRARY_PATH set?"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // Step 3: Create CUDA hardware device context.
     let mut hw_device_ctx: *mut ffmpeg_sys_next::AVBufferRef = ptr::null_mut();
     let ret = unsafe {
         ffmpeg_sys_next::av_hwdevice_ctx_create(
@@ -107,7 +127,7 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
     }
     debug!("Created CUDA device context");
 
-    // Step 3: Allocate and configure hardware frames context.
+    // Step 4: Allocate and configure hardware frames context.
     let hw_frames_ctx = unsafe { ffmpeg_sys_next::av_hwframe_ctx_alloc(hw_device_ctx) };
     if hw_frames_ctx.is_null() {
         unsafe { ffmpeg_sys_next::av_buffer_unref(&raw mut hw_device_ctx) };
@@ -144,7 +164,7 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
         config.width, config.height
     );
 
-    // Step 4: Create codec context and configure.
+    // Step 5: Create codec context and configure.
     let mut ctx = ffmpeg_next::codec::context::Context::new_with_codec(codec);
 
     // Attach hardware contexts before configuring the encoder.
@@ -180,7 +200,7 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
         (*raw_ctx).color_trc = ffmpeg_sys_next::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
     }
 
-    // Step 5: Open encoder with NVENC-specific options.
+    // Step 6: Open encoder with NVENC-specific options.
     let mut opts = ffmpeg_next::Dictionary::new();
     opts.set("preset", "p1");
     opts.set("tune", "ull");

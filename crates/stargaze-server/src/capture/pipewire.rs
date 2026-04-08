@@ -41,6 +41,9 @@ struct CaptureCallbackData {
     resolution_tx: Option<oneshot::Sender<Resolution>>,
     /// Frame counter for diagnostic logging.
     frame_count: u64,
+    /// Whether `ack_format` has been called for the current format.
+    /// Prevents re-entrant `update_params` → `param_changed` cycling.
+    format_acked: bool,
 }
 
 /// Maps a SPA video format to our internal `PixelFormat`.
@@ -459,6 +462,7 @@ pub fn run_capture_stream(
         modifier: 0,
         resolution_tx: Some(resolution_tx),
         frame_count: 0,
+        format_acked: false,
     };
 
     // We need a reference to the mainloop inside callbacks.
@@ -525,14 +529,13 @@ pub fn run_capture_stream(
                 }
 
                 // ACK the format by telling PipeWire which buffer types we
-                // accept.  Without this call PipeWire cycles between
-                // Streaming and Paused because it never receives buffer
-                // parameters.
-                //
-                // If the negotiated format includes a modifier (DMA-BUF
-                // path), request DmaBuf buffers; otherwise fall back to
-                // MemPtr (shared-memory).
-                ack_format(stream, data.modifier);
+                // accept.  Only do this once per negotiation — calling
+                // update_params re-triggers param_changed, causing a
+                // Paused↔Streaming cycle that can corrupt buffer state.
+                if !data.format_acked {
+                    data.format_acked = true;
+                    ack_format(stream, data.modifier);
+                }
             }
         })
         .process(move |stream, data| {
@@ -631,21 +634,59 @@ pub fn run_capture_stream(
                 // CPU-mapped path: copy bytes out of the PipeWire buffer.
                 // MemFd buffers are also memory-mapped by PipeWire (MAP_BUFFERS flag),
                 // so d.data() works identically for both MemPtr and MemFd.
-                let Some(slice) = d.data() else {
-                    warn!("MemPtr buffer has null data pointer");
-                    return;
+                // Grab the fd before taking a mutable borrow via d.data().
+                let memfd_raw = if data_type == pipewire::spa::buffer::DataType::MemFd {
+                    Some(d.fd())
+                } else {
+                    None
                 };
 
                 let size = chunk_size as usize;
-                if size > slice.len() {
-                    warn!(
-                        "Chunk size ({size}) exceeds buffer capacity ({})",
-                        slice.len()
-                    );
-                    return;
-                }
 
-                let pixels = slice[..size].to_vec();
+                // For MemFd buffers, PipeWire's MAP_BUFFERS mapping can be
+                // unreliable (the data pointer exists but pages aren't
+                // readable, causing SIGBUS/SIGSEGV on first access).  Map the
+                // fd ourselves with explicit PROT_READ to get a guaranteed-
+                // valid mapping.
+                let pixels = if let Some(raw_fd) = memfd_raw {
+                    let mapped = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            size,
+                            libc::PROT_READ,
+                            libc::MAP_SHARED,
+                            raw_fd,
+                            chunk_offset.into(),
+                        )
+                    };
+                    if mapped == libc::MAP_FAILED {
+                        warn!(
+                            "mmap MemFd fd={raw_fd} failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                        return;
+                    }
+                    let buf =
+                        unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), size) }.to_vec();
+                    unsafe {
+                        libc::munmap(mapped, size);
+                    }
+                    buf
+                } else {
+                    // MemPtr path: use PipeWire's data() as before.
+                    let Some(slice) = d.data() else {
+                        warn!("MemPtr buffer has null data pointer");
+                        return;
+                    };
+                    if size > slice.len() {
+                        warn!(
+                            "Chunk size ({size}) exceeds buffer capacity ({})",
+                            slice.len()
+                        );
+                        return;
+                    }
+                    slice[..size].to_vec()
+                };
 
                 let stride = if chunk_stride > 0 {
                     #[allow(clippy::cast_sign_loss)]
