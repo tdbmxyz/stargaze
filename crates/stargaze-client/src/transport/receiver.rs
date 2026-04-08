@@ -336,8 +336,28 @@ pub(crate) async fn receive_loop(
                     }
 
                     let send_result = match frame.stream_type {
-                        STREAM_TYPE_VIDEO => video_tx.send(frame).await,
-                        STREAM_TYPE_AUDIO => audio_tx.send(frame).await,
+                        STREAM_TYPE_VIDEO => {
+                            // Non-blocking send: if the decoder is behind,
+                            // drop the frame rather than stalling datagram
+                            // processing (which causes cascading loss).
+                            match video_tx.try_send(frame) {
+                                Ok(()) => Ok(()),
+                                Err(mpsc::error::TrySendError::Full(f)) => {
+                                    // Channel full — decoder is behind. Drop.
+                                    debug!(
+                                        pts = f.pts,
+                                        "Dropping video frame (decoder backpressure)"
+                                    );
+                                    Ok(())
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    Err(mpsc::error::SendError(()))
+                                }
+                            }
+                        }
+                        STREAM_TYPE_AUDIO => {
+                            audio_tx.send(frame).await.map_err(|_| mpsc::error::SendError(()))
+                        }
                         other => {
                             warn!(stream_type = other, "Unknown stream type, dropping frame");
                             continue;

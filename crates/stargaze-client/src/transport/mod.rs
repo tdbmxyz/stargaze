@@ -92,7 +92,7 @@ pub async fn connect(
         session_response.max_datagram_size,
     );
 
-    let (video_tx, video_rx) = mpsc::channel::<ReassembledFrame>(1);
+    let (video_tx, video_rx) = mpsc::channel::<ReassembledFrame>(2);
     let (audio_tx, audio_rx) = mpsc::channel::<ReassembledFrame>(16);
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>(64);
 

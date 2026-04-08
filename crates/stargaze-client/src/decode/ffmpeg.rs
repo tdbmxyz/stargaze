@@ -1,8 +1,11 @@
-//! `FFmpeg` H.265 software decoder internals.
+//! `FFmpeg` H.265 decoder with VAAPI hardware acceleration.
 //!
-//! Handles codec initialization and the synchronous decode loop.
-//! All `FFmpeg` interaction is confined to this module.
+//! Attempts VAAPI hardware decoding first, falls back to multi-threaded
+//! software decode if VAAPI is unavailable.  Hardware-decoded frames are
+//! transferred from GPU to CPU (NV12/YUV420P) before being sent to the
+//! renderer.
 
+use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -10,25 +13,49 @@ use stargaze_core::config::Codec;
 use stargaze_core::decode::{DecodeError, DecodedFrame, DecoderConfig};
 use stargaze_core::transport::ReassembledFrame;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Opaque handle to initialized `FFmpeg` decoder state.
 ///
-/// Owns the codec context and an optional scaler to YUV420P.
+/// Owns the codec context, an optional hardware device context, and an
+/// optional scaler to YUV420P.
 pub(crate) struct FfmpegDecoder {
-    /// Opened H.265 software decoder (owns the `AVCodecContext`).
+    /// Opened H.265 decoder (software or hardware-accelerated).
     decoder: ffmpeg_next::decoder::Video,
-    /// Lazily created scaler to YUV420P.
-    /// Created on first decoded frame when the output format is known.
+    /// Raw pointer to the VAAPI hardware device context (`AVBufferRef`).
+    /// Null when using software decode.  Owned — freed via `av_buffer_unref`
+    /// on drop.
+    hw_device_ctx: *mut ffmpeg_sys_next::AVBufferRef,
+    /// Whether the decoder is using hardware acceleration.
+    hw_accel: bool,
+    /// Lazily created scaler to YUV420P (for non-YUV420P output).
     scaler: Option<ffmpeg_next::software::scaling::Context>,
+    /// Reusable software frame for `av_hwframe_transfer_data`.
+    sw_frame: ffmpeg_next::frame::Video,
 }
 
-/// Initializes the `FFmpeg` H.265 software decoder.
+// Safety: FfmpegDecoder is only used on the dedicated decoder thread.
+unsafe impl Send for FfmpegDecoder {}
+
+impl Drop for FfmpegDecoder {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.hw_device_ctx.is_null() {
+                ffmpeg_sys_next::av_buffer_unref(&raw mut self.hw_device_ctx);
+            }
+        }
+    }
+}
+
+/// Initializes the `FFmpeg` H.265 decoder.
+///
+/// Tries VAAPI hardware acceleration first.  If VAAPI is unavailable or
+/// initialization fails, falls back to multi-threaded software decode.
 ///
 /// # Errors
 ///
-/// Returns `DecodeError::InitError` if `FFmpeg` initialization fails or
-/// the HEVC codec cannot be found/opened.
+/// Returns `DecodeError::InitError` if both hardware and software decoders
+/// fail to initialize.
 /// Returns `DecodeError::UnsupportedCodec` if a non-H.265 codec is requested.
 pub(crate) fn init_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeError> {
     ffmpeg_next::init().map_err(|e| DecodeError::InitError(format!("ffmpeg init: {e}")))?;
@@ -42,13 +69,88 @@ pub(crate) fn init_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, Deco
         }
     }
 
-    let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::HEVC).ok_or_else(|| {
-        DecodeError::InitError(
-            "hevc decoder not found — is FFmpeg compiled with H.265 support?".to_string(),
+    // Try VAAPI first, then fall back to software.
+    match init_vaapi_decoder(config) {
+        Ok(dec) => {
+            info!(
+                width = config.width,
+                height = config.height,
+                "H.265 VAAPI hardware decoder initialized"
+            );
+            Ok(dec)
+        }
+        Err(e) => {
+            warn!("VAAPI init failed ({e}), falling back to software decode");
+            init_software_decoder(config)
+        }
+    }
+}
+
+/// Attempts to initialize a VAAPI-accelerated H.265 decoder.
+fn init_vaapi_decoder(_config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeError> {
+    let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::HEVC)
+        .ok_or_else(|| DecodeError::InitError("hevc decoder not found".to_string()))?;
+
+    // Create VAAPI hardware device context.
+    let mut hw_device_ctx: *mut ffmpeg_sys_next::AVBufferRef = ptr::null_mut();
+    let ret = unsafe {
+        ffmpeg_sys_next::av_hwdevice_ctx_create(
+            &raw mut hw_device_ctx,
+            ffmpeg_sys_next::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+            ptr::null(),     // default device (/dev/dri/renderD128)
+            ptr::null_mut(), // no options
+            0,
         )
+    };
+    if ret < 0 {
+        return Err(DecodeError::InitError(format!(
+            "failed to create VAAPI device context (error {ret})"
+        )));
+    }
+    debug!("Created VAAPI device context");
+
+    let mut context = ffmpeg_next::codec::context::Context::new_with_codec(codec);
+
+    // Attach the hardware device context so the decoder can allocate
+    // hardware surfaces.
+    unsafe {
+        let raw_ctx = context.as_mut_ptr();
+        (*raw_ctx).hw_device_ctx = ffmpeg_sys_next::av_buffer_ref(hw_device_ctx);
+        if (*raw_ctx).hw_device_ctx.is_null() {
+            ffmpeg_sys_next::av_buffer_unref(&raw mut hw_device_ctx);
+            return Err(DecodeError::InitError(
+                "av_buffer_ref failed for hw_device_ctx".to_string(),
+            ));
+        }
+    }
+
+    let decoder = context.decoder().video().map_err(|e| {
+        unsafe { ffmpeg_sys_next::av_buffer_unref(&raw mut hw_device_ctx) };
+        DecodeError::InitError(format!("failed to open VAAPI hevc decoder: {e}"))
     })?;
 
-    let context = ffmpeg_next::codec::context::Context::new_with_codec(codec);
+    Ok(FfmpegDecoder {
+        decoder,
+        hw_device_ctx,
+        hw_accel: true,
+        scaler: None,
+        sw_frame: ffmpeg_next::frame::Video::empty(),
+    })
+}
+
+/// Initializes a multi-threaded software H.265 decoder.
+fn init_software_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeError> {
+    let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::HEVC)
+        .ok_or_else(|| DecodeError::InitError("hevc decoder not found".to_string()))?;
+
+    let mut context = ffmpeg_next::codec::context::Context::new_with_codec(codec);
+
+    // Enable multi-threaded decoding (auto-detect core count).
+    context.set_threading(ffmpeg_next::codec::threading::Config {
+        kind: ffmpeg_next::codec::threading::Type::Frame,
+        count: 0,
+    });
+
     let decoder = context
         .decoder()
         .video()
@@ -57,12 +159,16 @@ pub(crate) fn init_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, Deco
     info!(
         width = config.width,
         height = config.height,
-        "H.265 software decoder initialized"
+        threads = unsafe { (*decoder.as_ptr()).thread_count },
+        "H.265 multi-threaded software decoder initialized"
     );
 
     Ok(FfmpegDecoder {
         decoder,
+        hw_device_ctx: ptr::null_mut(),
+        hw_accel: false,
         scaler: None,
+        sw_frame: ffmpeg_next::frame::Video::empty(),
     })
 }
 
@@ -139,9 +245,8 @@ pub(crate) fn run_decode_loop(
     Ok(())
 }
 
-/// Drains all available decoded frames from the codec and converts them to YUV420P.
-///
-/// Returns `Ok(())` normally, or `Ok(())` if the receiver was dropped (clean shutdown).
+/// Drains all available decoded frames from the codec, converts to YUV420P
+/// planes, and sends them to the renderer.
 fn drain_decoded_frames(
     decoder: &mut FfmpegDecoder,
     decoded_frame: &mut ffmpeg_next::frame::Video,
@@ -159,130 +264,212 @@ fn drain_decoded_frames(
             }
         }
 
-        let width = decoded_frame.width();
-        let height = decoded_frame.height();
+        // If this is a hardware frame (VAAPI surface), transfer to CPU.
+        let is_vaapi =
+            decoder.hw_accel && decoded_frame.format() == ffmpeg_next::format::Pixel::VAAPI;
 
-        // Log decoded frame details for first few frames to diagnose banding.
+        if is_vaapi {
+            let ret = unsafe {
+                ffmpeg_sys_next::av_hwframe_transfer_data(
+                    decoder.sw_frame.as_mut_ptr(),
+                    decoded_frame.as_ptr(),
+                    0,
+                )
+            };
+            if ret < 0 {
+                warn!("av_hwframe_transfer_data failed (error {ret}), skipping frame");
+                continue;
+            }
+            decoder.sw_frame.set_pts(decoded_frame.pts());
+        }
+
+        // Pick the source frame: sw_frame after hw transfer, or decoded_frame.
+        let (width, height, format) = if is_vaapi {
+            (
+                decoder.sw_frame.width(),
+                decoder.sw_frame.height(),
+                decoder.sw_frame.format(),
+            )
+        } else {
+            (
+                decoded_frame.width(),
+                decoded_frame.height(),
+                decoded_frame.format(),
+            )
+        };
+
+        // Log decoded frame details for first few frames.
         static DIAG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let diag_n = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if diag_n < 5 {
+            let src = if is_vaapi {
+                &decoder.sw_frame
+            } else {
+                &*decoded_frame
+            };
             info!(
                 frame = diag_n,
                 decoded_width = width,
                 decoded_height = height,
-                decoded_format = ?decoded_frame.format(),
-                decoded_stride_0 = decoded_frame.stride(0),
-                decoded_stride_1 = decoded_frame.stride(1),
-                decoded_stride_2 = decoded_frame.stride(2),
-                "Decoded frame diagnostics (pre-scaler)"
+                decoded_format = ?format,
+                hw_accel = decoder.hw_accel,
+                stride_0 = src.stride(0),
+                stride_1 = src.stride(1),
+                stride_2 = src.stride(2),
+                "Decoded frame diagnostics"
             );
         }
 
-        // If the decoded format is already YUV420P, skip the scaler and
-        // strip stride padding directly.  Otherwise scale to YUV420P first.
-        let source_frame = if decoded_frame.format() == ffmpeg_next::format::Pixel::YUV420P {
-            None // use decoded_frame directly
+        // Convert to YUV420P planes for the renderer.
+        // VAAPI typically transfers to NV12; software decode outputs YUV420P.
+        let output = if format == ffmpeg_next::format::Pixel::NV12 {
+            let src = if is_vaapi {
+                &decoder.sw_frame
+            } else {
+                &*decoded_frame
+            };
+            extract_nv12_to_yuv420p(src, width, height)
+        } else if format == ffmpeg_next::format::Pixel::YUV420P {
+            let src = if is_vaapi {
+                &decoder.sw_frame
+            } else {
+                &*decoded_frame
+            };
+            extract_yuv420p(src, width, height)
         } else {
-            // Create or recreate the scaler if dimensions/format changed.
-            let needs_new_scaler = decoder
-                .scaler
-                .as_ref()
-                .is_none_or(|s| s.input().width != width || s.input().height != height);
-
-            if needs_new_scaler {
-                let scaler = ffmpeg_next::software::scaling::Context::get(
-                    decoded_frame.format(),
-                    width,
-                    height,
-                    ffmpeg_next::format::Pixel::YUV420P,
-                    width,
-                    height,
-                    ffmpeg_next::software::scaling::Flags::BILINEAR,
-                )
-                .map_err(|e| DecodeError::FfmpegError(format!("failed to create scaler: {e}")))?;
-                decoder.scaler = Some(scaler);
-            }
-
-            let scaler = decoder
-                .scaler
-                .as_mut()
-                .expect("scaler was just created above");
-
-            let mut yuv_frame =
-                ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
-
-            scaler
-                .run(decoded_frame, &mut yuv_frame)
-                .map_err(|e| DecodeError::FfmpegError(format!("scaler run failed: {e}")))?;
-
-            Some(yuv_frame)
+            // Arbitrary format — use sws_scale to convert.  We must avoid
+            // holding a borrow on decoder.sw_frame while mutably borrowing
+            // decoder for the scaler, so always use decoded_frame here (the
+            // scaler handles any format, and this path is never VAAPI).
+            let yuv_frame = scale_to_yuv420p(decoder, decoded_frame, width, height)?;
+            extract_yuv420p(&yuv_frame, width, height)
         };
 
-        let src = source_frame.as_ref().unwrap_or(decoded_frame);
-
-        let width_usize = width as usize;
-        let height_usize = height as usize;
-        let chroma_width = width_usize / 2;
-        let chroma_height = height_usize / 2;
-
-        let y_stride = src.stride(0);
-        let u_stride = src.stride(1);
-        let v_stride = src.stride(2);
-        let y_data = src.data(0);
-        let u_data = src.data(1);
-        let v_data = src.data(2);
-
-        // Fast path: if stride matches width, copy entire plane at once.
-        let y_plane = if y_stride == width_usize {
-            y_data[..width_usize * height_usize].to_vec()
-        } else {
-            let mut buf = Vec::with_capacity(width_usize * height_usize);
-            for row in 0..height_usize {
-                let src_off = row * y_stride;
-                buf.extend_from_slice(&y_data[src_off..src_off + width_usize]);
-            }
-            buf
-        };
-
-        let u_plane = if u_stride == chroma_width {
-            u_data[..chroma_width * chroma_height].to_vec()
-        } else {
-            let mut buf = Vec::with_capacity(chroma_width * chroma_height);
-            for row in 0..chroma_height {
-                let src_off = row * u_stride;
-                buf.extend_from_slice(&u_data[src_off..src_off + chroma_width]);
-            }
-            buf
-        };
-
-        let v_plane = if v_stride == chroma_width {
-            v_data[..chroma_width * chroma_height].to_vec()
-        } else {
-            let mut buf = Vec::with_capacity(chroma_width * chroma_height);
-            for row in 0..chroma_height {
-                let src_off = row * v_stride;
-                buf.extend_from_slice(&v_data[src_off..src_off + chroma_width]);
-            }
-            buf
-        };
-
-        let pts = decoded_frame.pts().map_or(0, i64::cast_unsigned);
-
-        let output_frame = DecodedFrame {
-            y_plane,
-            u_plane,
-            v_plane,
-            width,
-            height,
-            pts,
-        };
-
-        if decoded_tx.send(output_frame).is_err() {
+        if decoded_tx.send(output).is_err() {
             return Ok(());
         }
     }
 
     Ok(())
+}
+
+/// Extracts YUV420P planes from a frame, stripping stride padding.
+fn extract_yuv420p(frame: &ffmpeg_next::frame::Video, width: u32, height: u32) -> DecodedFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+
+    let y_stride = frame.stride(0);
+    let u_stride = frame.stride(1);
+    let v_stride = frame.stride(2);
+    let y_data = frame.data(0);
+    let u_data = frame.data(1);
+    let v_data = frame.data(2);
+
+    let y_plane = copy_plane(y_data, y_stride, w, h);
+    let u_plane = copy_plane(u_data, u_stride, cw, ch);
+    let v_plane = copy_plane(v_data, v_stride, cw, ch);
+
+    DecodedFrame {
+        y_plane,
+        u_plane,
+        v_plane,
+        width,
+        height,
+        pts: frame.pts().map_or(0, i64::cast_unsigned),
+    }
+}
+
+/// Extracts YUV420P planes from an NV12 frame (interleaved UV → split U + V).
+fn extract_nv12_to_yuv420p(
+    frame: &ffmpeg_next::frame::Video,
+    width: u32,
+    height: u32,
+) -> DecodedFrame {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+
+    let y_stride = frame.stride(0);
+    let uv_stride = frame.stride(1);
+    let y_data = frame.data(0);
+    let uv_data = frame.data(1);
+
+    let y_plane = copy_plane(y_data, y_stride, w, h);
+
+    // NV12: UV plane is interleaved (U0 V0 U1 V1 ...).  Split into separate
+    // U and V planes.
+    let mut u_plane = Vec::with_capacity(cw * ch);
+    let mut v_plane = Vec::with_capacity(cw * ch);
+    for row in 0..ch {
+        let src_off = row * uv_stride;
+        for col in 0..cw {
+            u_plane.push(uv_data[src_off + col * 2]);
+            v_plane.push(uv_data[src_off + col * 2 + 1]);
+        }
+    }
+
+    DecodedFrame {
+        y_plane,
+        u_plane,
+        v_plane,
+        width,
+        height,
+        pts: frame.pts().map_or(0, i64::cast_unsigned),
+    }
+}
+
+/// Copies a single plane, stripping stride padding.
+/// Fast path when stride == width (no padding).
+fn copy_plane(data: &[u8], stride: usize, width: usize, height: usize) -> Vec<u8> {
+    if stride == width {
+        data[..width * height].to_vec()
+    } else {
+        let mut buf = Vec::with_capacity(width * height);
+        for row in 0..height {
+            let off = row * stride;
+            buf.extend_from_slice(&data[off..off + width]);
+        }
+        buf
+    }
+}
+
+/// Uses sws_scale to convert an arbitrary pixel format to YUV420P.
+fn scale_to_yuv420p(
+    decoder: &mut FfmpegDecoder,
+    src: &ffmpeg_next::frame::Video,
+    width: u32,
+    height: u32,
+) -> Result<ffmpeg_next::frame::Video, DecodeError> {
+    let needs_new = decoder
+        .scaler
+        .as_ref()
+        .is_none_or(|s| s.input().width != width || s.input().height != height);
+
+    if needs_new {
+        let scaler = ffmpeg_next::software::scaling::Context::get(
+            src.format(),
+            width,
+            height,
+            ffmpeg_next::format::Pixel::YUV420P,
+            width,
+            height,
+            ffmpeg_next::software::scaling::Flags::BILINEAR,
+        )
+        .map_err(|e| DecodeError::FfmpegError(format!("failed to create scaler: {e}")))?;
+        decoder.scaler = Some(scaler);
+    }
+
+    let scaler = decoder.scaler.as_mut().expect("scaler just created");
+    let mut yuv =
+        ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
+    scaler
+        .run(src, &mut yuv)
+        .map_err(|e| DecodeError::FfmpegError(format!("scaler run failed: {e}")))?;
+    yuv.set_pts(src.pts());
+    Ok(yuv)
 }
 
 #[cfg(test)]

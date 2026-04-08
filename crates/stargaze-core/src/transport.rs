@@ -17,10 +17,10 @@ pub const STREAM_TYPE_AUDIO: u8 = 1;
 
 /// Maximum number of incomplete frames the assembler will buffer
 /// before requesting an IDR.
-pub const MAX_PENDING_FRAMES: usize = 16;
+pub const MAX_PENDING_FRAMES: usize = 8;
 
 /// Minimum interval between IDR requests in milliseconds.
-pub const IDR_RATE_LIMIT_MS: u64 = 500;
+pub const IDR_RATE_LIMIT_MS: u64 = 100;
 
 /// Conservative header size upper bound (bytes) for [`DatagramHeader`].
 ///
