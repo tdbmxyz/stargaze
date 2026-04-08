@@ -124,6 +124,7 @@ fn build_config(cli: &Cli) -> anyhow::Result<ServerConfig> {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
@@ -151,13 +152,24 @@ async fn main() -> anyhow::Result<()> {
         height: cfg.resolution.height,
         show_cursor: cfg.cursor.show_cursor,
     };
-    let (capture_session, frames) = capture::start_capture(capture_config).await?;
-    info!("Capture started");
+    let (capture_session, frames, resolution_rx) = capture::start_capture(capture_config).await?;
+    info!("Capture started, waiting for PipeWire format negotiation...");
 
-    // Start encoder pipeline.
+    // Wait for PipeWire to negotiate the actual capture resolution.
+    // This may differ from the configured resolution (e.g. 3440x1440 on an
+    // ultrawide when the config says 1920x1080).
+    let capture_resolution = resolution_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("capture ended before format negotiation completed"))?;
+    info!(
+        "Capture resolution negotiated: {} (configured: {})",
+        capture_resolution, cfg.resolution
+    );
+
+    // Start encoder pipeline with the actual capture resolution.
     let encoder_config = EncoderConfig {
-        width: cfg.resolution.width,
-        height: cfg.resolution.height,
+        width: capture_resolution.width,
+        height: capture_resolution.height,
         framerate: cfg.framerate,
         bitrate_mbps: cfg.bitrate,
     };
@@ -205,8 +217,17 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Start transport — accepts client connection and streams video + audio packets.
-    let server_transport =
-        transport::start_server_transport(&cfg, packets, audio_packets, idr_tx, input_tx)?;
+    // Override the config resolution with the actual capture resolution so the
+    // session handshake advertises the correct dimensions to the client.
+    let mut transport_cfg = cfg.clone();
+    transport_cfg.resolution = capture_resolution;
+    let server_transport = transport::start_server_transport(
+        &transport_cfg,
+        packets,
+        audio_packets,
+        idr_tx,
+        input_tx,
+    )?;
     let abort_handle = server_transport.abort_handle();
     info!("Transport started, waiting for client connection...");
 
@@ -281,7 +302,7 @@ mod tests {
             height: 1080,
             show_cursor: true,
         };
-        let (capture_session, frames) = capture::start_capture(capture_config)
+        let (capture_session, frames, _resolution_rx) = capture::start_capture(capture_config)
             .await
             .expect("capture should start");
 

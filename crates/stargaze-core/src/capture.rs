@@ -12,6 +12,14 @@ pub enum PixelFormat {
     Rgba8,
     /// NV12 semi-planar YUV (possible direct from some sources).
     Nv12,
+    /// BGRA 10-bit per channel (`DRM_FORMAT_XRGB2101010` / `xBGR_210LE`).
+    ///
+    /// Exposed by portals on 10-bit displays. The DMA-BUF or memory buffer
+    /// stores 2:10:10:10 packed pixels; downstream conversion to 8-bit
+    /// happens in the encoder (FFmpeg/NVENC).
+    Bgra10,
+    /// RGBA 10-bit per channel (`DRM_FORMAT_XBGR2101010` / `ABGR_210LE`).
+    Rgba10,
 }
 
 impl fmt::Display for PixelFormat {
@@ -20,6 +28,8 @@ impl fmt::Display for PixelFormat {
             Self::Bgra8 => write!(f, "BGRA8"),
             Self::Rgba8 => write!(f, "RGBA8"),
             Self::Nv12 => write!(f, "NV12"),
+            Self::Bgra10 => write!(f, "BGRA10"),
+            Self::Rgba10 => write!(f, "RGBA10"),
         }
     }
 }
@@ -138,6 +148,8 @@ mod tests {
         assert_eq!(PixelFormat::Bgra8.to_string(), "BGRA8");
         assert_eq!(PixelFormat::Rgba8.to_string(), "RGBA8");
         assert_eq!(PixelFormat::Nv12.to_string(), "NV12");
+        assert_eq!(PixelFormat::Bgra10.to_string(), "BGRA10");
+        assert_eq!(PixelFormat::Rgba10.to_string(), "RGBA10");
     }
 
     #[test]

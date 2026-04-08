@@ -19,7 +19,7 @@ use super::SessionRequest;
 
 /// Session parameters confirmed by the server.
 #[derive(Debug, Clone)]
-pub(crate) struct SessionParams {
+pub struct SessionParams {
     /// Confirmed video width in pixels.
     pub width: u32,
     /// Confirmed video height in pixels.

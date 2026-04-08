@@ -22,6 +22,23 @@ pub const MAX_PENDING_FRAMES: usize = 16;
 /// Minimum interval between IDR requests in milliseconds.
 pub const IDR_RATE_LIMIT_MS: u64 = 500;
 
+/// Conservative header size upper bound (bytes) for [`DatagramHeader`].
+///
+/// Postcard uses varint encoding, so the actual serialized size depends
+/// on field values.  This constant is safe for any field combination and
+/// avoids the need to serialize a sample header just to measure its
+/// length.
+pub const HEADER_SIZE_UPPER_BOUND: usize = 20;
+
+/// Initial QUIC MTU for LAN streaming (1500 Ethernet − 20 IP − 8 UDP − 20 headroom).
+pub const STREAMING_INITIAL_MTU: u16 = 1452;
+
+/// Outgoing datagram send buffer size (4 MiB).
+///
+/// A single high-bitrate keyframe can be hundreds of KB; all its
+/// fragments queue in this buffer before being written to the wire.
+pub const DATAGRAM_SEND_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
 /// Header prepended to each `QUIC` datagram.
 ///
 /// Serialized with `postcard` (compact binary format). The remaining

@@ -14,6 +14,16 @@ Follow-up tasks after the MVP implementation. Ordered roughly by priority.
 - [ ] **Frame loss resilience**: Test behavior under packet loss — verify IDR-on-loss strategy recovers video within a few frames.
 - [ ] **Audio/video sync**: Measure and correct drift between audio and video streams over long sessions (>10 min).
 
+## Known Issues & Workarounds
+
+### 10-bit Display Formats
+
+Systems running 10-bit color depth (e.g. Hyprland with `misc:screen_bit_depth = 10`) expose 10-bit DRM formats (`xBGR2101010`, `ABGR2101010`) through the portal. Stargaze accepts these formats and converts to 8-bit in the encode pipeline.
+
+If capture still fails with `no more input formats`, check your compositor:
+- **Hyprland ≥ v0.43**: `misc:screencopy_force_8b = true` (enabled by default) forces the portal to expose 8-bit formats only.
+- **Older Hyprland**: Set `misc:screen_bit_depth = 8` in `hyprland.conf`.
+
 ## 3. Latency Measurement
 
 - [ ] **Pipeline instrumentation**: Add timestamps at each pipeline stage (capture → encode → transport → decode → render) to measure per-stage latency.

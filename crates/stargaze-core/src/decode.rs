@@ -8,16 +8,20 @@ use thiserror::Error;
 
 /// A decoded video frame ready for rendering.
 ///
-/// Contains raw pixel data in NV12 format: a Y (luma) plane followed
-/// by an interleaved UV (chroma) plane at half vertical resolution.
+/// Contains raw pixel data in YUV420P (planar) format with three
+/// separate planes: Y (luma), U (chroma-blue), V (chroma-red).
 ///
-/// Total data size: `width * height * 3 / 2` bytes.
-/// - Y plane:  `data[0 .. width * height]`
-/// - UV plane: `data[width * height .. width * height * 3 / 2]`
+/// - Y plane:  `width * height` bytes
+/// - U plane:  `(width / 2) * (height / 2)` bytes
+/// - V plane:  `(width / 2) * (height / 2)` bytes
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
-    /// NV12 pixel data (Y plane followed by interleaved UV plane).
-    pub data: Vec<u8>,
+    /// Y (luma) plane data.
+    pub y_plane: Vec<u8>,
+    /// U (chroma-blue) plane data.
+    pub u_plane: Vec<u8>,
+    /// V (chroma-red) plane data.
+    pub v_plane: Vec<u8>,
     /// Frame width in pixels.
     pub width: u32,
     /// Frame height in pixels.
@@ -106,39 +110,46 @@ mod tests {
     fn decoded_frame_construction() {
         let width: u32 = 1920;
         let height: u32 = 1080;
-        let nv12_size = (width * height * 3 / 2) as usize;
+        let y_size = (width * height) as usize;
+        let chroma_size = ((width / 2) * (height / 2)) as usize;
         let frame = DecodedFrame {
-            data: vec![128; nv12_size],
+            y_plane: vec![128; y_size],
+            u_plane: vec![128; chroma_size],
+            v_plane: vec![128; chroma_size],
             width,
             height,
             pts: 0,
         };
-        assert_eq!(frame.data.len(), nv12_size);
+        assert_eq!(frame.y_plane.len(), y_size);
+        assert_eq!(frame.u_plane.len(), chroma_size);
+        assert_eq!(frame.v_plane.len(), chroma_size);
         assert_eq!(frame.width, 1920);
         assert_eq!(frame.height, 1080);
         assert_eq!(frame.pts, 0);
     }
 
     #[test]
-    fn decoded_frame_nv12_plane_sizes() {
+    fn decoded_frame_yuv420p_plane_sizes() {
         let width: u32 = 640;
         let height: u32 = 480;
         let y_size = (width * height) as usize;
-        let uv_size = (width * height / 2) as usize;
-        let total = y_size + uv_size;
+        let chroma_size = ((width / 2) * (height / 2)) as usize;
 
         let frame = DecodedFrame {
-            data: vec![0; total],
+            y_plane: vec![0; y_size],
+            u_plane: vec![0; chroma_size],
+            v_plane: vec![0; chroma_size],
             width,
             height,
             pts: 100,
         };
 
-        // Y plane: first width*height bytes.
         assert_eq!(y_size, 307_200);
-        // UV plane: next width*height/2 bytes.
-        assert_eq!(uv_size, 153_600);
-        assert_eq!(frame.data.len(), y_size + uv_size);
+        assert_eq!(chroma_size, 76_800);
+        assert_eq!(
+            frame.y_plane.len() + frame.u_plane.len() + frame.v_plane.len(),
+            y_size + 2 * chroma_size
+        );
     }
 
     #[test]

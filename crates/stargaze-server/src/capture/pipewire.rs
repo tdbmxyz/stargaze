@@ -13,7 +13,8 @@ use pipewire::spa::utils::{Direction, Fraction, Rectangle, SpaTypes};
 use pipewire::stream::{StreamBox, StreamFlags, StreamState};
 use pipewire_sys;
 use stargaze_core::capture::{CaptureError, DmaBufInfo, Frame, PixelFormat};
-use tokio::sync::mpsc;
+use stargaze_core::config::Resolution;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
 use super::CaptureConfig;
@@ -34,10 +35,12 @@ struct CaptureCallbackData {
     /// Negotiated pixel format (defaults to `Bgra8`).
     format: PixelFormat,
     /// Negotiated DRM format modifier (e.g. tiling/compression layout).
-    ///
-    /// Extracted from `PipeWire` format negotiation. Critical for correct
-    /// interpretation of `DMA-BUF` frames by downstream consumers (e.g. NVENC).
     modifier: u64,
+    /// Oneshot sender for the negotiated resolution — fires once on first
+    /// `param_changed` with a valid format. `None` after the first send.
+    resolution_tx: Option<oneshot::Sender<Resolution>>,
+    /// Frame counter for diagnostic logging.
+    frame_count: u64,
 }
 
 /// Maps a SPA video format to our internal `PixelFormat`.
@@ -51,29 +54,162 @@ fn spa_format_to_pixel_format(raw: u32) -> Option<PixelFormat> {
         VideoFormat::BGRA | VideoFormat::BGRx => Some(PixelFormat::Bgra8),
         VideoFormat::RGBA | VideoFormat::RGBx => Some(PixelFormat::Rgba8),
         VideoFormat::NV12 => Some(PixelFormat::Nv12),
+        // 10-bit 2:10:10:10 packed formats exposed by portals on 10-bit displays.
+        VideoFormat::xBGR_210LE
+        | VideoFormat::BGRx_102LE
+        | VideoFormat::ABGR_210LE
+        | VideoFormat::BGRA_102LE => Some(PixelFormat::Bgra10),
+        VideoFormat::xRGB_210LE
+        | VideoFormat::RGBx_102LE
+        | VideoFormat::ARGB_210LE
+        | VideoFormat::RGBA_102LE => Some(PixelFormat::Rgba10),
         _ => None,
     }
 }
 
-/// Builds the SPA format pod for video stream negotiation.
-///
-/// Offers `Video/Raw` with a choice of pixel formats, a size range up to
-/// the configured resolution, and a framerate of `0/1` (variable) so the
-/// portal node can drive timing.
-///
-/// Includes a `VideoModifier` property with `MANDATORY | DONT_FIXATE` flags
-/// so that portal backends using DMA-BUF (e.g. xdg-desktop-portal-hyprland)
-/// can negotiate modifiers. Without this, format intersection fails with
-/// "no more input formats".
-fn build_format_params(config: &CaptureConfig) -> Vec<u8> {
-    use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
-    use pipewire::spa::pod::{ChoiceValue, Property, PropertyFlags, Value};
-    use pipewire::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+const DMABUF_FORMATS: &[pipewire::spa::param::video::VideoFormat] = &[
+    // 8-bit
+    pipewire::spa::param::video::VideoFormat::BGRA,
+    pipewire::spa::param::video::VideoFormat::BGRx,
+    pipewire::spa::param::video::VideoFormat::RGBA,
+    pipewire::spa::param::video::VideoFormat::RGBx,
+    // 10-bit (2:10:10:10) — required for portals on 10-bit displays
+    pipewire::spa::param::video::VideoFormat::xBGR_210LE,
+    pipewire::spa::param::video::VideoFormat::ABGR_210LE,
+    pipewire::spa::param::video::VideoFormat::xRGB_210LE,
+    pipewire::spa::param::video::VideoFormat::ARGB_210LE,
+];
 
-    // DRM_FORMAT_MOD_INVALID signals "accept any modifier the source offers".
-    const DRM_FORMAT_MOD_INVALID: i64 = (1 << 56) - 1;
+/// `DRM_FORMAT_MOD_INVALID` — accept any modifier the source offers.
+const DRM_FORMAT_MOD_INVALID: i64 = (1 << 56) - 1;
+
+/// Builds SPA format pods for video stream negotiation.
+///
+/// Creates **one pod per pixel format** with `VideoModifier`
+/// (`MANDATORY | DONT_FIXATE`) for DMA-BUF negotiation, plus a single
+/// **fallback pod** (format enum, no modifier) for SHM/`MemPtr` sources.
+///
+/// This per-format pod pattern matches what Sunshine, xdg-desktop-portal-hyprland,
+/// and `WayVR` use. A single pod with a format enum *and* a modifier fails
+/// intersection because `PipeWire` needs each format paired with its own
+/// modifier list.
+fn build_format_params(config: &CaptureConfig) -> Vec<Vec<u8>> {
+    let mut pods: Vec<Vec<u8>> = DMABUF_FORMATS
+        .iter()
+        .map(|fmt| build_dmabuf_format_pod(config, *fmt))
+        .collect();
+
+    // SHM fallback pod (no modifier) — used if DMA-BUF negotiation fails.
+    pods.push(build_shm_fallback_pod(config));
+
+    info!(
+        pod_count = pods.len(),
+        pod_sizes = ?pods.iter().map(Vec::len).collect::<Vec<_>>(),
+        "Built format negotiation pods (DMA-BUF per-format + SHM fallback)"
+    );
+
+    pods
+}
+
+/// Builds a single DMA-BUF format pod for one pixel format.
+///
+/// The `VideoModifier` property uses `MANDATORY` with `DRM_FORMAT_MOD_INVALID`
+/// so the portal can offer its preferred modifier.
+#[allow(dead_code)] // Retained for future DMA-BUF import support.
+fn build_dmabuf_format_pod(
+    config: &CaptureConfig,
+    video_format: pipewire::spa::param::video::VideoFormat,
+) -> Vec<u8> {
+    use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+    use pipewire::spa::pod::{Property, PropertyFlags, Value};
 
     let mut format_obj = object! {
+        SpaTypes::ObjectParamFormat,
+        pipewire::spa::param::ParamType::EnumFormat,
+        property!(
+            FormatProperties::MediaType,
+            Id,
+            MediaType::Video
+        ),
+        property!(
+            FormatProperties::MediaSubtype,
+            Id,
+            MediaSubtype::Raw
+        ),
+        property!(
+            FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            video_format,
+            video_format,
+        ),
+        property!(
+            FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            Rectangle {
+                width: config.width,
+                height: config.height,
+            },
+            Rectangle {
+                width: 1,
+                height: 1,
+            },
+            Rectangle {
+                width: 8192,
+                height: 8192,
+            }
+        ),
+        property!(
+            FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            Fraction { num: 0, denom: 1 },
+            Fraction { num: 0, denom: 1 },
+            Fraction { num: 1000, denom: 1 }
+        ),
+    };
+
+    // VideoModifier: MANDATORY | DONT_FIXATE with a Choice::Enum.
+    //
+    // DONT_FIXATE tells PipeWire not to lock onto our offered value but to
+    // let the compositor's video-src-fixate propose the real DRM modifier
+    // (e.g. NVIDIA block-linear tiling). Without DONT_FIXATE, PipeWire keeps
+    // DRM_FORMAT_MOD_INVALID and the compositor sends tiled DMA-BUFs that we
+    // misinterpret as linear — causing horizontal banding artifacts.
+    //
+    // The Choice::Enum contains DRM_FORMAT_MOD_INVALID as both default and
+    // sole alternative, meaning "I accept any modifier." During fixation the
+    // compositor replaces this with its preferred modifier.
+    //
+    // This matches Sunshine's portalgrab.cpp pattern (MANDATORY | DONT_FIXATE
+    // + SPA_CHOICE_Enum of modifiers).
+    format_obj.properties.push(Property {
+        key: FormatProperties::VideoModifier.as_raw(),
+        flags: PropertyFlags::MANDATORY | PropertyFlags::DONT_FIXATE,
+        value: Value::Choice(pod::ChoiceValue::Long(pipewire::spa::utils::Choice(
+            pipewire::spa::utils::ChoiceFlags::empty(),
+            pipewire::spa::utils::ChoiceEnum::Enum {
+                default: DRM_FORMAT_MOD_INVALID,
+                alternatives: vec![DRM_FORMAT_MOD_INVALID],
+            },
+        ))),
+    });
+
+    serialize_pod(format_obj)
+}
+
+/// Builds the SHM/`MemPtr` fallback pod with a format enum and no modifier.
+///
+/// If DMA-BUF negotiation fails for every per-format pod, `PipeWire` falls
+/// through to this one and uses shared-memory buffers instead.
+fn build_shm_fallback_pod(config: &CaptureConfig) -> Vec<u8> {
+    use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+
+    let format_obj = object! {
         SpaTypes::ObjectParamFormat,
         pipewire::spa::param::ParamType::EnumFormat,
         property!(
@@ -96,6 +232,10 @@ fn build_format_params(config: &CaptureConfig) -> Vec<u8> {
             pipewire::spa::param::video::VideoFormat::RGBA,
             pipewire::spa::param::video::VideoFormat::RGBx,
             pipewire::spa::param::video::VideoFormat::NV12,
+            pipewire::spa::param::video::VideoFormat::xBGR_210LE,
+            pipewire::spa::param::video::VideoFormat::ABGR_210LE,
+            pipewire::spa::param::video::VideoFormat::xRGB_210LE,
+            pipewire::spa::param::video::VideoFormat::ARGB_210LE,
         ),
         property!(
             FormatProperties::VideoSize,
@@ -111,34 +251,156 @@ fn build_format_params(config: &CaptureConfig) -> Vec<u8> {
                 height: 1,
             },
             Rectangle {
-                width: config.width,
-                height: config.height,
+                width: 8192,
+                height: 8192,
             }
         ),
         property!(
             FormatProperties::VideoFramerate,
+            Choice,
+            Range,
             Fraction,
-            Fraction { num: 0, denom: 1 }
+            Fraction { num: 0, denom: 1 },
+            Fraction { num: 0, denom: 1 },
+            Fraction { num: 1000, denom: 1 }
         ),
     };
 
-    format_obj.properties.push(Property {
-        key: FormatProperties::VideoModifier.as_raw(),
-        flags: PropertyFlags::MANDATORY | PropertyFlags::DONT_FIXATE,
-        value: Value::Choice(ChoiceValue::Long(Choice(
-            ChoiceFlags::empty(),
-            ChoiceEnum::Enum {
-                default: DRM_FORMAT_MOD_INVALID,
-                alternatives: vec![DRM_FORMAT_MOD_INVALID],
-            },
-        ))),
-    });
+    serialize_pod(format_obj)
+}
 
-    let pod_value = pod::Value::Object(format_obj);
+fn serialize_pod(obj: pod::Object) -> Vec<u8> {
+    let pod_value = pod::Value::Object(obj);
     let cursor = Cursor::new(Vec::new());
     let (bytes, _len) =
         PodSerializer::serialize(cursor, &pod_value).expect("failed to serialize format pod");
     bytes.into_inner()
+}
+
+/// SPA data-type constants (from `spa/param/param.h`).
+const SPA_DATA_MEM_PTR: i32 = 1;
+const SPA_DATA_MEM_FD: i32 = 2;
+const SPA_DATA_DMA_BUF: i32 = 3;
+
+/// `SPA_PARAM_BUFFERS_dataType` property key.
+const SPA_PARAM_BUFFERS_DATA_TYPE: u32 = 6;
+
+/// `SPA_PARAM_META_*` property keys.
+const SPA_PARAM_META_TYPE: u32 = 1;
+const SPA_PARAM_META_SIZE: u32 = 2;
+
+/// `SPA_META_Header` id.
+const SPA_META_HEADER: u32 = 1;
+
+/// Size of `spa_meta_header` (from libspa bindings: 32 bytes).
+const SPA_META_HEADER_SIZE: i32 = 32;
+
+/// `SPA_META_VideoDamage` id (from `spa/param/param.h`).
+const SPA_META_VIDEO_DAMAGE: u32 = 3;
+
+/// Size of a single `spa_meta_region` (from libspa bindings: 16 bytes).
+const SPA_META_REGION_SIZE: i32 = 16;
+
+/// Acknowledge a negotiated format by calling `stream.update_params()` with
+/// buffer-type and meta params. Matches Sunshine's `on_param_changed` exactly:
+/// only `dataType` in Buffers (let the producer own allocation), plus Meta
+/// Header and Meta `VideoDamage` (choice-range).
+fn ack_format(stream: &pipewire::stream::Stream, modifier: u64) {
+    use pipewire::spa::param::ParamType;
+    use pipewire::spa::pod::{Property, PropertyFlags, Value};
+    use pipewire::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+
+    const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+    let is_dmabuf = modifier != 0 && modifier != DRM_FORMAT_MOD_INVALID;
+
+    let buffer_types: i32 = if is_dmabuf {
+        info!("Requesting DMA-BUF buffers (modifier 0x{modifier:x})");
+        1 << SPA_DATA_DMA_BUF
+    } else {
+        info!("Requesting MemPtr + MemFd + DMA-BUF buffers (no real DRM modifier)");
+        (1 << SPA_DATA_MEM_PTR) | (1 << SPA_DATA_MEM_FD) | (1 << SPA_DATA_DMA_BUF)
+    };
+
+    // 1. SPA_PARAM_Buffers — only dataType (producer owns buffer layout).
+    let buffers_obj = pod::Object {
+        type_: SpaTypes::ObjectParamBuffers.as_raw(),
+        id: ParamType::Buffers.as_raw(),
+        properties: vec![Property {
+            key: SPA_PARAM_BUFFERS_DATA_TYPE,
+            flags: PropertyFlags::empty(),
+            value: Value::Int(buffer_types),
+        }],
+    };
+
+    // 2. SPA_PARAM_Meta — Header (fixed size).
+    let meta_header_obj = pod::Object {
+        type_: SpaTypes::ObjectParamMeta.as_raw(),
+        id: ParamType::Meta.as_raw(),
+        properties: vec![
+            Property {
+                key: SPA_PARAM_META_TYPE,
+                flags: PropertyFlags::empty(),
+                value: Value::Id(pipewire::spa::utils::Id(SPA_META_HEADER)),
+            },
+            Property {
+                key: SPA_PARAM_META_SIZE,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(SPA_META_HEADER_SIZE),
+            },
+        ],
+    };
+
+    // 3. SPA_PARAM_Meta — VideoDamage (choice-range size, matching Sunshine).
+    let video_damage_region_count: i32 = 16;
+    let meta_video_damage_obj = pod::Object {
+        type_: SpaTypes::ObjectParamMeta.as_raw(),
+        id: ParamType::Meta.as_raw(),
+        properties: vec![
+            Property {
+                key: SPA_PARAM_META_TYPE,
+                flags: PropertyFlags::empty(),
+                value: Value::Id(pipewire::spa::utils::Id(SPA_META_VIDEO_DAMAGE)),
+            },
+            Property {
+                key: SPA_PARAM_META_SIZE,
+                flags: PropertyFlags::empty(),
+                value: Value::Choice(pod::ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: SPA_META_REGION_SIZE * video_damage_region_count,
+                        min: SPA_META_REGION_SIZE,
+                        max: SPA_META_REGION_SIZE * video_damage_region_count,
+                    },
+                ))),
+            },
+        ],
+    };
+
+    let buf_bytes = serialize_pod(buffers_obj);
+    let meta_hdr_bytes = serialize_pod(meta_header_obj);
+    let meta_vd_bytes = serialize_pod(meta_video_damage_obj);
+
+    let Some(buf_pod) = pipewire::spa::pod::Pod::from_bytes(&buf_bytes) else {
+        error!("Failed to build SPA_PARAM_Buffers pod");
+        return;
+    };
+    let Some(meta_hdr_pod) = pipewire::spa::pod::Pod::from_bytes(&meta_hdr_bytes) else {
+        error!("Failed to build SPA_PARAM_Meta (Header) pod");
+        return;
+    };
+    let Some(meta_vd_pod) = pipewire::spa::pod::Pod::from_bytes(&meta_vd_bytes) else {
+        error!("Failed to build SPA_PARAM_Meta (VideoDamage) pod");
+        return;
+    };
+
+    if let Err(e) = stream.update_params(&mut [buf_pod, meta_hdr_pod, meta_vd_pod]) {
+        error!(%e, "stream.update_params failed");
+    } else {
+        info!(
+            is_dmabuf,
+            "Acknowledged format with 3 params (Buffers + Meta Header + Meta VideoDamage)"
+        );
+    }
 }
 
 /// Runs the `PipeWire` capture stream on the current thread (blocking).
@@ -157,6 +419,7 @@ pub fn run_capture_stream(
     config: CaptureConfig,
     tx: mpsc::Sender<Frame>,
     shutdown: Arc<AtomicBool>,
+    resolution_tx: oneshot::Sender<Resolution>,
 ) -> Result<(), CaptureError> {
     // 1. Initialize PipeWire (idempotent — safe to call multiple times).
     pipewire::init();
@@ -194,6 +457,8 @@ pub fn run_capture_stream(
         height: config.height,
         format: PixelFormat::Bgra8,
         modifier: 0,
+        resolution_tx: Some(resolution_tx),
+        frame_count: 0,
     };
 
     // We need a reference to the mainloop inside callbacks.
@@ -214,13 +479,19 @@ pub fn run_capture_stream(
                 }
             }
         })
-        .param_changed(|_stream, data, id, param| {
+        .param_changed(|stream, data, id, param| {
             let Some(param) = param else {
+                info!(param_id = id, "param_changed with null param");
                 return;
             };
 
-            // We only care about the Format param.
-            if id != pipewire::spa::param::ParamType::Format.as_raw() {
+            let format_id = pipewire::spa::param::ParamType::Format.as_raw();
+            if id != format_id {
+                info!(
+                    param_id = id,
+                    param_len = param.size(),
+                    "param_changed (non-Format)"
+                );
                 return;
             }
 
@@ -244,6 +515,24 @@ pub fn run_capture_stream(
                     modifier = data.modifier,
                     "PipeWire format negotiated"
                 );
+
+                // Notify main thread of actual capture resolution (once).
+                if let Some(tx) = data.resolution_tx.take() {
+                    let _ = tx.send(Resolution {
+                        width: data.width,
+                        height: data.height,
+                    });
+                }
+
+                // ACK the format by telling PipeWire which buffer types we
+                // accept.  Without this call PipeWire cycles between
+                // Streaming and Paused because it never receives buffer
+                // parameters.
+                //
+                // If the negotiated format includes a modifier (DMA-BUF
+                // path), request DmaBuf buffers; otherwise fall back to
+                // MemPtr (shared-memory).
+                ack_format(stream, data.modifier);
             }
         })
         .process(move |stream, data| {
@@ -276,6 +565,22 @@ pub fn run_capture_stream(
             let chunk_size = d.chunk().size();
             let chunk_stride = d.chunk().stride();
             let chunk_offset = d.chunk().offset();
+
+            static PW_DIAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let pn = PW_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if pn < 3 {
+                info!(
+                    frame = pn,
+                    chunk_size,
+                    chunk_stride,
+                    chunk_offset,
+                    data_type = ?d.type_(),
+                    width = data.width,
+                    height = data.height,
+                    modifier = format_args!("0x{:x}", data.modifier),
+                    "PipeWire buffer chunk diagnostics"
+                );
+            }
 
             // Skip empty or corrupt chunks.
             if chunk_size == 0 {
@@ -320,8 +625,12 @@ pub fn run_capture_stream(
                     stride,
                     offset: chunk_offset,
                 })
-            } else if data_type == pipewire::spa::buffer::DataType::MemPtr {
+            } else if data_type == pipewire::spa::buffer::DataType::MemPtr
+                || data_type == pipewire::spa::buffer::DataType::MemFd
+            {
                 // CPU-mapped path: copy bytes out of the PipeWire buffer.
+                // MemFd buffers are also memory-mapped by PipeWire (MAP_BUFFERS flag),
+                // so d.data() works identically for both MemPtr and MemFd.
                 let Some(slice) = d.data() else {
                     warn!("MemPtr buffer has null data pointer");
                     return;
@@ -360,6 +669,16 @@ pub fn run_capture_stream(
             };
 
             // Send frame to the consumer. If the receiver is dropped, stop.
+            data.frame_count += 1;
+            if data.frame_count == 1 || data.frame_count.is_multiple_of(300) {
+                info!(
+                    frame = data.frame_count,
+                    data_type = ?data_type,
+                    width = data.width,
+                    height = data.height,
+                    "Captured frame"
+                );
+            }
             if data.tx.blocking_send(frame).is_err() {
                 info!("Frame receiver dropped, stopping capture");
                 unsafe {
@@ -371,10 +690,24 @@ pub fn run_capture_stream(
         .map_err(|e| CaptureError::PipeWireError(format!("failed to register listener: {e}")))?;
 
     // 8. Build format parameters for negotiation.
-    let param_bytes = build_format_params(&config);
-    let param_pod = pipewire::spa::pod::Pod::from_bytes(&param_bytes)
-        .ok_or_else(|| CaptureError::NegotiationError("failed to build format pod".to_string()))?;
-    let mut params = [param_pod];
+    let param_bytes_list = build_format_params(&config);
+    let param_pods: Vec<&pipewire::spa::pod::Pod> = param_bytes_list
+        .iter()
+        .filter_map(|bytes| pipewire::spa::pod::Pod::from_bytes(bytes))
+        .collect();
+
+    if param_pods.is_empty() {
+        return Err(CaptureError::NegotiationError(
+            "failed to build any format pods".to_string(),
+        ));
+    }
+
+    let mut params: Vec<&pipewire::spa::pod::Pod> = param_pods;
+
+    info!(
+        param_count = params.len(),
+        "Connecting PipeWire stream with format params"
+    );
 
     // 9. Connect the stream to the portal node.
     stream
@@ -418,9 +751,9 @@ pub fn run_capture_stream(
 
     info!("PipeWire capture stream exited");
 
-    // Ensure the param_bytes buffer lives long enough (referenced by params pod).
+    // Ensure the param buffers live long enough (referenced by Pod slices).
     let _ = params;
-    drop(param_bytes);
+    drop(param_bytes_list);
 
     Ok(())
 }

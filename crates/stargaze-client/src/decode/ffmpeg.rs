@@ -14,11 +14,11 @@ use tracing::{info, warn};
 
 /// Opaque handle to initialized `FFmpeg` decoder state.
 ///
-/// Owns the codec context and an optional YUV420P→NV12 scaler.
+/// Owns the codec context and an optional scaler to YUV420P.
 pub(crate) struct FfmpegDecoder {
     /// Opened H.265 software decoder (owns the `AVCodecContext`).
     decoder: ffmpeg_next::decoder::Video,
-    /// Lazily created YUV420P→NV12 scaler.
+    /// Lazily created scaler to YUV420P.
     /// Created on first decoded frame when the output format is known.
     scaler: Option<ffmpeg_next::software::scaling::Context>,
 }
@@ -67,7 +67,7 @@ pub(crate) fn init_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, Deco
 }
 
 /// Runs the decode loop: receives reassembled frames, decodes them, converts
-/// YUV420P→NV12, and sends decoded frames to the renderer.
+/// to YUV420P planes, and sends decoded frames to the renderer.
 ///
 /// Blocks until `shutdown` is signaled or the input channel closes.
 /// Meant to run on a dedicated `std::thread`.
@@ -84,6 +84,7 @@ pub(crate) fn run_decode_loop(
     shutdown: &Arc<AtomicBool>,
 ) -> Result<(), DecodeError> {
     let mut decoded_frame = ffmpeg_next::frame::Video::empty();
+    let mut packet_counter: u64 = 0;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -94,6 +95,19 @@ pub(crate) fn run_decode_loop(
             info!("Reassembled frame channel closed, flushing decoder");
             break;
         };
+
+        if packet_counter < 5 {
+            let preview_len = frame.data.len().min(64);
+            info!(
+                packet = packet_counter,
+                size = frame.data.len(),
+                is_keyframe = frame.is_keyframe,
+                stream_type = frame.stream_type,
+                first_bytes = ?&frame.data[..preview_len],
+                "Decoder input dump"
+            );
+        }
+        packet_counter += 1;
 
         let mut packet = ffmpeg_next::Packet::copy(&frame.data);
         packet.set_pts(Some(frame.pts.cast_signed()));
@@ -117,7 +131,7 @@ pub(crate) fn run_decode_loop(
     Ok(())
 }
 
-/// Drains all available decoded frames from the codec and converts them to NV12.
+/// Drains all available decoded frames from the codec and converts them to YUV420P.
 ///
 /// Returns `Ok(())` normally, or `Ok(())` if the receiver was dropped (clean shutdown).
 fn drain_decoded_frames(
@@ -140,7 +154,23 @@ fn drain_decoded_frames(
         let width = decoded_frame.width();
         let height = decoded_frame.height();
 
-        // Create or recreate the scaler if dimensions changed or on first use.
+        // Log decoded frame details for first few frames to diagnose banding.
+        static DIAG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let diag_n = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if diag_n < 5 {
+            info!(
+                frame = diag_n,
+                decoded_width = width,
+                decoded_height = height,
+                decoded_format = ?decoded_frame.format(),
+                decoded_stride_0 = decoded_frame.stride(0),
+                decoded_stride_1 = decoded_frame.stride(1),
+                decoded_stride_2 = decoded_frame.stride(2),
+                "Decoded frame diagnostics (pre-scaler)"
+            );
+        }
+
+        // Create or recreate the scaler if dimensions/format changed or on first use.
         let needs_new_scaler = decoder
             .scaler
             .as_ref()
@@ -151,7 +181,7 @@ fn drain_decoded_frames(
                 decoded_frame.format(),
                 width,
                 height,
-                ffmpeg_next::format::Pixel::NV12,
+                ffmpeg_next::format::Pixel::YUV420P,
                 width,
                 height,
                 ffmpeg_next::software::scaling::Flags::BILINEAR,
@@ -165,47 +195,74 @@ fn drain_decoded_frames(
             .as_mut()
             .expect("scaler was just created above");
 
-        let mut nv12_frame =
-            ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::NV12, width, height);
+        let mut yuv_frame =
+            ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
 
         scaler
-            .run(decoded_frame, &mut nv12_frame)
+            .run(decoded_frame, &mut yuv_frame)
             .map_err(|e| DecodeError::FfmpegError(format!("scaler run failed: {e}")))?;
 
-        // Copy NV12 data line-by-line to remove stride padding.
         let width_usize = width as usize;
         let height_usize = height as usize;
+        let chroma_width = width_usize / 2;
+        let chroma_height = height_usize / 2;
 
-        let y_stride = nv12_frame.stride(0);
-        let uv_stride = nv12_frame.stride(1);
-        let y_data = nv12_frame.data(0);
-        let uv_data = nv12_frame.data(1);
+        let y_stride = yuv_frame.stride(0);
+        let u_stride = yuv_frame.stride(1);
+        let v_stride = yuv_frame.stride(2);
+        let y_data = yuv_frame.data(0);
+        let u_data = yuv_frame.data(1);
+        let v_data = yuv_frame.data(2);
 
-        let y_size = width_usize * height_usize;
-        let uv_size = width_usize * (height_usize / 2);
-        let mut nv12_data = Vec::with_capacity(y_size + uv_size);
-
+        if diag_n < 5 {
+            info!(
+                frame = diag_n,
+                yuv_width = width,
+                yuv_height = height,
+                y_stride,
+                u_stride,
+                v_stride,
+                y_data_len = y_data.len(),
+                u_data_len = u_data.len(),
+                v_data_len = v_data.len(),
+                width_usize,
+                chroma_width,
+                chroma_height,
+                y_plane_expected = width_usize * height_usize,
+                u_plane_expected = chroma_width * chroma_height,
+                "Post-scaler YUV420P diagnostics"
+            );
+        }
+        let mut y_plane = Vec::with_capacity(width_usize * height_usize);
         for row in 0..height_usize {
             let src = row * y_stride;
-            nv12_data.extend_from_slice(&y_data[src..src + width_usize]);
+            y_plane.extend_from_slice(&y_data[src..src + width_usize]);
         }
 
-        for row in 0..(height_usize / 2) {
-            let src = row * uv_stride;
-            nv12_data.extend_from_slice(&uv_data[src..src + width_usize]);
+        let mut u_plane = Vec::with_capacity(chroma_width * chroma_height);
+        for row in 0..chroma_height {
+            let src = row * u_stride;
+            u_plane.extend_from_slice(&u_data[src..src + chroma_width]);
+        }
+
+        let mut v_plane = Vec::with_capacity(chroma_width * chroma_height);
+        for row in 0..chroma_height {
+            let src = row * v_stride;
+            v_plane.extend_from_slice(&v_data[src..src + chroma_width]);
         }
 
         let pts = decoded_frame.pts().map_or(0, i64::cast_unsigned);
 
         let output_frame = DecodedFrame {
-            data: nv12_data,
+            y_plane,
+            u_plane,
+            v_plane,
             width,
             height,
             pts,
         };
 
         if decoded_tx.send(output_frame).is_err() {
-            // Receiver dropped — clean shutdown, stop draining.
             return Ok(());
         }
     }

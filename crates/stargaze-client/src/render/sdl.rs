@@ -45,7 +45,7 @@ pub(super) fn run_sdl_loop(
     let texture_creator = canvas.texture_creator();
     let mut texture = texture_creator
         .create_texture_streaming(
-            sdl2::pixels::PixelFormatEnum::NV12,
+            sdl2::pixels::PixelFormatEnum::IYUV,
             config.width,
             config.height,
         )
@@ -194,16 +194,46 @@ pub(super) fn run_sdl_loop(
         }
 
         if let Some(frame) = latest_frame {
-            let width = frame.width as usize;
+            static RENDER_DIAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let rn = RENDER_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if rn < 5 {
+                info!(
+                    frame_n = rn,
+                    frame_width = frame.width,
+                    frame_height = frame.height,
+                    texture_width = config.width,
+                    texture_height = config.height,
+                    y_plane_len = frame.y_plane.len(),
+                    u_plane_len = frame.u_plane.len(),
+                    v_plane_len = frame.v_plane.len(),
+                    y_pitch = frame.width as usize,
+                    chroma_pitch = frame.width as usize / 2,
+                    "SDL render diagnostics"
+                );
+            }
+
+            let y_pitch = frame.width as usize;
+            let chroma_pitch = frame.width as usize / 2;
 
             texture
-                .update(None, &frame.data, width)
+                .update_yuv(
+                    None,
+                    &frame.y_plane,
+                    y_pitch,
+                    &frame.u_plane,
+                    chroma_pitch,
+                    &frame.v_plane,
+                    chroma_pitch,
+                )
                 .map_err(|e| anyhow!("texture update failed: {e}"))?;
-
-            canvas
-                .copy(&texture, None, None)
-                .map_err(|e| anyhow!("canvas copy failed: {e}"))?;
         }
+
+        // Always copy the texture to the canvas — the texture retains its
+        // last-uploaded content, but the back buffer is undefined after
+        // present() with double buffering, so we must re-copy every frame.
+        canvas
+            .copy(&texture, None, None)
+            .map_err(|e| anyhow!("canvas copy failed: {e}"))?;
 
         // Drain decoded audio PCM and queue for playback.
         while let Ok(pcm) = audio_pcm_rx.try_recv() {

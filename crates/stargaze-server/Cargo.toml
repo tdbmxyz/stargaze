@@ -22,3 +22,7 @@ rcgen = "0.14.7"
 bytes = "1.11.1"
 directories = "6"
 evdev = "0.13"
+cudarc = { version = "0.19", default-features = false, features = ["driver", "dynamic-loading", "cuda-13020"] }
+khronos-egl = { version = "6", features = ["dynamic"] }
+gl = "0.14"
+libloading = "0.9.0"

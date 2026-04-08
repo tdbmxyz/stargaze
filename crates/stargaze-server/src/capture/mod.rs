@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use stargaze_core::capture::{CaptureError, Frame};
-use tokio::sync::mpsc;
+use stargaze_core::config::Resolution;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
 /// Channel capacity for frame delivery (provides backpressure).
@@ -74,8 +75,14 @@ impl Drop for CaptureSession {
 /// Starts screen capture via xdg-desktop-portal and `PipeWire`.
 ///
 /// Performs the portal handshake asynchronously (D-Bus), then spawns a
-/// dedicated thread for the `PipeWire` main loop. Returns a session handle
-/// and a channel receiver that yields captured frames.
+/// dedicated thread for the `PipeWire` main loop. Returns a session handle,
+/// a channel receiver that yields captured frames, and a oneshot receiver
+/// for the negotiated capture resolution.
+///
+/// The negotiated resolution may differ from the requested
+/// `CaptureConfig.width`/`height` — `PipeWire` delivers at the actual
+/// display resolution. Callers should await the resolution before
+/// configuring downstream consumers (e.g., the encoder).
 ///
 /// # Errors
 ///
@@ -83,7 +90,14 @@ impl Drop for CaptureSession {
 /// Returns `CaptureError::PipeWireError` if the `PipeWire` connection fails.
 pub async fn start_capture(
     config: CaptureConfig,
-) -> Result<(CaptureSession, mpsc::Receiver<Frame>), CaptureError> {
+) -> Result<
+    (
+        CaptureSession,
+        mpsc::Receiver<Frame>,
+        oneshot::Receiver<Resolution>,
+    ),
+    CaptureError,
+> {
     // Step 1: Portal handshake (async, runs on tokio).
     let (pw_fd, pw_node_id) = portal::create_screencast_session(config.show_cursor).await?;
 
@@ -92,8 +106,9 @@ pub async fn start_capture(
         "Portal session established, starting PipeWire capture"
     );
 
-    // Step 2: Create the frame channel.
+    // Step 2: Create the frame channel and resolution oneshot.
     let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+    let (resolution_tx, resolution_rx) = oneshot::channel();
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
 
@@ -101,9 +116,14 @@ pub async fn start_capture(
     let thread_handle = thread::Builder::new()
         .name("stargaze-pipewire".to_string())
         .spawn(move || {
-            if let Err(e) =
-                pipewire::run_capture_stream(pw_fd, pw_node_id, config, tx, shutdown_clone)
-            {
+            if let Err(e) = pipewire::run_capture_stream(
+                pw_fd,
+                pw_node_id,
+                config,
+                tx,
+                shutdown_clone,
+                resolution_tx,
+            ) {
                 error!("PipeWire capture stream failed: {e}");
             }
         })
@@ -115,5 +135,6 @@ pub async fn start_capture(
             shutdown,
         },
         rx,
+        resolution_rx,
     ))
 }

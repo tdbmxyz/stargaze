@@ -12,6 +12,8 @@ use stargaze_core::transport::{ReassembledFrame, TransportError};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+pub use receiver::SessionParams;
+
 /// Handle to a running client transport session.
 pub struct ClientTransport {
     /// Join handle for the transport task.
@@ -57,6 +59,7 @@ pub async fn connect(
 ) -> Result<
     (
         ClientTransport,
+        SessionParams,
         mpsc::Receiver<ReassembledFrame>,
         mpsc::Receiver<ReassembledFrame>,
         mpsc::Sender<InputEvent>,
@@ -103,6 +106,7 @@ pub async fn connect(
 
     Ok((
         ClientTransport { task_handle },
+        session_response,
         video_rx,
         audio_rx,
         input_tx,

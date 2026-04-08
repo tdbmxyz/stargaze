@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use stargaze_core::transport::TransportError;
+use stargaze_core::transport::{DATAGRAM_SEND_BUFFER_SIZE, STREAMING_INITIAL_MTU, TransportError};
 use tracing::debug;
 
 /// A `rustls` certificate verifier that accepts any server certificate.
@@ -77,11 +77,16 @@ pub(crate) async fn connect_to_server(
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
 
-    let client_config = quinn::ClientConfig::new(Arc::new(
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(|e| {
             TransportError::TlsError(format!("failed to create QUIC client config: {e}"))
         })?,
     ));
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.initial_mtu(STREAMING_INITIAL_MTU);
+    transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER_SIZE);
+    client_config.transport_config(Arc::new(transport));
 
     let mut endpoint =
         quinn::Endpoint::client("0.0.0.0:0".parse().expect("valid addr")).map_err(|e| {

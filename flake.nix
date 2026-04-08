@@ -50,6 +50,8 @@
         pkgs.libopus
         pkgs.libclang
         pkgs.llvmPackages.libclang
+        pkgs.libglvnd
+        pkgs.mesa
       ];
 
       commonNativeBuildInputs = [
@@ -73,6 +75,8 @@
         pkgs.dbus
         pkgs.SDL2
         pkgs.libopus
+        pkgs.libglvnd
+        pkgs.mesa
       ];
 
       # ── Rust platform (for Nix package builds) ─────────────────────
@@ -187,6 +191,8 @@
                 pkgsCuda.libopus
                 pkgsCuda.cudaPackages.cuda_cudart
                 pkgsCuda.cudaPackages.cuda_nvml_dev
+                pkgsCuda.libglvnd
+                pkgsCuda.mesa
               ]
             }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 

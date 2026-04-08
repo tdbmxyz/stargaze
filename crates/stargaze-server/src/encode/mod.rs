@@ -4,6 +4,7 @@
 //! [`start_audio_encoder()`] for Opus audio encoding. Both return a
 //! session handle plus a channel receiver for encoded packets.
 
+pub(crate) mod egl_cuda;
 pub(crate) mod ffmpeg;
 pub(crate) mod opus_enc;
 

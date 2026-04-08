@@ -2,10 +2,11 @@
 
 use std::fs;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use directories::ProjectDirs;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use stargaze_core::transport::TransportError;
+use stargaze_core::transport::{DATAGRAM_SEND_BUFFER_SIZE, STREAMING_INITIAL_MTU, TransportError};
 use tracing::{debug, info};
 
 /// Creates a server `QUIC` endpoint with `TLS` using a self-signed certificate.
@@ -22,10 +23,12 @@ pub(crate) fn create_server_endpoint(
     let (cert_der, key_der) = load_or_generate_cert()?;
 
     let cert_chain = vec![cert_der];
-    let server_config =
+    let mut server_config =
         quinn::ServerConfig::with_single_cert(cert_chain, key_der).map_err(|e| {
             TransportError::TlsError(format!("failed to create server TLS config: {e}"))
         })?;
+
+    server_config.transport_config(Arc::new(streaming_transport_config()));
 
     let endpoint = quinn::Endpoint::server(server_config, bind_addr).map_err(|e| {
         TransportError::ConnectionError(format!("failed to bind QUIC endpoint: {e}"))
@@ -96,4 +99,16 @@ fn load_or_generate_cert()
         .map_err(|e| TransportError::TlsError(format!("parse generated key: {e}")))?;
 
     Ok((cert, key))
+}
+
+/// Creates a [`quinn::TransportConfig`] tuned for low-latency media streaming.
+///
+/// See [`stargaze_core::transport::STREAMING_INITIAL_MTU`] and
+/// [`stargaze_core::transport::DATAGRAM_SEND_BUFFER_SIZE`] for the
+/// shared constants used here.
+pub(crate) fn streaming_transport_config() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.initial_mtu(STREAMING_INITIAL_MTU);
+    transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER_SIZE);
+    transport
 }

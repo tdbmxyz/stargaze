@@ -113,21 +113,30 @@ async fn main() -> anyhow::Result<()> {
         codec: Codec::H265,
     };
 
-    let decoder_config = DecoderConfig {
-        width: session_request.width,
-        height: session_request.height,
-        codec: session_request.codec,
-    };
-
     let audio_decoder_config = AudioDecoderConfig {
         sample_rate: 48_000,
         channels: 2,
     };
 
-    let (client_transport, video_frames, audio_frames, transport_input_tx) =
+    let (client_transport, session_params, video_frames, audio_frames, transport_input_tx) =
         transport::connect(&cfg, session_request).await?;
 
-    info!("Connected, starting decoders and renderer...");
+    // Use the server-confirmed resolution for decoding and rendering.
+    // The server may advertise a different resolution than what the client
+    // requested (e.g. 3440x1440 on an ultrawide display).
+    let decoder_config = DecoderConfig {
+        width: session_params.width,
+        height: session_params.height,
+        codec: Codec::H265,
+    };
+
+    info!(
+        "Connected, session: {}x{} @ {}fps, {} Mbps",
+        session_params.width,
+        session_params.height,
+        session_params.framerate,
+        session_params.bitrate_mbps
+    );
 
     // Optionally start rsonance transmitter for mic forwarding.
     let mut rsonance_child = if cfg.mic_forward.enabled {

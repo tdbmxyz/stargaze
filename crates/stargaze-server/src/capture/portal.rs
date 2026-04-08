@@ -38,10 +38,27 @@ pub async fn create_screencast_session(show_cursor: bool) -> Result<(OwnedFd, u3
         .await
         .map_err(|e| CaptureError::PortalError(format!("failed to create session: {e}")))?;
 
-    let cursor_mode = if show_cursor {
-        CursorMode::Embedded
+    let cursor_mode: Option<CursorMode> = if show_cursor {
+        let available = screencast.available_cursor_modes().await.ok();
+
+        if available.is_some_and(|m| m.contains(CursorMode::Embedded)) {
+            Some(CursorMode::Embedded)
+        } else if available.is_some_and(|m| m.contains(CursorMode::Metadata)) {
+            debug!("Embedded cursor unavailable, falling back to Metadata");
+            Some(CursorMode::Metadata)
+        } else {
+            debug!("Could not determine available cursor modes, using portal default");
+            None
+        }
     } else {
-        CursorMode::Hidden
+        let available = screencast.available_cursor_modes().await.ok();
+
+        if available.is_some_and(|m| m.contains(CursorMode::Hidden)) {
+            Some(CursorMode::Hidden)
+        } else {
+            debug!("Hidden cursor mode unavailable, using portal default");
+            None
+        }
     };
 
     debug!(?cursor_mode, "Selecting sources (monitor)");

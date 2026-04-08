@@ -7,8 +7,8 @@ use stargaze_core::config::ServerConfig;
 use stargaze_core::encode::EncodedPacket;
 use stargaze_core::input::InputEvent;
 use stargaze_core::transport::{
-    ControlMessage, DatagramHeader, TransportError, deserialize_control_message,
-    serialize_control_message, serialize_header,
+    ControlMessage, DatagramHeader, HEADER_SIZE_UPPER_BOUND, TransportError,
+    deserialize_control_message, serialize_control_message, serialize_header,
 };
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -72,8 +72,10 @@ pub(crate) async fn handle_session_handshake(
     );
 
     // For MVP, use server's configured parameters.
-    let max_datagram_size = connection.max_datagram_size().unwrap_or(1200);
+    let max_datagram_size = connection.max_datagram_size().unwrap_or(0);
     let max_datagram_size_u16 = u16::try_from(max_datagram_size).unwrap_or(u16::MAX);
+
+    info!(max_datagram_size, "Session handshake: datagram size limit");
 
     let response = ControlMessage::SessionResponse {
         width: config.resolution.width,
@@ -180,31 +182,33 @@ pub(crate) async fn send_packets(
     use bytes::Bytes;
 
     let mut frame_index: u32 = 0;
+    let mut logged_datagram_size = false;
 
     while let Some(pkt) = packets.recv().await {
-        let max_datagram_size = connection.max_datagram_size().unwrap_or(1200);
-
-        // Serialize a sample header to determine header size.
-        let sample_header = DatagramHeader {
-            stream_type,
-            frame_index,
-            fragment_index: 0,
-            fragment_count: 1,
-            pts: pkt.pts,
-            is_keyframe: pkt.is_keyframe,
+        let Some(max_datagram_size) = connection.max_datagram_size() else {
+            warn!(
+                frame = frame_index,
+                "Datagrams not supported by peer, skipping frame"
+            );
+            frame_index = frame_index.wrapping_add(1);
+            continue;
         };
-        let header_size = serialize_header(&sample_header)
-            .map_err(|e| TransportError::SendError(format!("header size: {e}")))?
-            .len();
 
-        let max_payload = max_datagram_size.saturating_sub(header_size);
+        if !logged_datagram_size {
+            info!(max_datagram_size, "QUIC datagram size limit");
+            logged_datagram_size = true;
+        }
+
+        let max_payload = max_datagram_size.saturating_sub(HEADER_SIZE_UPPER_BOUND);
         if max_payload == 0 {
-            warn!("Max datagram size too small for header, skipping frame");
+            warn!(
+                max_datagram_size,
+                "Max datagram size too small for header, skipping frame"
+            );
             frame_index = frame_index.wrapping_add(1);
             continue;
         }
 
-        // Fragment the packet.
         let fragment_count = pkt.data.len().div_ceil(max_payload);
         let fragment_count_u16 = u16::try_from(fragment_count).unwrap_or(u16::MAX);
 
@@ -228,6 +232,13 @@ pub(crate) async fn send_packets(
             let mut datagram = Vec::with_capacity(header_bytes.len() + payload.len());
             datagram.extend_from_slice(&header_bytes);
             datagram.extend_from_slice(payload);
+
+            debug_assert!(
+                datagram.len() <= max_datagram_size,
+                "datagram {} > max {}",
+                datagram.len(),
+                max_datagram_size
+            );
 
             if let Err(e) = connection.send_datagram(Bytes::from(datagram)) {
                 debug!(
