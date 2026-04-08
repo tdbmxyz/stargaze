@@ -91,10 +91,18 @@ pub(crate) fn run_decode_loop(
             break;
         }
 
-        let Some(frame) = frames_rx.blocking_recv() else {
+        let Some(mut frame) = frames_rx.blocking_recv() else {
             info!("Reassembled frame channel closed, flushing decoder");
             break;
         };
+
+        // Drain any queued frames, keeping only the latest.  Always prefer
+        // a keyframe — it resets the decoder and avoids reference corruption.
+        while let Ok(newer) = frames_rx.try_recv() {
+            if newer.is_keyframe || !frame.is_keyframe {
+                frame = newer;
+            }
+        }
 
         if packet_counter < 5 {
             let preview_len = frame.data.len().min(64);
@@ -170,86 +178,93 @@ fn drain_decoded_frames(
             );
         }
 
-        // Create or recreate the scaler if dimensions/format changed or on first use.
-        let needs_new_scaler = decoder
-            .scaler
-            .as_ref()
-            .is_none_or(|s| s.input().width != width || s.input().height != height);
+        // If the decoded format is already YUV420P, skip the scaler and
+        // strip stride padding directly.  Otherwise scale to YUV420P first.
+        let source_frame = if decoded_frame.format() == ffmpeg_next::format::Pixel::YUV420P {
+            None // use decoded_frame directly
+        } else {
+            // Create or recreate the scaler if dimensions/format changed.
+            let needs_new_scaler = decoder
+                .scaler
+                .as_ref()
+                .is_none_or(|s| s.input().width != width || s.input().height != height);
 
-        if needs_new_scaler {
-            let scaler = ffmpeg_next::software::scaling::Context::get(
-                decoded_frame.format(),
-                width,
-                height,
-                ffmpeg_next::format::Pixel::YUV420P,
-                width,
-                height,
-                ffmpeg_next::software::scaling::Flags::BILINEAR,
-            )
-            .map_err(|e| DecodeError::FfmpegError(format!("failed to create scaler: {e}")))?;
-            decoder.scaler = Some(scaler);
-        }
+            if needs_new_scaler {
+                let scaler = ffmpeg_next::software::scaling::Context::get(
+                    decoded_frame.format(),
+                    width,
+                    height,
+                    ffmpeg_next::format::Pixel::YUV420P,
+                    width,
+                    height,
+                    ffmpeg_next::software::scaling::Flags::BILINEAR,
+                )
+                .map_err(|e| DecodeError::FfmpegError(format!("failed to create scaler: {e}")))?;
+                decoder.scaler = Some(scaler);
+            }
 
-        let scaler = decoder
-            .scaler
-            .as_mut()
-            .expect("scaler was just created above");
+            let scaler = decoder
+                .scaler
+                .as_mut()
+                .expect("scaler was just created above");
 
-        let mut yuv_frame =
-            ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
+            let mut yuv_frame =
+                ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
 
-        scaler
-            .run(decoded_frame, &mut yuv_frame)
-            .map_err(|e| DecodeError::FfmpegError(format!("scaler run failed: {e}")))?;
+            scaler
+                .run(decoded_frame, &mut yuv_frame)
+                .map_err(|e| DecodeError::FfmpegError(format!("scaler run failed: {e}")))?;
+
+            Some(yuv_frame)
+        };
+
+        let src = source_frame.as_ref().unwrap_or(decoded_frame);
 
         let width_usize = width as usize;
         let height_usize = height as usize;
         let chroma_width = width_usize / 2;
         let chroma_height = height_usize / 2;
 
-        let y_stride = yuv_frame.stride(0);
-        let u_stride = yuv_frame.stride(1);
-        let v_stride = yuv_frame.stride(2);
-        let y_data = yuv_frame.data(0);
-        let u_data = yuv_frame.data(1);
-        let v_data = yuv_frame.data(2);
+        let y_stride = src.stride(0);
+        let u_stride = src.stride(1);
+        let v_stride = src.stride(2);
+        let y_data = src.data(0);
+        let u_data = src.data(1);
+        let v_data = src.data(2);
 
-        if diag_n < 5 {
-            info!(
-                frame = diag_n,
-                yuv_width = width,
-                yuv_height = height,
-                y_stride,
-                u_stride,
-                v_stride,
-                y_data_len = y_data.len(),
-                u_data_len = u_data.len(),
-                v_data_len = v_data.len(),
-                width_usize,
-                chroma_width,
-                chroma_height,
-                y_plane_expected = width_usize * height_usize,
-                u_plane_expected = chroma_width * chroma_height,
-                "Post-scaler YUV420P diagnostics"
-            );
-        }
-        let mut y_plane = Vec::with_capacity(width_usize * height_usize);
-        for row in 0..height_usize {
-            let src = row * y_stride;
-            y_plane.extend_from_slice(&y_data[src..src + width_usize]);
-        }
+        // Fast path: if stride matches width, copy entire plane at once.
+        let y_plane = if y_stride == width_usize {
+            y_data[..width_usize * height_usize].to_vec()
+        } else {
+            let mut buf = Vec::with_capacity(width_usize * height_usize);
+            for row in 0..height_usize {
+                let src_off = row * y_stride;
+                buf.extend_from_slice(&y_data[src_off..src_off + width_usize]);
+            }
+            buf
+        };
 
-        let mut u_plane = Vec::with_capacity(chroma_width * chroma_height);
-        for row in 0..chroma_height {
-            let src = row * u_stride;
-            u_plane.extend_from_slice(&u_data[src..src + chroma_width]);
-        }
+        let u_plane = if u_stride == chroma_width {
+            u_data[..chroma_width * chroma_height].to_vec()
+        } else {
+            let mut buf = Vec::with_capacity(chroma_width * chroma_height);
+            for row in 0..chroma_height {
+                let src_off = row * u_stride;
+                buf.extend_from_slice(&u_data[src_off..src_off + chroma_width]);
+            }
+            buf
+        };
 
-        let mut v_plane = Vec::with_capacity(chroma_width * chroma_height);
-        for row in 0..chroma_height {
-            let src = row * v_stride;
-            v_plane.extend_from_slice(&v_data[src..src + chroma_width]);
-        }
+        let v_plane = if v_stride == chroma_width {
+            v_data[..chroma_width * chroma_height].to_vec()
+        } else {
+            let mut buf = Vec::with_capacity(chroma_width * chroma_height);
+            for row in 0..chroma_height {
+                let src_off = row * v_stride;
+                buf.extend_from_slice(&v_data[src_off..src_off + chroma_width]);
+            }
+            buf
+        };
 
         let pts = decoded_frame.pts().map_or(0, i64::cast_unsigned);
 

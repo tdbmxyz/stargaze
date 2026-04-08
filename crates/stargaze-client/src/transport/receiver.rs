@@ -179,16 +179,22 @@ impl FrameAssembler {
             completed.push(frame);
         }
 
-        self.deliver_in_order(header.stream_type, &mut completed);
+        let skipped = self.deliver_in_order(header.stream_type, &mut completed);
 
-        // IDR is video-only: count only video pending frames.
+        // Request IDR if we skipped a gap (lost video frame) or too many
+        // incomplete video frames are pending.
+        if header.stream_type == STREAM_TYPE_VIDEO && skipped {
+            need_idr = self.should_request_idr();
+        }
         let video_pending = self
             .pending
             .keys()
             .filter(|(st, _)| *st == STREAM_TYPE_VIDEO)
             .count();
         if video_pending > self.max_pending {
-            need_idr = self.should_request_idr();
+            if !need_idr {
+                need_idr = self.should_request_idr();
+            }
             if need_idr {
                 self.pending.retain(|(st, _), _| *st != STREAM_TYPE_VIDEO);
                 self.next_frame.remove(&STREAM_TYPE_VIDEO);
@@ -214,8 +220,10 @@ impl FrameAssembler {
         })
     }
 
-    fn deliver_in_order(&mut self, stream_type: u8, completed: &mut Vec<ReassembledFrame>) {
+    fn deliver_in_order(&mut self, stream_type: u8, completed: &mut Vec<ReassembledFrame>) -> bool {
         let mut next = *self.next_frame.entry(stream_type).or_insert(0);
+        let mut skipped_gap = false;
+
         loop {
             let key = (stream_type, next);
             let is_complete = self
@@ -228,10 +236,24 @@ impl FrameAssembler {
                 }
                 next = next.wrapping_add(1);
             } else {
+                // If the next expected frame is missing but we have later
+                // complete frames, skip the gap so the pipeline doesn't stall.
+                // This triggers an IDR request in the caller.
+                let have_later = self.pending.iter().any(|((st, idx), pf)| {
+                    *st == stream_type && *idx > next && pf.received_count == pf.fragment_count
+                });
+                if have_later {
+                    // Drop the incomplete frame if it exists.
+                    self.pending.remove(&key);
+                    next = next.wrapping_add(1);
+                    skipped_gap = true;
+                    continue;
+                }
                 break;
             }
         }
         self.next_frame.insert(stream_type, next);
+        skipped_gap
     }
 
     /// Checks if we should send an `IDR` request based on rate limiting.

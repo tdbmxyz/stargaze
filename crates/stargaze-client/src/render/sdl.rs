@@ -38,7 +38,6 @@ pub(super) fn run_sdl_loop(
     let mut canvas = window
         .into_canvas()
         .accelerated()
-        .present_vsync()
         .build()
         .map_err(|e| anyhow!("canvas creation failed: {e}"))?;
 
