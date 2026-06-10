@@ -41,6 +41,8 @@ struct CaptureCallbackData {
     resolution_tx: Option<oneshot::Sender<Resolution>>,
     /// Frame counter for diagnostic logging.
     frame_count: u64,
+    /// Frames dropped because the encoder was behind (channel full).
+    dropped_count: u64,
     /// Whether `ack_format` has been called for the current format.
     /// Prevents re-entrant `update_params` → `param_changed` cycling.
     format_acked: bool,
@@ -462,6 +464,7 @@ pub fn run_capture_stream(
         modifier: 0,
         resolution_tx: Some(resolution_tx),
         frame_count: 0,
+        dropped_count: 0,
         format_acked: false,
     };
 
@@ -720,10 +723,26 @@ pub fn run_capture_stream(
                     "Captured frame"
                 );
             }
-            if data.tx.blocking_send(frame.into()).is_err() {
-                info!("Frame receiver dropped, stopping capture");
-                unsafe {
-                    pipewire_sys::pw_main_loop_quit(mainloop_ptr);
+            // Never block the PipeWire loop: blocking here delays buffer
+            // recycling to the compositor and queues stale frames, adding
+            // latency. If the encoder is behind, drop this frame — the next
+            // capture is fresher anyway.
+            match data.tx.try_send(frame.into()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    data.dropped_count += 1;
+                    if data.dropped_count.is_multiple_of(300) {
+                        info!(
+                            dropped = data.dropped_count,
+                            "Encoder behind, dropping captured frames"
+                        );
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    info!("Frame receiver dropped, stopping capture");
+                    unsafe {
+                        pipewire_sys::pw_main_loop_quit(mainloop_ptr);
+                    }
                 }
             }
         })

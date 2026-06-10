@@ -128,7 +128,11 @@ fn toggle_fullscreen(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>) {
     }
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    clippy::similar_names
+)]
 pub(super) fn run_sdl_loop(
     sdl: &sdl2::Sdl,
     config: &DecoderConfig,
@@ -199,6 +203,12 @@ pub(super) fn run_sdl_loop(
     canvas.present();
 
     'main: loop {
+        // Coalesce mouse motion within one event batch: a 1000 Hz mouse
+        // delivers ~16 motion events per frame, and sending each as its own
+        // control-stream message adds per-event overhead end to end.
+        let mut mouse_dx = 0i32;
+        let mut mouse_dy = 0i32;
+
         for event in event_pump.poll_iter() {
             match event {
                 sdl2::event::Event::Quit { .. } => break 'main,
@@ -250,7 +260,8 @@ pub(super) fn run_sdl_loop(
                 }
 
                 sdl2::event::Event::MouseMotion { xrel, yrel, .. } if captured => {
-                    let _ = input_tx.send(InputEvent::MouseMove { dx: xrel, dy: yrel });
+                    mouse_dx += xrel;
+                    mouse_dy += yrel;
                 }
 
                 sdl2::event::Event::MouseButtonDown { mouse_btn, .. } if captured => {
@@ -331,6 +342,13 @@ pub(super) fn run_sdl_loop(
 
                 _ => {}
             }
+        }
+
+        if mouse_dx != 0 || mouse_dy != 0 {
+            let _ = input_tx.send(InputEvent::MouseMove {
+                dx: mouse_dx,
+                dy: mouse_dy,
+            });
         }
 
         // Wait briefly for a decoded frame so the loop doesn't busy-spin;

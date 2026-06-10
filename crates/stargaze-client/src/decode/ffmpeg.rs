@@ -189,6 +189,9 @@ fn init_vaapi_decoder(_config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeEr
             ));
         }
         (*raw_ctx).get_format = Some(select_vaapi_format);
+        // Output frames as soon as they decode instead of waiting for the
+        // stream's nominal reorder depth (we encode without B-frames).
+        (*raw_ctx).flags |= ffmpeg_sys_next::AV_CODEC_FLAG_LOW_DELAY.cast_signed();
     }
 
     let decoder = context.decoder().video().map_err(|e| {
@@ -212,11 +215,18 @@ fn init_software_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, Decode
 
     let mut context = ffmpeg_next::codec::context::Context::new_with_codec(codec);
 
-    // Enable multi-threaded decoding (auto-detect core count).
+    // Frame threading pipelines decoding across threads, but each thread
+    // adds one frame of output delay — with auto-detection on a 16-core
+    // machine that's ~250 ms at 60 fps. Cap the pipeline depth and set
+    // LOW_DELAY so frames are emitted as soon as they're ready.
     context.set_threading(ffmpeg_next::codec::threading::Config {
         kind: ffmpeg_next::codec::threading::Type::Frame,
-        count: 0,
+        count: 4,
     });
+    unsafe {
+        let raw_ctx = context.as_mut_ptr();
+        (*raw_ctx).flags |= ffmpeg_sys_next::AV_CODEC_FLAG_LOW_DELAY.cast_signed();
+    }
 
     let decoder = context
         .decoder()
