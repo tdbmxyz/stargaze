@@ -144,6 +144,8 @@ pub(crate) fn run_opus_encode_loop(
                 data: output_buf[..len].to_vec(),
                 pts,
                 is_keyframe: false,
+                capture_us: 0,
+                encode_us: 0,
             };
 
             if packets_tx.blocking_send(packet).is_err() {

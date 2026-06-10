@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::anyhow;
 use sdl2::audio::AudioQueue;
 use sdl2::controller::GameController;
@@ -6,6 +8,125 @@ use stargaze_core::input::{GamepadAxis, GamepadButton, InputEvent, MouseButton};
 use tracing::{info, warn};
 
 use super::audio::create_audio_queue;
+use super::input::{InputTracker, PadSlots, ShortcutAction, shortcut_action};
+use super::stats::{StatsOverlay, draw_overlay};
+
+/// Window title shown while input is captured ("inside" mode).
+const TITLE_CAPTURED: &str = "Stargaze";
+/// Window title shown while input is released ("outside" mode).
+const TITLE_RELEASED: &str = "Stargaze — input released (Ctrl+Alt+Shift+Z to capture)";
+
+/// Connected game controllers: slot bookkeeping plus the open SDL handles
+/// (dropping a handle closes the controller, so they must stay alive).
+struct Controllers {
+    slots: PadSlots,
+    handles: HashMap<u32, GameController>,
+}
+
+impl Controllers {
+    fn new() -> Self {
+        Self {
+            slots: PadSlots::new(),
+            handles: HashMap::new(),
+        }
+    }
+
+    /// Opens the controller at `joystick_index` and assigns it a pad slot.
+    /// Notifies the server so it creates the matching virtual device.
+    fn add(
+        &mut self,
+        subsystem: &sdl2::GameControllerSubsystem,
+        joystick_index: u32,
+        input_tx: &std::sync::mpsc::Sender<InputEvent>,
+    ) {
+        let controller = match subsystem.open(joystick_index) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    index = joystick_index,
+                    "Failed to open game controller: {e}"
+                );
+                return;
+            }
+        };
+        let instance_id = controller.instance_id();
+        if self.handles.contains_key(&instance_id) {
+            return; // Already open (duplicate hotplug event).
+        }
+        let Some(pad) = self.slots.allocate(instance_id) else {
+            warn!(
+                name = controller.name(),
+                "All gamepad slots taken, ignoring controller"
+            );
+            return;
+        };
+        info!(name = controller.name(), pad, "Game controller connected");
+        self.handles.insert(instance_id, controller);
+        let _ = input_tx.send(InputEvent::GamepadConnected { pad });
+    }
+
+    /// Closes the controller with `instance_id` and frees its pad slot.
+    /// Notifies the server so it removes the matching virtual device.
+    fn remove(&mut self, instance_id: u32, input_tx: &std::sync::mpsc::Sender<InputEvent>) {
+        self.handles.remove(&instance_id);
+        if let Some(pad) = self.slots.release(instance_id) {
+            info!(pad, "Game controller disconnected");
+            let _ = input_tx.send(InputEvent::GamepadDisconnected { pad });
+        }
+    }
+
+    fn pad_of(&self, instance_id: u32) -> Option<u8> {
+        self.slots.get(instance_id)
+    }
+}
+
+/// Applies the input capture mode to the window.
+///
+/// "Inside" (`captured == true`): the keyboard is grabbed — on Wayland this
+/// inhibits compositor shortcuts (e.g. Hyprland's Super bindings), so every
+/// key reaches the remote session — and the mouse is in relative mode.
+/// "Outside": grabs are released and the cursor is freed so keyboard and
+/// mouse act on the local desktop.
+fn apply_capture_mode(
+    captured: bool,
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    mouse: &sdl2::mouse::MouseUtil,
+) {
+    let window = canvas.window_mut();
+    window.set_keyboard_grab(captured);
+    let title = if captured {
+        TITLE_CAPTURED
+    } else {
+        TITLE_RELEASED
+    };
+    if let Err(e) = window.set_title(title) {
+        warn!("Failed to set window title: {e}");
+    }
+    mouse.set_relative_mouse_mode(captured);
+    mouse.show_cursor(!captured);
+    info!(
+        captured,
+        "Input capture {}",
+        if captured {
+            "enabled (keys go to the remote session)"
+        } else {
+            "released (keys stay on the local desktop)"
+        }
+    );
+}
+
+/// Toggles the window between windowed and borderless fullscreen.
+fn toggle_fullscreen(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>) {
+    let window = canvas.window_mut();
+    let target = if window.fullscreen_state() == sdl2::video::FullscreenType::Off {
+        sdl2::video::FullscreenType::Desktop
+    } else {
+        sdl2::video::FullscreenType::Off
+    };
+    if let Err(e) = window.set_fullscreen(target) {
+        warn!("Failed to toggle fullscreen: {e}");
+    }
+}
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub(super) fn run_sdl_loop(
@@ -15,6 +136,7 @@ pub(super) fn run_sdl_loop(
     audio_pcm_rx: std::sync::mpsc::Receiver<Vec<f32>>,
     fullscreen: bool,
     input_tx: std::sync::mpsc::Sender<InputEvent>,
+    rtt_probe: super::RttProbe,
 ) -> Result<(), anyhow::Error> {
     let audio_queue: AudioQueue<f32> = create_audio_queue(sdl)?;
 
@@ -54,32 +176,21 @@ pub(super) fn run_sdl_loop(
         .event_pump()
         .map_err(|e| anyhow!("event pump failed: {e}"))?;
 
-    sdl.mouse().set_relative_mouse_mode(true);
+    // Controllers present at startup arrive as ControllerDeviceAdded events
+    // on the first event pump iterations, so no manual scan is needed.
+    let mut controllers = Controllers::new();
 
-    let mut controllers: Vec<GameController> = Vec::new();
-    let num_joysticks = game_controller_subsystem.num_joysticks().unwrap_or(0);
-    for i in 0..num_joysticks {
-        if game_controller_subsystem.is_game_controller(i) {
-            match game_controller_subsystem.open(i) {
-                Ok(controller) => {
-                    info!(
-                        name = controller.name(),
-                        index = i,
-                        "Opened game controller"
-                    );
-                    controllers.push(controller);
-                }
-                Err(e) => warn!(index = i, "Failed to open game controller: {e}"),
-            }
-        }
-    }
+    // Start captured ("inside" mode): all input goes to the remote session.
+    let mut captured = true;
+    let mut tracker = InputTracker::new();
+    apply_capture_mode(captured, &mut canvas, &sdl.mouse());
+
+    let mut overlay = StatsOverlay::new();
+    let video_desc = format!("{}x{}", config.width, config.height);
 
     info!(
-        "Renderer started: {}x{} (fullscreen: {}, controllers: {})",
-        config.width,
-        config.height,
-        fullscreen,
-        controllers.len()
+        "Renderer started: {}x{} (fullscreen: {})",
+        config.width, config.height, fullscreen
     );
 
     // Show a black window until the first frame arrives.
@@ -94,16 +205,34 @@ pub(super) fn run_sdl_loop(
 
                 sdl2::event::Event::KeyDown {
                     scancode: Some(sc),
+                    keymod,
                     repeat: false,
                     ..
                 } => {
-                    if sc == sdl2::keyboard::Scancode::Escape {
-                        break 'main;
+                    if let Some(action) = shortcut_action(keymod, sc) {
+                        // Release everything held remotely so the chord's
+                        // modifiers (already forwarded) don't stay stuck.
+                        for ev in tracker.release_all() {
+                            let _ = input_tx.send(ev);
+                        }
+                        match action {
+                            ShortcutAction::Quit => break 'main,
+                            ShortcutAction::ToggleCapture => {
+                                captured = !captured;
+                                apply_capture_mode(captured, &mut canvas, &sdl.mouse());
+                            }
+                            ShortcutAction::ToggleFullscreen => toggle_fullscreen(&mut canvas),
+                            ShortcutAction::ToggleStats => {
+                                overlay.visible = !overlay.visible;
+                            }
+                        }
+                    } else if captured {
+                        tracker.key_down(sc as u32);
+                        let _ = input_tx.send(InputEvent::Keyboard {
+                            scancode: sc as u32,
+                            pressed: true,
+                        });
                     }
-                    let _ = input_tx.send(InputEvent::Keyboard {
-                        scancode: sc as u32,
-                        pressed: true,
-                    });
                 }
 
                 sdl2::event::Event::KeyUp {
@@ -111,18 +240,22 @@ pub(super) fn run_sdl_loop(
                     repeat: false,
                     ..
                 } => {
-                    let _ = input_tx.send(InputEvent::Keyboard {
-                        scancode: sc as u32,
-                        pressed: false,
-                    });
+                    if captured {
+                        tracker.key_up(sc as u32);
+                        let _ = input_tx.send(InputEvent::Keyboard {
+                            scancode: sc as u32,
+                            pressed: false,
+                        });
+                    }
                 }
 
-                sdl2::event::Event::MouseMotion { xrel, yrel, .. } => {
+                sdl2::event::Event::MouseMotion { xrel, yrel, .. } if captured => {
                     let _ = input_tx.send(InputEvent::MouseMove { dx: xrel, dy: yrel });
                 }
 
-                sdl2::event::Event::MouseButtonDown { mouse_btn, .. } => {
+                sdl2::event::Event::MouseButtonDown { mouse_btn, .. } if captured => {
                     if let Some(button) = map_mouse_button(mouse_btn) {
+                        tracker.mouse_down(button);
                         let _ = input_tx.send(InputEvent::MouseButton {
                             button,
                             pressed: true,
@@ -130,8 +263,9 @@ pub(super) fn run_sdl_loop(
                     }
                 }
 
-                sdl2::event::Event::MouseButtonUp { mouse_btn, .. } => {
+                sdl2::event::Event::MouseButtonUp { mouse_btn, .. } if captured => {
                     if let Some(button) = map_mouse_button(mouse_btn) {
+                        tracker.mouse_up(button);
                         let _ = input_tx.send(InputEvent::MouseButton {
                             button,
                             pressed: false,
@@ -139,27 +273,43 @@ pub(super) fn run_sdl_loop(
                     }
                 }
 
-                sdl2::event::Event::MouseWheel { x, y, .. } => {
+                sdl2::event::Event::MouseWheel { x, y, .. } if captured => {
                     let _ = input_tx.send(InputEvent::MouseWheel { dx: x, dy: y });
                 }
 
-                sdl2::event::Event::ControllerAxisMotion { axis, value, .. } => {
-                    let ga = map_gamepad_axis(axis);
-                    let _ = input_tx.send(InputEvent::GamepadAxis { axis: ga, value });
+                // Gamepad input is forwarded regardless of capture mode:
+                // the local desktop doesn't compete for it.
+                sdl2::event::Event::ControllerAxisMotion {
+                    which, axis, value, ..
+                } => {
+                    if let Some(pad) = controllers.pad_of(which) {
+                        let ga = map_gamepad_axis(axis);
+                        let _ = input_tx.send(InputEvent::GamepadAxis {
+                            pad,
+                            axis: ga,
+                            value,
+                        });
+                    }
                 }
 
-                sdl2::event::Event::ControllerButtonDown { button, .. } => {
-                    if let Some(gb) = map_gamepad_button(button) {
+                sdl2::event::Event::ControllerButtonDown { which, button, .. } => {
+                    if let (Some(pad), Some(gb)) =
+                        (controllers.pad_of(which), map_gamepad_button(button))
+                    {
                         let _ = input_tx.send(InputEvent::GamepadButton {
+                            pad,
                             button: gb,
                             pressed: true,
                         });
                     }
                 }
 
-                sdl2::event::Event::ControllerButtonUp { button, .. } => {
-                    if let Some(gb) = map_gamepad_button(button) {
+                sdl2::event::Event::ControllerButtonUp { which, button, .. } => {
+                    if let (Some(pad), Some(gb)) =
+                        (controllers.pad_of(which), map_gamepad_button(button))
+                    {
                         let _ = input_tx.send(InputEvent::GamepadButton {
+                            pad,
                             button: gb,
                             pressed: false,
                         });
@@ -170,19 +320,13 @@ pub(super) fn run_sdl_loop(
                     which: joystick_index,
                     ..
                 } if game_controller_subsystem.is_game_controller(joystick_index) => {
-                    match game_controller_subsystem.open(joystick_index) {
-                        Ok(controller) => {
-                            info!(
-                                name = controller.name(),
-                                index = joystick_index,
-                                "Game controller connected"
-                            );
-                            controllers.push(controller);
-                        }
-                        Err(e) => {
-                            warn!(index = joystick_index, "Failed to open new controller: {e}");
-                        }
-                    }
+                    controllers.add(&game_controller_subsystem, joystick_index, &input_tx);
+                }
+
+                sdl2::event::Event::ControllerDeviceRemoved {
+                    which: instance_id, ..
+                } => {
+                    controllers.remove(instance_id, &input_tx);
                 }
 
                 _ => {}
@@ -202,6 +346,9 @@ pub(super) fn run_sdl_loop(
                 }
             };
         while let Ok(frame) = decoded_rx.try_recv() {
+            if latest_frame.is_some() {
+                overlay.on_frames_dropped(1);
+            }
             latest_frame = Some(frame);
         }
 
@@ -254,7 +401,22 @@ pub(super) fn run_sdl_loop(
         canvas
             .copy(&texture, None, None)
             .map_err(|e| anyhow!("canvas copy failed: {e}"))?;
+
+        overlay.on_frame_rendered(frame.stats);
+        if overlay.visible {
+            let text = overlay.text(rtt_probe(), &video_desc).to_string();
+            if let Err(e) = draw_overlay(&mut canvas, &text) {
+                warn!("Stats overlay draw failed: {e}");
+            }
+        }
+
         canvas.present();
+    }
+
+    // Release any keys/buttons still held so the remote session isn't left
+    // with stuck input (best-effort — the transport may already be gone).
+    for ev in tracker.release_all() {
+        let _ = input_tx.send(ev);
     }
 
     info!("Renderer shutting down");

@@ -224,6 +224,8 @@ pub(crate) async fn send_packets(
                 fragment_count: fragment_count_u16,
                 pts: pkt.pts,
                 is_keyframe: pkt.is_keyframe,
+                capture_us: pkt.capture_us,
+                encode_us: pkt.encode_us,
             };
 
             let header_bytes = serialize_header(&header)

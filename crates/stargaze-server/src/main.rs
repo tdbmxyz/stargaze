@@ -379,7 +379,7 @@ mod tests {
         let num_frames = 90u32; // 3 seconds at 30fps
 
         // Create a channel to feed frames to the encoder.
-        let (frames_tx, frames_rx) = mpsc::channel::<Frame>(4);
+        let (frames_tx, frames_rx) = mpsc::channel::<stargaze_core::capture::CapturedFrame>(4);
 
         let encoder_config = EncoderConfig {
             width,
@@ -418,7 +418,7 @@ mod tests {
                     format: PixelFormat::Bgra8,
                 };
 
-                if frames_tx.send(frame).await.is_err() {
+                if frames_tx.send(frame.into()).await.is_err() {
                     break;
                 }
             }
@@ -506,7 +506,7 @@ mod tests {
         // We'll request IDR at frame 15 and 45 to force extras.
         let num_frames = 120u32;
 
-        let (frames_tx, frames_rx) = mpsc::channel::<Frame>(4);
+        let (frames_tx, frames_rx) = mpsc::channel::<stargaze_core::capture::CapturedFrame>(4);
 
         let encoder_config = EncoderConfig {
             width,
@@ -539,7 +539,7 @@ mod tests {
                     format: PixelFormat::Bgra8,
                 };
 
-                if frames_tx.send(frame).await.is_err() {
+                if frames_tx.send(frame.into()).await.is_err() {
                     break;
                 }
             }

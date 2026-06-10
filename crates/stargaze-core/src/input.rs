@@ -6,6 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum number of simultaneously connected gamepads (matches Sunshine).
+pub const MAX_GAMEPADS: u8 = 4;
+
 /// An input event captured on the client and forwarded to the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputEvent {
@@ -42,6 +45,8 @@ pub enum InputEvent {
     },
     /// Gamepad analog axis movement.
     GamepadAxis {
+        /// Gamepad slot (0..[`MAX_GAMEPADS`]).
+        pad: u8,
         /// Which axis.
         axis: GamepadAxis,
         /// Axis value (-32768..32767 for sticks, 0..32767 for triggers).
@@ -49,15 +54,32 @@ pub enum InputEvent {
     },
     /// Gamepad button pressed or released.
     GamepadButton {
+        /// Gamepad slot (0..[`MAX_GAMEPADS`]).
+        pad: u8,
         /// Which button.
         button: GamepadButton,
         /// `true` = pressed, `false` = released.
         pressed: bool,
     },
+    /// A gamepad was connected on the client.
+    ///
+    /// The server creates a virtual gamepad device for this slot so games
+    /// see the device appear (hotplug) before any button/axis event.
+    GamepadConnected {
+        /// Gamepad slot (0..[`MAX_GAMEPADS`]).
+        pad: u8,
+    },
+    /// A gamepad was disconnected on the client.
+    ///
+    /// The server removes the virtual gamepad device for this slot.
+    GamepadDisconnected {
+        /// Gamepad slot (0..[`MAX_GAMEPADS`]).
+        pad: u8,
+    },
 }
 
 /// Mouse button identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MouseButton {
     /// Left mouse button.
     Left,
@@ -399,12 +421,14 @@ mod tests {
     #[test]
     fn input_event_gamepad_axis_construction() {
         let event = InputEvent::GamepadAxis {
+            pad: 0,
             axis: GamepadAxis::LeftX,
             value: -16000,
         };
         assert_eq!(
             event,
             InputEvent::GamepadAxis {
+                pad: 0,
                 axis: GamepadAxis::LeftX,
                 value: -16000,
             }
@@ -414,16 +438,45 @@ mod tests {
     #[test]
     fn input_event_gamepad_button_construction() {
         let event = InputEvent::GamepadButton {
+            pad: 1,
             button: GamepadButton::South,
             pressed: true,
         };
         assert_eq!(
             event,
             InputEvent::GamepadButton {
+                pad: 1,
                 button: GamepadButton::South,
                 pressed: true,
             }
         );
+    }
+
+    #[test]
+    fn input_events_postcard_round_trip() {
+        let events = [
+            InputEvent::Keyboard {
+                scancode: 4,
+                pressed: true,
+            },
+            InputEvent::GamepadAxis {
+                pad: 3,
+                axis: GamepadAxis::TriggerRight,
+                value: 32767,
+            },
+            InputEvent::GamepadButton {
+                pad: 2,
+                button: GamepadButton::Guide,
+                pressed: false,
+            },
+            InputEvent::GamepadConnected { pad: 1 },
+            InputEvent::GamepadDisconnected { pad: 1 },
+        ];
+        for event in events {
+            let bytes = postcard::to_allocvec(&event).expect("serialize");
+            let decoded: InputEvent = postcard::from_bytes(&bytes).expect("deserialize");
+            assert_eq!(decoded, event);
+        }
     }
 
     #[test]

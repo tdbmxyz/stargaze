@@ -28,6 +28,25 @@ pub struct DecodedFrame {
     pub height: u32,
     /// Presentation timestamp (matches the encoded frame's PTS).
     pub pts: u64,
+    /// Per-frame pipeline timing, for the client stats overlay.
+    pub stats: FrameStats,
+}
+
+/// Per-frame pipeline timing measurements, accumulated as a frame moves
+/// from capture (server) to decode (client). All values in microseconds;
+/// zero means "not measured".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameStats {
+    /// Host: capture → start of encoding.
+    pub capture_us: u32,
+    /// Host: encode duration.
+    pub encode_us: u32,
+    /// Client: frame fully received → decode started.
+    pub queue_us: u32,
+    /// Client: decode duration.
+    pub decode_us: u32,
+    /// Size of the encoded frame in bytes (for bitrate display).
+    pub packet_bytes: u32,
 }
 
 /// Configuration for the video decoder.
@@ -119,6 +138,7 @@ mod tests {
             width,
             height,
             pts: 0,
+            stats: FrameStats::default(),
         };
         assert_eq!(frame.y_plane.len(), y_size);
         assert_eq!(frame.u_plane.len(), chroma_size);
@@ -142,6 +162,7 @@ mod tests {
             width,
             height,
             pts: 100,
+            stats: FrameStats::default(),
         };
 
         assert_eq!(y_size, 307_200);

@@ -50,6 +50,9 @@ pub struct SessionRequest {
     pub codec: Codec,
 }
 
+/// Callback returning the current QUIC round-trip time estimate.
+pub type RttProbe = Box<dyn Fn() -> std::time::Duration + Send>;
+
 /// # Errors
 ///
 /// Returns `TransportError` if connection or handshake fails.
@@ -63,6 +66,7 @@ pub async fn connect(
         mpsc::Receiver<ReassembledFrame>,
         mpsc::Receiver<ReassembledFrame>,
         mpsc::Sender<InputEvent>,
+        RttProbe,
     ),
     TransportError,
 > {
@@ -96,6 +100,10 @@ pub async fn connect(
     let (audio_tx, audio_rx) = mpsc::channel::<ReassembledFrame>(16);
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>(64);
 
+    // Cloneable handle for RTT queries from the stats overlay.
+    let rtt_conn = connection.clone();
+    let rtt_probe: RttProbe = Box::new(move || rtt_conn.rtt());
+
     let task_handle = tokio::spawn(async move {
         if let Err(e) =
             receiver::receive_loop(connection, send_stream, video_tx, audio_tx, input_rx).await
@@ -110,5 +118,6 @@ pub async fn connect(
         video_rx,
         audio_rx,
         input_tx,
+        rtt_probe,
     ))
 }

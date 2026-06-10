@@ -115,6 +115,10 @@ struct PendingFrame {
     is_keyframe: bool,
     /// Stream type.
     stream_type: u8,
+    /// Host-side capture→encode latency in microseconds.
+    capture_us: u32,
+    /// Host-side encode duration in microseconds.
+    encode_us: u32,
 }
 
 /// Assembles datagram fragments into complete frames.
@@ -179,6 +183,8 @@ impl FrameAssembler {
             pts: header.pts,
             is_keyframe: header.is_keyframe,
             stream_type: header.stream_type,
+            capture_us: header.capture_us,
+            encode_us: header.encode_us,
         });
 
         let idx = usize::from(header.fragment_index);
@@ -225,6 +231,9 @@ impl FrameAssembler {
             pts: pending.pts,
             is_keyframe: pending.is_keyframe,
             stream_type: pending.stream_type,
+            capture_us: pending.capture_us,
+            encode_us: pending.encode_us,
+            received_at: Instant::now(),
         })
     }
 
@@ -435,6 +444,8 @@ mod tests {
             fragment_count,
             pts,
             is_keyframe,
+            capture_us: 0,
+            encode_us: 0,
         }
     }
 

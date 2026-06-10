@@ -1,14 +1,15 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use evdev::uinput::VirtualDevice;
 use evdev::{
-    AbsInfo, AbsoluteAxisCode, AttributeSet, InputEvent as EvdevInputEvent, KeyCode,
-    RelativeAxisCode, UinputAbsSetup,
+    AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, InputEvent as EvdevInputEvent, InputId,
+    KeyCode, RelativeAxisCode, UinputAbsSetup,
 };
-use stargaze_core::input::{GamepadAxis, GamepadButton, InputEvent, MouseButton};
+use stargaze_core::input::{GamepadAxis, GamepadButton, InputEvent, MAX_GAMEPADS, MouseButton};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug)]
 pub enum InputError {
@@ -45,17 +46,39 @@ impl From<std::io::Error> for InputError {
 pub(crate) struct VirtualDevices {
     keyboard: VirtualDevice,
     mouse: VirtualDevice,
-    gamepad: VirtualDevice,
+    /// Virtual gamepads keyed by pad slot, created on demand when the
+    /// client connects a controller and removed when it disconnects.
+    gamepads: HashMap<u8, VirtualDevice>,
+}
+
+impl VirtualDevices {
+    /// Returns the virtual gamepad for `pad`, creating it if needed.
+    ///
+    /// Pads beyond [`MAX_GAMEPADS`] are rejected.
+    fn gamepad(&mut self, pad: u8) -> Result<&mut VirtualDevice, InputError> {
+        if pad >= MAX_GAMEPADS {
+            return Err(InputError::SpawnFailed(format!(
+                "gamepad slot {pad} exceeds maximum of {MAX_GAMEPADS}"
+            )));
+        }
+        match self.gamepads.entry(pad) {
+            std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let device = create_virtual_gamepad()?;
+                info!(pad, "Created virtual gamepad (Xbox 360 layout)");
+                Ok(e.insert(device))
+            }
+        }
+    }
 }
 
 pub(crate) fn create_virtual_devices() -> Result<VirtualDevices, InputError> {
     let keyboard = create_virtual_keyboard()?;
     let mouse = create_virtual_mouse()?;
-    let gamepad = create_virtual_gamepad()?;
     Ok(VirtualDevices {
         keyboard,
         mouse,
-        gamepad,
+        gamepads: HashMap::new(),
     })
 }
 
@@ -96,6 +119,12 @@ fn create_virtual_mouse() -> Result<VirtualDevice, InputError> {
     Ok(device)
 }
 
+/// Creates a virtual gamepad that mimics a wired Xbox 360 controller.
+///
+/// Name, vendor/product ids, and the evdev layout (`HAT0X`/`HAT0Y` d-pad,
+/// 0..255 triggers on `ABS_Z`/`ABS_RZ`) match the kernel `xpad` driver, so
+/// games and SDL's controller database recognize it out of the box —
+/// the same approach Sunshine uses.
 fn create_virtual_gamepad() -> Result<VirtualDevice, InputError> {
     let mut keys = AttributeSet::<KeyCode>::new();
     let gamepad_keys = [
@@ -115,17 +144,13 @@ fn create_virtual_gamepad() -> Result<VirtualDevice, InputError> {
         keys.insert(*key);
     }
 
-    // D-pad as buttons (HAT0X/HAT0Y would be axes, but using keys is simpler
-    // and compatible with most games via evdev).
-    keys.insert(KeyCode::BTN_DPAD_UP);
-    keys.insert(KeyCode::BTN_DPAD_DOWN);
-    keys.insert(KeyCode::BTN_DPAD_LEFT);
-    keys.insert(KeyCode::BTN_DPAD_RIGHT);
-
-    let abs_info = AbsInfo::new(0, -32768, 32767, 16, 128, 1);
+    let stick_info = AbsInfo::new(0, -32768, 32767, 16, 128, 1);
+    let trigger_info = AbsInfo::new(0, 0, 255, 0, 0, 1);
+    let hat_info = AbsInfo::new(0, -1, 1, 0, 0, 0);
 
     let mut builder = VirtualDevice::builder()?
-        .name("Stargaze Virtual Gamepad")
+        .name("Microsoft X-Box 360 pad")
+        .input_id(InputId::new(BusType::BUS_USB, 0x045e, 0x028e, 0x110))
         .with_keys(&keys)?;
 
     let stick_axes = [
@@ -135,15 +160,15 @@ fn create_virtual_gamepad() -> Result<VirtualDevice, InputError> {
         AbsoluteAxisCode::ABS_RY,
     ];
     for axis in &stick_axes {
-        builder = builder.with_absolute_axis(&UinputAbsSetup::new(*axis, abs_info))?;
+        builder = builder.with_absolute_axis(&UinputAbsSetup::new(*axis, stick_info))?;
     }
 
-    let trigger_info = AbsInfo::new(0, 0, 32767, 16, 128, 1);
-    builder = builder
+    let device = builder
         .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisCode::ABS_Z, trigger_info))?
-        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisCode::ABS_RZ, trigger_info))?;
-
-    let device = builder.build()?;
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisCode::ABS_RZ, trigger_info))?
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisCode::ABS_HAT0X, hat_info))?
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisCode::ABS_HAT0Y, hat_info))?
+        .build()?;
     Ok(device)
 }
 
@@ -208,16 +233,37 @@ fn inject_event(devices: &mut VirtualDevices, event: &InputEvent) -> Result<(), 
         InputEvent::MouseWheel { dx, dy } => {
             inject_mouse_wheel(&mut devices.mouse, *dx, *dy, &syn)?;
         }
-        InputEvent::GamepadAxis { axis, value } => {
+        InputEvent::GamepadAxis { pad, axis, value } => {
             let (evdev_axis, val) = gamepad_axis_code(*axis, *value);
             let ev = EvdevInputEvent::new(evdev::EventType::ABSOLUTE.0, evdev_axis, val);
-            devices.gamepad.emit(&[ev, syn])?;
+            devices.gamepad(*pad)?.emit(&[ev, syn])?;
         }
-        InputEvent::GamepadButton { button, pressed } => {
-            let code = gamepad_button_code(*button);
-            let value = i32::from(*pressed);
-            let ev = EvdevInputEvent::new(evdev::EventType::KEY.0, code, value);
-            devices.gamepad.emit(&[ev, syn])?;
+        InputEvent::GamepadButton {
+            pad,
+            button,
+            pressed,
+        } => {
+            let ev = match gamepad_button_mapping(*button) {
+                PadButtonMapping::Key(code) => {
+                    EvdevInputEvent::new(evdev::EventType::KEY.0, code, i32::from(*pressed))
+                }
+                // D-pad buttons map to hat axis positions on the Xbox 360
+                // layout: pressed moves the hat, released recenters it.
+                PadButtonMapping::Hat { axis, direction } => EvdevInputEvent::new(
+                    evdev::EventType::ABSOLUTE.0,
+                    axis,
+                    if *pressed { direction } else { 0 },
+                ),
+            };
+            devices.gamepad(*pad)?.emit(&[ev, syn])?;
+        }
+        InputEvent::GamepadConnected { pad } => {
+            devices.gamepad(*pad)?;
+        }
+        InputEvent::GamepadDisconnected { pad } => {
+            if devices.gamepads.remove(pad).is_some() {
+                info!(pad, "Removed virtual gamepad");
+            }
         }
     }
 
@@ -290,34 +336,59 @@ fn mouse_button_code(button: MouseButton) -> u16 {
     }
 }
 
+/// Maps a gamepad axis event to an evdev (axis code, value) pair.
+///
+/// Sticks pass through unchanged; triggers are rescaled from SDL's
+/// 0..32767 to the Xbox 360 pad's 0..255 range.
 fn gamepad_axis_code(axis: GamepadAxis, value: i16) -> (u16, i32) {
+    let trigger = (i32::from(value).max(0) * 255 / 32767).min(255);
     match axis {
         GamepadAxis::LeftX => (AbsoluteAxisCode::ABS_X.0, i32::from(value)),
         GamepadAxis::LeftY => (AbsoluteAxisCode::ABS_Y.0, i32::from(value)),
         GamepadAxis::RightX => (AbsoluteAxisCode::ABS_RX.0, i32::from(value)),
         GamepadAxis::RightY => (AbsoluteAxisCode::ABS_RY.0, i32::from(value)),
-        GamepadAxis::TriggerLeft => (AbsoluteAxisCode::ABS_Z.0, i32::from(value)),
-        GamepadAxis::TriggerRight => (AbsoluteAxisCode::ABS_RZ.0, i32::from(value)),
+        GamepadAxis::TriggerLeft => (AbsoluteAxisCode::ABS_Z.0, trigger),
+        GamepadAxis::TriggerRight => (AbsoluteAxisCode::ABS_RZ.0, trigger),
     }
 }
 
-fn gamepad_button_code(button: GamepadButton) -> u16 {
+/// How a gamepad button is injected: as a key event, or as a hat axis
+/// position (the Xbox 360 d-pad is the HAT0X/HAT0Y axis pair).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PadButtonMapping {
+    Key(u16),
+    Hat { axis: u16, direction: i32 },
+}
+
+fn gamepad_button_mapping(button: GamepadButton) -> PadButtonMapping {
     match button {
-        GamepadButton::South => KeyCode::BTN_SOUTH.code(),
-        GamepadButton::East => KeyCode::BTN_EAST.code(),
-        GamepadButton::North => KeyCode::BTN_NORTH.code(),
-        GamepadButton::West => KeyCode::BTN_WEST.code(),
-        GamepadButton::Start => KeyCode::BTN_START.code(),
-        GamepadButton::Back => KeyCode::BTN_SELECT.code(),
-        GamepadButton::Guide => KeyCode::BTN_MODE.code(),
-        GamepadButton::LeftStick => KeyCode::BTN_THUMBL.code(),
-        GamepadButton::RightStick => KeyCode::BTN_THUMBR.code(),
-        GamepadButton::LeftShoulder => KeyCode::BTN_TL.code(),
-        GamepadButton::RightShoulder => KeyCode::BTN_TR.code(),
-        GamepadButton::DPadUp => KeyCode::BTN_DPAD_UP.code(),
-        GamepadButton::DPadDown => KeyCode::BTN_DPAD_DOWN.code(),
-        GamepadButton::DPadLeft => KeyCode::BTN_DPAD_LEFT.code(),
-        GamepadButton::DPadRight => KeyCode::BTN_DPAD_RIGHT.code(),
+        GamepadButton::South => PadButtonMapping::Key(KeyCode::BTN_SOUTH.code()),
+        GamepadButton::East => PadButtonMapping::Key(KeyCode::BTN_EAST.code()),
+        GamepadButton::North => PadButtonMapping::Key(KeyCode::BTN_NORTH.code()),
+        GamepadButton::West => PadButtonMapping::Key(KeyCode::BTN_WEST.code()),
+        GamepadButton::Start => PadButtonMapping::Key(KeyCode::BTN_START.code()),
+        GamepadButton::Back => PadButtonMapping::Key(KeyCode::BTN_SELECT.code()),
+        GamepadButton::Guide => PadButtonMapping::Key(KeyCode::BTN_MODE.code()),
+        GamepadButton::LeftStick => PadButtonMapping::Key(KeyCode::BTN_THUMBL.code()),
+        GamepadButton::RightStick => PadButtonMapping::Key(KeyCode::BTN_THUMBR.code()),
+        GamepadButton::LeftShoulder => PadButtonMapping::Key(KeyCode::BTN_TL.code()),
+        GamepadButton::RightShoulder => PadButtonMapping::Key(KeyCode::BTN_TR.code()),
+        GamepadButton::DPadUp => PadButtonMapping::Hat {
+            axis: AbsoluteAxisCode::ABS_HAT0Y.0,
+            direction: -1,
+        },
+        GamepadButton::DPadDown => PadButtonMapping::Hat {
+            axis: AbsoluteAxisCode::ABS_HAT0Y.0,
+            direction: 1,
+        },
+        GamepadButton::DPadLeft => PadButtonMapping::Hat {
+            axis: AbsoluteAxisCode::ABS_HAT0X.0,
+            direction: -1,
+        },
+        GamepadButton::DPadRight => PadButtonMapping::Hat {
+            axis: AbsoluteAxisCode::ABS_HAT0X.0,
+            direction: 1,
+        },
     }
 }
 
@@ -342,7 +413,72 @@ mod tests {
 
     #[test]
     fn gamepad_button_south_maps_correctly() {
-        assert_eq!(KeyCode::BTN_SOUTH.code(), 0x130);
+        assert_eq!(
+            gamepad_button_mapping(GamepadButton::South),
+            PadButtonMapping::Key(0x130)
+        );
+    }
+
+    #[test]
+    fn dpad_maps_to_hat_axes() {
+        assert_eq!(
+            gamepad_button_mapping(GamepadButton::DPadUp),
+            PadButtonMapping::Hat {
+                axis: AbsoluteAxisCode::ABS_HAT0Y.0,
+                direction: -1
+            }
+        );
+        assert_eq!(
+            gamepad_button_mapping(GamepadButton::DPadDown),
+            PadButtonMapping::Hat {
+                axis: AbsoluteAxisCode::ABS_HAT0Y.0,
+                direction: 1
+            }
+        );
+        assert_eq!(
+            gamepad_button_mapping(GamepadButton::DPadLeft),
+            PadButtonMapping::Hat {
+                axis: AbsoluteAxisCode::ABS_HAT0X.0,
+                direction: -1
+            }
+        );
+        assert_eq!(
+            gamepad_button_mapping(GamepadButton::DPadRight),
+            PadButtonMapping::Hat {
+                axis: AbsoluteAxisCode::ABS_HAT0X.0,
+                direction: 1
+            }
+        );
+    }
+
+    #[test]
+    fn triggers_rescale_to_xbox_range() {
+        // Full press: 32767 → 255.
+        assert_eq!(
+            gamepad_axis_code(GamepadAxis::TriggerLeft, 32767),
+            (AbsoluteAxisCode::ABS_Z.0, 255)
+        );
+        // Released: 0 → 0.
+        assert_eq!(
+            gamepad_axis_code(GamepadAxis::TriggerRight, 0),
+            (AbsoluteAxisCode::ABS_RZ.0, 0)
+        );
+        // Half press: ~127.
+        assert_eq!(gamepad_axis_code(GamepadAxis::TriggerLeft, 16384).1, 127);
+        // Negative values (shouldn't happen for triggers) clamp to 0.
+        assert_eq!(gamepad_axis_code(GamepadAxis::TriggerLeft, -100).1, 0);
+    }
+
+    #[test]
+    fn sticks_pass_through_unchanged() {
+        assert_eq!(
+            gamepad_axis_code(GamepadAxis::LeftX, -32768),
+            (AbsoluteAxisCode::ABS_X.0, -32768)
+        );
+        assert_eq!(
+            gamepad_axis_code(GamepadAxis::RightY, 32767),
+            (AbsoluteAxisCode::ABS_RY.0, 32767)
+        );
     }
 
     #[test]

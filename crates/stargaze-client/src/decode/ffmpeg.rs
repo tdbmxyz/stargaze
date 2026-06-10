@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use stargaze_core::config::Codec;
-use stargaze_core::decode::{DecodeError, DecodedFrame, DecoderConfig};
+use stargaze_core::decode::{DecodeError, DecodedFrame, DecoderConfig, FrameStats};
 use stargaze_core::transport::ReassembledFrame;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -288,6 +288,15 @@ pub(crate) fn run_decode_loop(
         }
         packet_counter += 1;
 
+        let decode_start = std::time::Instant::now();
+        let stats = FrameStats {
+            capture_us: frame.capture_us,
+            encode_us: frame.encode_us,
+            queue_us: saturating_us(decode_start.duration_since(frame.received_at)),
+            decode_us: 0, // filled in when the decoded frame pops out
+            packet_bytes: u32::try_from(frame.data.len()).unwrap_or(u32::MAX),
+        };
+
         let mut packet = ffmpeg_next::Packet::copy(&frame.data);
         packet.set_pts(Some(frame.pts.cast_signed()));
 
@@ -296,18 +305,29 @@ pub(crate) fn run_decode_loop(
             continue;
         }
 
-        drain_decoded_frames(decoder, &mut decoded_frame, decoded_tx)?;
+        drain_decoded_frames(decoder, &mut decoded_frame, decoded_tx, stats, decode_start)?;
     }
 
     // Flush: send EOF and drain remaining frames.
     if let Err(e) = decoder.decoder.send_eof() {
         warn!("Failed to send EOF to decoder: {e}");
     } else {
-        drain_decoded_frames(decoder, &mut decoded_frame, decoded_tx)?;
+        drain_decoded_frames(
+            decoder,
+            &mut decoded_frame,
+            decoded_tx,
+            FrameStats::default(),
+            std::time::Instant::now(),
+        )?;
     }
 
     info!("Decoder loop finished");
     Ok(())
+}
+
+/// Converts a duration to whole microseconds, saturating at `u32::MAX`.
+fn saturating_us(d: std::time::Duration) -> u32 {
+    u32::try_from(d.as_micros()).unwrap_or(u32::MAX)
 }
 
 /// Drains all available decoded frames from the codec, converts to YUV420P
@@ -316,6 +336,8 @@ fn drain_decoded_frames(
     decoder: &mut FfmpegDecoder,
     decoded_frame: &mut ffmpeg_next::frame::Video,
     decoded_tx: &std::sync::mpsc::Sender<DecodedFrame>,
+    stats: FrameStats,
+    decode_start: std::time::Instant,
 ) -> Result<(), DecodeError> {
     loop {
         match decoder.decoder.receive_frame(decoded_frame) {
@@ -388,7 +410,7 @@ fn drain_decoded_frames(
 
         // Convert to YUV420P planes for the renderer.
         // VAAPI typically transfers to NV12; software decode outputs YUV420P.
-        let output = if format == ffmpeg_next::format::Pixel::NV12 {
+        let mut output = if format == ffmpeg_next::format::Pixel::NV12 {
             let src = if is_vaapi {
                 &decoder.sw_frame
             } else {
@@ -409,6 +431,11 @@ fn drain_decoded_frames(
             // scaler handles any format, and this path is never VAAPI).
             let yuv_frame = scale_to_yuv420p(decoder, decoded_frame, width, height)?;
             extract_yuv420p(&yuv_frame, width, height)
+        };
+
+        output.stats = FrameStats {
+            decode_us: saturating_us(decode_start.elapsed()),
+            ..stats
         };
 
         if decoded_tx.send(output).is_err() {
@@ -458,6 +485,7 @@ fn extract_yuv420p(frame: &ffmpeg_next::frame::Video, width: u32, height: u32) -
         width,
         height,
         pts: frame.pts().map_or(0, i64::cast_unsigned),
+        stats: FrameStats::default(),
     }
 }
 
@@ -498,6 +526,7 @@ fn extract_nv12_to_yuv420p(
         width,
         height,
         pts: frame.pts().map_or(0, i64::cast_unsigned),
+        stats: FrameStats::default(),
     }
 }
 

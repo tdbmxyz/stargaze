@@ -8,7 +8,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use stargaze_core::capture::{Frame, PixelFormat};
+use stargaze_core::capture::{CapturedFrame, Frame, PixelFormat};
 use stargaze_core::encode::{EncodeError, EncodedPacket, EncoderConfig};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
@@ -279,7 +279,7 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn run_encode_loop(
     encoder: &mut FfmpegEncoder,
-    frames: &mut mpsc::Receiver<Frame>,
+    frames: &mut mpsc::Receiver<CapturedFrame>,
     packets_tx: &mpsc::Sender<EncodedPacket>,
     shutdown: &Arc<AtomicBool>,
     mut idr_rx: watch::Receiver<u64>,
@@ -298,10 +298,11 @@ pub(crate) fn run_encode_loop(
         }
 
         // Blocking receive from capture channel.
-        let Some(frame) = frames.blocking_recv() else {
+        let Some(captured) = frames.blocking_recv() else {
             info!("Capture channel closed, flushing encoder");
             break;
         };
+        let frame = captured.frame;
 
         // Check if an IDR keyframe was requested.
         let current_idr = *idr_rx.borrow_and_update();
@@ -318,6 +319,8 @@ pub(crate) fn run_encode_loop(
         if frame_counter == 0 {
             info!("First frame received from capture pipeline, uploading to encoder");
         }
+        let encode_start = std::time::Instant::now();
+        let capture_us = saturating_us(encode_start - captured.captured_at);
         match upload_and_encode(encoder, &frame, frame_counter, force_idr) {
             Ok(()) => {}
             Err(e) => {
@@ -334,6 +337,8 @@ pub(crate) fn run_encode_loop(
             packets_tx,
             frame_counter,
             &encoder.extradata,
+            capture_us,
+            encode_start,
         );
 
         frame_counter += 1;
@@ -683,17 +688,24 @@ fn try_mmap_dmabuf_fallback(
     result
 }
 
+/// Converts a duration to whole microseconds, saturating at `u32::MAX`.
+fn saturating_us(d: std::time::Duration) -> u32 {
+    u32::try_from(d.as_micros()).unwrap_or(u32::MAX)
+}
+
 /// Drains all available packets from the encoder after sending a frame.
 ///
 /// For keyframes, prepends `extradata` (VPS/SPS/PPS) so the decoder can
 /// start decoding from any keyframe without prior state.
-#[allow(clippy::similar_names)]
+#[allow(clippy::similar_names, clippy::too_many_arguments)]
 fn drain_packets(
     enc: &mut ffmpeg_next::encoder::video::Encoder,
     packet: &mut ffmpeg_next::Packet,
     packets_tx: &mpsc::Sender<EncodedPacket>,
     frame_counter: u64,
     extradata: &[u8],
+    capture_us: u32,
+    encode_start: std::time::Instant,
 ) {
     loop {
         match enc.receive_packet(packet) {
@@ -725,6 +737,8 @@ fn drain_packets(
                     data,
                     pts: packet.pts().unwrap_or(0).cast_unsigned(),
                     is_keyframe,
+                    capture_us,
+                    encode_us: saturating_us(encode_start.elapsed()),
                 };
 
                 if pkt.is_keyframe {
@@ -781,6 +795,8 @@ fn flush_encoder(
             data,
             pts: packet.pts().unwrap_or(0).cast_unsigned(),
             is_keyframe,
+            capture_us: 0,
+            encode_us: 0,
         };
 
         if packets_tx.blocking_send(pkt).is_err() {

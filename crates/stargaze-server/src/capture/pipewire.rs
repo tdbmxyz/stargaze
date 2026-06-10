@@ -12,7 +12,7 @@ use pipewire::spa::pod::{self, object, property};
 use pipewire::spa::utils::{Direction, Fraction, Rectangle, SpaTypes};
 use pipewire::stream::{StreamBox, StreamFlags, StreamState};
 use pipewire_sys;
-use stargaze_core::capture::{CaptureError, DmaBufInfo, Frame, PixelFormat};
+use stargaze_core::capture::{CaptureError, CapturedFrame, DmaBufInfo, Frame, PixelFormat};
 use stargaze_core::config::Resolution;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
@@ -25,7 +25,7 @@ use super::CaptureConfig;
 /// and send frames.
 struct CaptureCallbackData {
     /// Channel sender for delivering captured frames to the consumer.
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<CapturedFrame>,
     /// Shutdown flag — when set, the main loop should exit.
     shutdown: Arc<AtomicBool>,
     /// Negotiated frame width (set from config, may be updated on format change).
@@ -420,7 +420,7 @@ pub fn run_capture_stream(
     pw_fd: OwnedFd,
     pw_node_id: u32,
     config: CaptureConfig,
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<CapturedFrame>,
     shutdown: Arc<AtomicBool>,
     resolution_tx: oneshot::Sender<Resolution>,
 ) -> Result<(), CaptureError> {
@@ -720,7 +720,7 @@ pub fn run_capture_stream(
                     "Captured frame"
                 );
             }
-            if data.tx.blocking_send(frame).is_err() {
+            if data.tx.blocking_send(frame.into()).is_err() {
                 info!("Frame receiver dropped, stopping capture");
                 unsafe {
                     pipewire_sys::pw_main_loop_quit(mainloop_ptr);

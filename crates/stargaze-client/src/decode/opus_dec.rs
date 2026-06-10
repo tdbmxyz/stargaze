@@ -199,6 +199,9 @@ mod tests {
                     pts: 0,
                     is_keyframe: false,
                     data: encoded[..encoded_len].to_vec(),
+                    capture_us: 0,
+                    encode_us: 0,
+                    received_at: std::time::Instant::now(),
                 })
                 .await
                 .unwrap();

@@ -28,7 +28,7 @@ pub const IDR_RATE_LIMIT_MS: u64 = 100;
 /// on field values.  This constant is safe for any field combination and
 /// avoids the need to serialize a sample header just to measure its
 /// length.
-pub const HEADER_SIZE_UPPER_BOUND: usize = 20;
+pub const HEADER_SIZE_UPPER_BOUND: usize = 32;
 
 /// Initial QUIC MTU for LAN streaming (1500 Ethernet − 20 IP − 8 UDP − 20 headroom).
 pub const STREAMING_INITIAL_MTU: u16 = 1452;
@@ -57,6 +57,10 @@ pub struct DatagramHeader {
     pub pts: u64,
     /// True for IDR/keyframes (video only, always false for audio).
     pub is_keyframe: bool,
+    /// Host-side capture→encode latency in microseconds (0 = unknown).
+    pub capture_us: u32,
+    /// Host-side encode duration in microseconds (0 = unknown).
+    pub encode_us: u32,
 }
 
 /// Messages exchanged over the reliable control stream.
@@ -120,6 +124,12 @@ pub struct ReassembledFrame {
     pub is_keyframe: bool,
     /// Stream type (video or audio).
     pub stream_type: u8,
+    /// Host-side capture→encode latency in microseconds (0 = unknown).
+    pub capture_us: u32,
+    /// Host-side encode duration in microseconds (0 = unknown).
+    pub encode_us: u32,
+    /// When the frame finished reassembling on the client.
+    pub received_at: std::time::Instant,
 }
 
 /// Errors from the transport subsystem.
@@ -213,6 +223,8 @@ mod tests {
             fragment_count: 10,
             pts: 12345,
             is_keyframe: true,
+            capture_us: 2_100,
+            encode_us: 3_400,
         };
         let bytes = serialize_header(&header).unwrap();
         let (decoded, remainder) = deserialize_header(&bytes).unwrap();
@@ -229,6 +241,8 @@ mod tests {
             fragment_count: 1,
             pts: 0,
             is_keyframe: false,
+            capture_us: 0,
+            encode_us: 0,
         };
         let header_bytes = serialize_header(&header).unwrap();
         let payload = b"audio data here";
@@ -334,6 +348,9 @@ mod tests {
             pts: 100,
             is_keyframe: false,
             stream_type: STREAM_TYPE_VIDEO,
+            capture_us: 0,
+            encode_us: 0,
+            received_at: std::time::Instant::now(),
         };
         assert_eq!(frame.data.len(), 3);
         assert_eq!(frame.pts, 100);
@@ -398,6 +415,7 @@ mod tests {
     fn control_message_input_gamepad_axis_round_trip() {
         use crate::input::{GamepadAxis, InputEvent};
         let msg = ControlMessage::Input(InputEvent::GamepadAxis {
+            pad: 0,
             axis: GamepadAxis::LeftX,
             value: -16000,
         });
@@ -411,6 +429,7 @@ mod tests {
     fn control_message_input_gamepad_button_round_trip() {
         use crate::input::{GamepadButton, InputEvent};
         let msg = ControlMessage::Input(InputEvent::GamepadButton {
+            pad: 1,
             button: GamepadButton::South,
             pressed: true,
         });

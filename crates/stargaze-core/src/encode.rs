@@ -9,6 +9,11 @@ pub struct EncodedPacket {
     pub pts: u64,
     /// True for IDR frames.
     pub is_keyframe: bool,
+    /// Microseconds from capture to the start of encoding (host side).
+    /// Zero when unknown (e.g. audio packets).
+    pub capture_us: u32,
+    /// Microseconds spent encoding (host side). Zero when unknown.
+    pub encode_us: u32,
 }
 
 /// Configuration for the video encoder.
@@ -95,6 +100,8 @@ mod tests {
             data: vec![0x00, 0x00, 0x00, 0x01, 0x40, 0x01],
             pts: 0,
             is_keyframe: true,
+            capture_us: 0,
+            encode_us: 0,
         };
         assert_eq!(pkt.data.len(), 6);
         assert_eq!(pkt.pts, 0);

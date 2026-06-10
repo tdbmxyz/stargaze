@@ -81,6 +81,8 @@ async fn test_transport_localhost_round_trip() {
                     fragment_count: 1,
                     pts: u64::try_from(frame_idx).unwrap(),
                     is_keyframe: frame_idx == 0,
+                    capture_us: u32::MAX,
+                    encode_us: u32::MAX,
                 };
                 let header_size = serialize_header(&sample_header).unwrap().len();
                 let max_payload = max_datagram_size - header_size;
@@ -98,6 +100,8 @@ async fn test_transport_localhost_round_trip() {
                         fragment_count: u16::try_from(fragment_count).unwrap(),
                         pts: u64::try_from(frame_idx).unwrap(),
                         is_keyframe: frame_idx == 0,
+                        capture_us: 1_000,
+                        encode_us: 2_000,
                     };
 
                     let header_bytes = serialize_header(&header).unwrap();

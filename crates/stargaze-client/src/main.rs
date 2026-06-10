@@ -118,8 +118,14 @@ async fn main() -> anyhow::Result<()> {
         channels: 2,
     };
 
-    let (client_transport, session_params, video_frames, audio_frames, transport_input_tx) =
-        transport::connect(&cfg, session_request).await?;
+    let (
+        client_transport,
+        session_params,
+        video_frames,
+        audio_frames,
+        transport_input_tx,
+        rtt_probe,
+    ) = transport::connect(&cfg, session_request).await?;
 
     // Use the server-confirmed resolution for decoding and rendering.
     // The server may advertise a different resolution than what the client
@@ -188,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
             audio_pcm_rx,
             cfg.fullscreen,
             sdl_input_tx,
+            rtt_probe,
         )
     })?;
 

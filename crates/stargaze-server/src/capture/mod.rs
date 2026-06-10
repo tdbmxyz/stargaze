@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use stargaze_core::capture::{CaptureError, Frame};
+use stargaze_core::capture::{CaptureError, CapturedFrame};
 use stargaze_core::config::Resolution;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
@@ -93,7 +93,7 @@ pub async fn start_capture(
 ) -> Result<
     (
         CaptureSession,
-        mpsc::Receiver<Frame>,
+        mpsc::Receiver<CapturedFrame>,
         oneshot::Receiver<Resolution>,
     ),
     CaptureError,

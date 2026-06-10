@@ -89,6 +89,25 @@ pub enum Frame {
     },
 }
 
+/// A captured frame paired with its capture timestamp, used to measure
+/// how long a frame waits between capture and encoding.
+#[derive(Debug)]
+pub struct CapturedFrame {
+    /// The captured frame data.
+    pub frame: Frame,
+    /// When the frame was delivered by the capture pipeline.
+    pub captured_at: std::time::Instant,
+}
+
+impl From<Frame> for CapturedFrame {
+    fn from(frame: Frame) -> Self {
+        Self {
+            frame,
+            captured_at: std::time::Instant::now(),
+        }
+    }
+}
+
 /// Errors from the video capture subsystem.
 #[derive(Error, Debug)]
 pub enum CaptureError {

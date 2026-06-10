@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use stargaze_core::audio::{AudioEncoderConfig, AudioError, AudioFrame};
-use stargaze_core::capture::Frame;
+use stargaze_core::capture::CapturedFrame;
 use stargaze_core::encode::{EncodeError, EncodedPacket, EncoderConfig};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
@@ -95,7 +95,7 @@ impl Drop for EncoderSession {
 /// Returns `EncodeError::FfmpegError` if the encoder thread fails to spawn.
 pub fn start_encoder(
     config: EncoderConfig,
-    frames: mpsc::Receiver<Frame>,
+    frames: mpsc::Receiver<CapturedFrame>,
 ) -> Result<
     (
         EncoderSession,
