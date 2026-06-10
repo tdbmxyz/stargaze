@@ -378,9 +378,10 @@ fn drain_decoded_frames(
                 decoded_height = height,
                 decoded_format = ?format,
                 hw_accel = decoder.hw_accel,
-                stride_0 = src.stride(0),
-                stride_1 = src.stride(1),
-                stride_2 = src.stride(2),
+                planes = src.planes(),
+                stride_0 = plane_stride(src, 0),
+                stride_1 = plane_stride(src, 1),
+                stride_2 = plane_stride(src, 2),
                 "Decoded frame diagnostics"
             );
         }
@@ -416,6 +417,20 @@ fn drain_decoded_frames(
     }
 
     Ok(())
+}
+
+/// Returns the stride of plane `index`, or 0 if the frame has fewer planes.
+///
+/// `ffmpeg_next::frame::Video::stride` panics with "out of bounds" when the
+/// plane index is >= `planes()` (e.g. plane 2 of an NV12 frame, which only
+/// has 2 planes).  Any stride query on a frame whose format isn't known in
+/// advance must go through this.
+fn plane_stride(frame: &ffmpeg_next::frame::Video, index: usize) -> usize {
+    if index < frame.planes() {
+        frame.stride(index)
+    } else {
+        0
+    }
 }
 
 /// Extracts YUV420P planes from a frame, stripping stride padding.
@@ -554,6 +569,75 @@ mod tests {
             result.is_ok(),
             "H.265 decoder should initialize successfully"
         );
+    }
+
+    /// Regression test: VAAPI frames transferred to CPU are NV12, which has
+    /// only 2 planes.  Querying `stride(2)` on such a frame panics inside
+    /// ffmpeg-next ("out of bounds") and used to crash the decoder thread
+    /// when the frame diagnostics logged `stride_2` unconditionally.
+    #[test]
+    fn plane_stride_does_not_panic_on_nv12_two_plane_frame() {
+        ffmpeg_next::init().expect("ffmpeg init");
+        let frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::NV12, 64, 64);
+        assert_eq!(frame.planes(), 2, "NV12 must have exactly 2 planes");
+        assert!(plane_stride(&frame, 0) >= 64);
+        assert!(plane_stride(&frame, 1) >= 64);
+        // frame.stride(2) would panic here; plane_stride must return 0.
+        assert_eq!(plane_stride(&frame, 2), 0);
+    }
+
+    #[test]
+    fn plane_stride_handles_empty_frame() {
+        ffmpeg_next::init().expect("ffmpeg init");
+        let frame = ffmpeg_next::frame::Video::empty();
+        assert_eq!(plane_stride(&frame, 0), 0);
+        assert_eq!(plane_stride(&frame, 1), 0);
+        assert_eq!(plane_stride(&frame, 2), 0);
+    }
+
+    /// NV12 → YUV420P extraction must deinterleave the UV plane correctly
+    /// and produce planes sized for the visible area (stride stripped).
+    #[test]
+    fn extract_nv12_deinterleaves_uv_and_strips_stride() {
+        ffmpeg_next::init().expect("ffmpeg init");
+        let (w, h) = (64u32, 36u32);
+        let mut frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::NV12, w, h);
+        frame.set_pts(Some(42));
+
+        frame.data_mut(0).fill(0x11);
+        // Interleave U=0xAA / V=0x55 in the UV plane.
+        for chunk in frame.data_mut(1).chunks_exact_mut(2) {
+            chunk[0] = 0xAA;
+            chunk[1] = 0x55;
+        }
+
+        let out = extract_nv12_to_yuv420p(&frame, w, h);
+        let (w, h) = (w as usize, h as usize);
+        assert_eq!(out.y_plane.len(), w * h);
+        assert_eq!(out.u_plane.len(), (w / 2) * (h / 2));
+        assert_eq!(out.v_plane.len(), (w / 2) * (h / 2));
+        assert!(out.y_plane.iter().all(|&b| b == 0x11));
+        assert!(out.u_plane.iter().all(|&b| b == 0xAA));
+        assert!(out.v_plane.iter().all(|&b| b == 0x55));
+        assert_eq!(out.pts, 42);
+    }
+
+    #[test]
+    fn extract_yuv420p_strips_stride() {
+        ffmpeg_next::init().expect("ffmpeg init");
+        let (w, h) = (64u32, 36u32);
+        let mut frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, w, h);
+        frame.data_mut(0).fill(1);
+        frame.data_mut(1).fill(2);
+        frame.data_mut(2).fill(3);
+
+        let out = extract_yuv420p(&frame, w, h);
+        let (w, h) = (w as usize, h as usize);
+        assert_eq!(out.y_plane.len(), w * h);
+        assert_eq!(out.u_plane.len(), (w / 2) * (h / 2));
+        assert_eq!(out.v_plane.len(), (w / 2) * (h / 2));
+        assert!(out.u_plane.iter().all(|&b| b == 2));
+        assert!(out.v_plane.iter().all(|&b| b == 3));
     }
 
     #[test]
