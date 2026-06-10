@@ -82,6 +82,11 @@ pub(super) fn run_sdl_loop(
         controllers.len()
     );
 
+    // Show a black window until the first frame arrives.
+    canvas.set_draw_color(sdl2::pixels::Color::BLACK);
+    canvas.clear();
+    canvas.present();
+
     'main: loop {
         for event in event_pump.poll_iter() {
             match event {
@@ -164,20 +169,18 @@ pub(super) fn run_sdl_loop(
                 sdl2::event::Event::ControllerDeviceAdded {
                     which: joystick_index,
                     ..
-                } => {
-                    if game_controller_subsystem.is_game_controller(joystick_index) {
-                        match game_controller_subsystem.open(joystick_index) {
-                            Ok(controller) => {
-                                info!(
-                                    name = controller.name(),
-                                    index = joystick_index,
-                                    "Game controller connected"
-                                );
-                                controllers.push(controller);
-                            }
-                            Err(e) => {
-                                warn!(index = joystick_index, "Failed to open new controller: {e}");
-                            }
+                } if game_controller_subsystem.is_game_controller(joystick_index) => {
+                    match game_controller_subsystem.open(joystick_index) {
+                        Ok(controller) => {
+                            info!(
+                                name = controller.name(),
+                                index = joystick_index,
+                                "Game controller connected"
+                            );
+                            controllers.push(controller);
+                        }
+                        Err(e) => {
+                            warn!(index = joystick_index, "Failed to open new controller: {e}");
                         }
                     }
                 }
@@ -186,53 +189,21 @@ pub(super) fn run_sdl_loop(
             }
         }
 
-        // Drain decoded video frames, keeping only the latest.
-        let mut latest_frame: Option<DecodedFrame> = None;
+        // Wait briefly for a decoded frame so the loop doesn't busy-spin;
+        // the short timeout keeps input polling responsive. Then drain any
+        // queued frames, keeping only the latest.
+        let mut latest_frame: Option<DecodedFrame> =
+            match decoded_rx.recv_timeout(std::time::Duration::from_millis(2)) {
+                Ok(frame) => Some(frame),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    info!("Decoded frame channel closed, stopping renderer");
+                    break 'main;
+                }
+            };
         while let Ok(frame) = decoded_rx.try_recv() {
             latest_frame = Some(frame);
         }
-
-        if let Some(frame) = latest_frame {
-            static RENDER_DIAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let rn = RENDER_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if rn < 5 {
-                info!(
-                    frame_n = rn,
-                    frame_width = frame.width,
-                    frame_height = frame.height,
-                    texture_width = config.width,
-                    texture_height = config.height,
-                    y_plane_len = frame.y_plane.len(),
-                    u_plane_len = frame.u_plane.len(),
-                    v_plane_len = frame.v_plane.len(),
-                    y_pitch = frame.width as usize,
-                    chroma_pitch = frame.width as usize / 2,
-                    "SDL render diagnostics"
-                );
-            }
-
-            let y_pitch = frame.width as usize;
-            let chroma_pitch = frame.width as usize / 2;
-
-            texture
-                .update_yuv(
-                    None,
-                    &frame.y_plane,
-                    y_pitch,
-                    &frame.u_plane,
-                    chroma_pitch,
-                    &frame.v_plane,
-                    chroma_pitch,
-                )
-                .map_err(|e| anyhow!("texture update failed: {e}"))?;
-        }
-
-        // Always copy the texture to the canvas — the texture retains its
-        // last-uploaded content, but the back buffer is undefined after
-        // present() with double buffering, so we must re-copy every frame.
-        canvas
-            .copy(&texture, None, None)
-            .map_err(|e| anyhow!("canvas copy failed: {e}"))?;
 
         // Drain decoded audio PCM and queue for playback.
         while let Ok(pcm) = audio_pcm_rx.try_recv() {
@@ -242,6 +213,47 @@ pub(super) fn run_sdl_loop(
             }
         }
 
+        // Nothing new to display — keep polling events without re-presenting.
+        let Some(frame) = latest_frame else {
+            continue;
+        };
+
+        static RENDER_DIAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let rn = RENDER_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if rn < 5 {
+            info!(
+                frame_n = rn,
+                frame_width = frame.width,
+                frame_height = frame.height,
+                texture_width = config.width,
+                texture_height = config.height,
+                y_plane_len = frame.y_plane.len(),
+                u_plane_len = frame.u_plane.len(),
+                v_plane_len = frame.v_plane.len(),
+                y_pitch = frame.width as usize,
+                chroma_pitch = frame.width as usize / 2,
+                "SDL render diagnostics"
+            );
+        }
+
+        let y_pitch = frame.width as usize;
+        let chroma_pitch = frame.width as usize / 2;
+
+        texture
+            .update_yuv(
+                None,
+                &frame.y_plane,
+                y_pitch,
+                &frame.u_plane,
+                chroma_pitch,
+                &frame.v_plane,
+                chroma_pitch,
+            )
+            .map_err(|e| anyhow!("texture update failed: {e}"))?;
+
+        canvas
+            .copy(&texture, None, None)
+            .map_err(|e| anyhow!("canvas copy failed: {e}"))?;
         canvas.present();
     }
 

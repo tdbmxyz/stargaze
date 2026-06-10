@@ -474,13 +474,10 @@ mod tests {
         );
         assert!(got_keyframe, "should have received at least one keyframe");
 
-        // Test IDR request: send an IDR request value and encode one more frame.
-        // (Encoder is already stopped, so we test the IDR sender is functional.)
-        // The idr_tx was returned and should still be valid.
-        assert!(
-            idr_tx.send(1).is_ok() || true,
-            "IDR sender should be usable (or encoder thread exited)"
-        );
+        // Exercise the IDR sender handle. The encoder is already stopped, so
+        // the send may fail if the receiver was dropped — either outcome is
+        // acceptable here.
+        let _ = idr_tx.send(1);
     }
 
     /// Tests that the encoder properly forces IDR keyframes when requested.

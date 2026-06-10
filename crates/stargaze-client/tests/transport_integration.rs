@@ -122,18 +122,13 @@ async fn test_transport_localhost_round_trip() {
     let mut received_frames: Vec<ReassembledFrame> = Vec::new();
 
     let _receive_result = timeout(Duration::from_secs(5), async {
-        loop {
-            match client_conn.read_datagram().await {
-                Ok(datagram) => {
-                    let (header, payload) = deserialize_header(&datagram).unwrap();
-                    let (completed, _) = assembler.process_datagram(&header, payload.to_vec());
-                    received_frames.extend(completed);
+        while let Ok(datagram) = client_conn.read_datagram().await {
+            let (header, payload) = deserialize_header(&datagram).unwrap();
+            let (completed, _) = assembler.process_datagram(&header, payload.to_vec());
+            received_frames.extend(completed);
 
-                    if received_frames.len() == test_frames.len() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+            if received_frames.len() == test_frames.len() {
+                break;
             }
         }
     })

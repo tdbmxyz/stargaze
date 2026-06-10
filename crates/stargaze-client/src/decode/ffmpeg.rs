@@ -86,10 +86,75 @@ pub(crate) fn init_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, Deco
     }
 }
 
+/// `get_format` callback that selects the VAAPI hardware pixel format.
+///
+/// FFmpeg's default callback skips hardware formats, so without this the
+/// decoder silently falls back to software decoding even when a hardware
+/// device context is attached.
+unsafe extern "C" fn select_vaapi_format(
+    _ctx: *mut ffmpeg_sys_next::AVCodecContext,
+    fmt_list: *const ffmpeg_sys_next::AVPixelFormat,
+) -> ffmpeg_sys_next::AVPixelFormat {
+    use ffmpeg_sys_next::AVPixelFormat;
+
+    let mut fmt = fmt_list;
+    unsafe {
+        while *fmt != AVPixelFormat::AV_PIX_FMT_NONE {
+            if *fmt == AVPixelFormat::AV_PIX_FMT_VAAPI {
+                return AVPixelFormat::AV_PIX_FMT_VAAPI;
+            }
+            fmt = fmt.add(1);
+        }
+    }
+
+    // VAAPI is not offered for this stream (e.g. unsupported profile).
+    // Fall back to the first software format, mirroring FFmpeg's default.
+    warn!("VAAPI surface format not offered by decoder, decoding in software");
+    let mut fmt = fmt_list;
+    unsafe {
+        while *fmt != AVPixelFormat::AV_PIX_FMT_NONE {
+            let desc = ffmpeg_sys_next::av_pix_fmt_desc_get(*fmt);
+            let hwaccel = u64::from(ffmpeg_sys_next::AV_PIX_FMT_FLAG_HWACCEL.unsigned_abs());
+            if !desc.is_null() && ((*desc).flags & hwaccel) == 0 {
+                return *fmt;
+            }
+            fmt = fmt.add(1);
+        }
+    }
+    AVPixelFormat::AV_PIX_FMT_NONE
+}
+
+/// Returns true if the codec supports VAAPI decoding via a device context.
+fn codec_supports_vaapi(codec: ffmpeg_next::Codec) -> bool {
+    let mut index = 0;
+    loop {
+        let config = unsafe { ffmpeg_sys_next::avcodec_get_hw_config(codec.as_ptr(), index) };
+        if config.is_null() {
+            return false;
+        }
+        let config = unsafe { &*config };
+        let via_device_ctx = (config.methods
+            & ffmpeg_sys_next::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as libc::c_int)
+            != 0;
+        if via_device_ctx
+            && config.device_type == ffmpeg_sys_next::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI
+        {
+            return true;
+        }
+        index += 1;
+    }
+}
+
 /// Attempts to initialize a VAAPI-accelerated H.265 decoder.
 fn init_vaapi_decoder(_config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeError> {
     let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::HEVC)
         .ok_or_else(|| DecodeError::InitError("hevc decoder not found".to_string()))?;
+
+    if !codec_supports_vaapi(codec) {
+        return Err(DecodeError::InitError(
+            "hevc decoder does not support VAAPI via device context".to_string(),
+        ));
+    }
 
     // Create VAAPI hardware device context.
     let mut hw_device_ctx: *mut ffmpeg_sys_next::AVBufferRef = ptr::null_mut();
@@ -112,7 +177,8 @@ fn init_vaapi_decoder(_config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeEr
     let mut context = ffmpeg_next::codec::context::Context::new_with_codec(codec);
 
     // Attach the hardware device context so the decoder can allocate
-    // hardware surfaces.
+    // hardware surfaces, and install the format callback that selects the
+    // VAAPI surface format (without it FFmpeg defaults to software decode).
     unsafe {
         let raw_ctx = context.as_mut_ptr();
         (*raw_ctx).hw_device_ctx = ffmpeg_sys_next::av_buffer_ref(hw_device_ctx);
@@ -122,6 +188,7 @@ fn init_vaapi_decoder(_config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeEr
                 "av_buffer_ref failed for hw_device_ctx".to_string(),
             ));
         }
+        (*raw_ctx).get_format = Some(select_vaapi_format);
     }
 
     let decoder = context.decoder().video().map_err(|e| {
@@ -197,18 +264,16 @@ pub(crate) fn run_decode_loop(
             break;
         }
 
-        let Some(mut frame) = frames_rx.blocking_recv() else {
+        let Some(frame) = frames_rx.blocking_recv() else {
             info!("Reassembled frame channel closed, flushing decoder");
             break;
         };
 
-        // Drain any queued frames, keeping only the latest.  Always prefer
-        // a keyframe — it resets the decoder and avoids reference corruption.
-        while let Ok(newer) = frames_rx.try_recv() {
-            if newer.is_keyframe || !frame.is_keyframe {
-                frame = newer;
-            }
-        }
+        // Decode every frame we receive: skipping a delta frame here would
+        // break decoder references and corrupt output. If decoding falls
+        // behind, the transport drops frames before they reach this channel
+        // and requests an IDR, and the renderer keeps only the latest
+        // decoded frame.
 
         if packet_counter < 5 {
             let preview_len = frame.data.len().min(64);

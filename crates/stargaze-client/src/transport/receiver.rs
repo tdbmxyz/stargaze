@@ -145,8 +145,9 @@ impl FrameAssembler {
 
     /// Processes an incoming datagram fragment.
     ///
-    /// Returns a list of completed frames (may be empty or contain
-    /// multiple frames if out-of-order fragments completed several frames).
+    /// Returns a list of completed frames, delivered in `frame_index`
+    /// order (may be empty, or contain multiple frames if this fragment
+    /// unblocked several already-complete frames).
     /// Also returns `true` in the second element if an `IDR` should be requested.
     pub fn process_datagram(
         &mut self,
@@ -155,6 +156,19 @@ impl FrameAssembler {
     ) -> (Vec<ReassembledFrame>, bool) {
         let mut completed = Vec::new();
         let mut need_idr = false;
+
+        // Start in-order tracking from the first frame seen on this stream
+        // (the client may join mid-stream).
+        let next = *self
+            .next_frame
+            .entry(header.stream_type)
+            .or_insert(header.frame_index);
+
+        // Late fragment for a frame already delivered or skipped — drop it
+        // rather than re-creating a pending entry that can never complete.
+        if header.frame_index < next {
+            return (completed, false);
+        }
 
         let key = (header.stream_type, header.frame_index);
 
@@ -171,12 +185,6 @@ impl FrameAssembler {
         if idx < pending.fragments.len() && pending.fragments[idx].is_none() {
             pending.fragments[idx] = Some(payload);
             pending.received_count += 1;
-        }
-
-        if pending.received_count == pending.fragment_count
-            && let Some(frame) = self.assemble_frame(key)
-        {
-            completed.push(frame);
         }
 
         let skipped = self.deliver_in_order(header.stream_type, &mut completed);
@@ -235,22 +243,29 @@ impl FrameAssembler {
                     completed.push(frame);
                 }
                 next = next.wrapping_add(1);
-            } else {
-                // If the next expected frame is missing but we have later
-                // complete frames, skip the gap so the pipeline doesn't stall.
-                // This triggers an IDR request in the caller.
-                let have_later = self.pending.iter().any(|((st, idx), pf)| {
-                    *st == stream_type && *idx > next && pf.received_count == pf.fragment_count
-                });
-                if have_later {
-                    // Drop the incomplete frame if it exists.
-                    self.pending.remove(&key);
-                    next = next.wrapping_add(1);
-                    skipped_gap = true;
-                    continue;
-                }
-                break;
+                continue;
             }
+
+            // The next expected frame is incomplete. If the stream has
+            // already moved at least two frames past it (a complete frame
+            // with index >= next + 2 exists), treat it as lost and skip it
+            // so the pipeline doesn't stall. This triggers an IDR request
+            // in the caller. Requiring two frames of progress tolerates
+            // simple datagram reordering without dropping frames that are
+            // still in flight.
+            let lost = self.pending.iter().any(|((st, idx), pf)| {
+                *st == stream_type
+                    && *idx >= next.saturating_add(2)
+                    && pf.received_count == pf.fragment_count
+            });
+            if lost {
+                // Drop the incomplete frame if it exists.
+                self.pending.remove(&key);
+                next = next.wrapping_add(1);
+                skipped_gap = true;
+                continue;
+            }
+            break;
         }
         self.next_frame.insert(stream_type, next);
         skipped_gap
@@ -319,7 +334,7 @@ pub(crate) async fn receive_loop(
                     }
                 };
 
-                let (completed_frames, need_idr) =
+                let (completed_frames, mut need_idr) =
                     assembler.process_datagram(&header, payload.to_vec());
 
                 for frame in completed_frames {
@@ -343,11 +358,17 @@ pub(crate) async fn receive_loop(
                             match video_tx.try_send(frame) {
                                 Ok(()) => Ok(()),
                                 Err(mpsc::error::TrySendError::Full(f)) => {
-                                    // Channel full — decoder is behind. Drop.
+                                    // Channel full — decoder is behind. Drop
+                                    // the frame and request an IDR: the gap
+                                    // would otherwise corrupt decoding until
+                                    // the next periodic keyframe.
                                     debug!(
                                         pts = f.pts,
                                         "Dropping video frame (decoder backpressure)"
                                     );
+                                    if !need_idr {
+                                        need_idr = assembler.should_request_idr();
+                                    }
                                     Ok(())
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -575,25 +596,79 @@ mod tests {
     fn per_stream_in_order_delivery() {
         let mut assembler = FrameAssembler::new();
 
-        // Audio frame 1 arrives before audio frame 0.
+        // Audio frame 1 is the first frame seen on this stream — in-order
+        // tracking starts there and it is delivered immediately.
         let audio_1 = make_header(STREAM_TYPE_AUDIO, 1, 0, 1, 10, false);
         let (frames, _) = assembler.process_datagram(&audio_1, vec![0xBB]);
-        // Frame 1 completed but frame 0 hasn't arrived yet — should be delivered
-        // since it was the first completed frame on this stream and assembler
-        // already consumed it directly.
         assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, vec![0xBB]);
 
-        // Audio frame 0 arrives.
+        // Audio frame 0 arrives late (before the stream start) — dropped.
         let audio_0 = make_header(STREAM_TYPE_AUDIO, 0, 0, 1, 5, false);
         let (frames, _) = assembler.process_datagram(&audio_0, vec![0xAA]);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data, vec![0xAA]);
+        assert!(frames.is_empty());
 
         // Meanwhile, video stream is tracked independently.
         let video_0 = video_header(0, 0, 1, 50, true);
         let (frames, _) = assembler.process_datagram(&video_0, vec![0xCC]);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].stream_type, STREAM_TYPE_VIDEO);
+    }
+
+    #[test]
+    fn out_of_order_frames_delivered_in_order() {
+        let mut assembler = FrameAssembler::new();
+
+        // Frame 0 starts assembling (1 of 2 fragments).
+        let f0_frag0 = video_header(0, 0, 2, 0, true);
+        let (frames, _) = assembler.process_datagram(&f0_frag0, vec![1]);
+        assert!(frames.is_empty());
+
+        // Frame 1 completes while frame 0 is still pending — must NOT be
+        // delivered ahead of frame 0.
+        let f1 = video_header(1, 0, 1, 1, false);
+        let (frames, need_idr) = assembler.process_datagram(&f1, vec![9]);
+        assert!(frames.is_empty());
+        assert!(!need_idr);
+
+        // Frame 0 completes — both frames are delivered, in order.
+        let f0_frag1 = video_header(0, 1, 2, 0, true);
+        let (frames, _) = assembler.process_datagram(&f0_frag1, vec![2]);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].data, vec![1, 2]);
+        assert_eq!(frames[1].data, vec![9]);
+    }
+
+    #[test]
+    fn lost_frame_gap_skipped_and_idr_requested() {
+        let mut assembler = FrameAssembler::new();
+
+        // Frame 0 delivered normally.
+        let f0 = video_header(0, 0, 1, 0, true);
+        let (frames, _) = assembler.process_datagram(&f0, vec![1]);
+        assert_eq!(frames.len(), 1);
+
+        // Frame 1 is lost entirely; frame 2 arrives complete — only one
+        // frame of progress, could still be simple reordering, so wait.
+        let f2 = video_header(2, 0, 1, 2, false);
+        let (frames, need_idr) = assembler.process_datagram(&f2, vec![3]);
+        assert!(frames.is_empty());
+        assert!(!need_idr);
+
+        // Frame 3 completes too — frame 1 is now considered lost: the gap
+        // is skipped, frames 2 and 3 are delivered, and an IDR is requested.
+        let f3 = video_header(3, 0, 1, 3, false);
+        let (frames, need_idr) = assembler.process_datagram(&f3, vec![4]);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].pts, 2);
+        assert_eq!(frames[1].pts, 3);
+        assert!(need_idr, "Skipping a lost video frame must request an IDR");
+
+        // A late fragment of the skipped frame 1 is ignored.
+        let f1_late = video_header(1, 0, 2, 1, false);
+        let (frames, need_idr) = assembler.process_datagram(&f1_late, vec![7]);
+        assert!(frames.is_empty());
+        assert!(!need_idr);
     }
 
     #[test]

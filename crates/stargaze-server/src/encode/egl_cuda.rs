@@ -865,7 +865,7 @@ impl EglCudaBridge {
 
         let proc = self.egl.get_proc_address("glEGLImageTargetTexture2DOES");
         let egl_image_target: EglImageTargetFn = match proc {
-            Some(p) => unsafe { std::mem::transmute(p) },
+            Some(p) => unsafe { std::mem::transmute::<extern "system" fn(), EglImageTargetFn>(p) },
             None => {
                 return Err(EncodeError::EncodeFrameError {
                     frame: 0,

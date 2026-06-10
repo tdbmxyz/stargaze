@@ -158,11 +158,13 @@ async fn main() -> anyhow::Result<()> {
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
 
     // Bridge: SDL event loop (std::sync::mpsc) → tokio channel → transport.
+    // The std receiver blocks, so this must run on a blocking thread rather
+    // than a tokio worker.
     let (sdl_input_tx, sdl_input_rx) =
         std::sync::mpsc::channel::<stargaze_core::input::InputEvent>();
-    let bridge_handle = tokio::spawn(async move {
+    let bridge_handle = tokio::task::spawn_blocking(move || {
         while let Ok(event) = sdl_input_rx.recv() {
-            if transport_input_tx.send(event).await.is_err() {
+            if transport_input_tx.blocking_send(event).is_err() {
                 break;
             }
         }
