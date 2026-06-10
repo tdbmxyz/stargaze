@@ -518,14 +518,18 @@ fn extract_nv12_to_yuv420p(
     let y_plane = copy_plane(y_data, y_stride, w, h);
 
     // NV12: UV plane is interleaved (U0 V0 U1 V1 ...).  Split into separate
-    // U and V planes.
-    let mut u_plane = Vec::with_capacity(cw * ch);
-    let mut v_plane = Vec::with_capacity(cw * ch);
+    // U and V planes.  Row-sliced with exact chunks so the inner loop has
+    // no bounds checks and vectorizes — this runs per frame on the full
+    // chroma plane, so the scalar version showed up in decode time.
+    let mut u_plane = vec![0u8; cw * ch];
+    let mut v_plane = vec![0u8; cw * ch];
     for row in 0..ch {
-        let src_off = row * uv_stride;
-        for col in 0..cw {
-            u_plane.push(uv_data[src_off + col * 2]);
-            v_plane.push(uv_data[src_off + col * 2 + 1]);
+        let src = &uv_data[row * uv_stride..row * uv_stride + cw * 2];
+        let dst_u = &mut u_plane[row * cw..(row + 1) * cw];
+        let dst_v = &mut v_plane[row * cw..(row + 1) * cw];
+        for ((pair, u), v) in src.chunks_exact(2).zip(dst_u).zip(dst_v) {
+            *u = pair[0];
+            *v = pair[1];
         }
     }
 
