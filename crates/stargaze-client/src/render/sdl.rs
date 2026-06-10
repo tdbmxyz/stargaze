@@ -448,6 +448,14 @@ pub(super) fn run_sdl_loop(
         let _ = input_tx.send(ev);
     }
 
+    // Release the keyboard grab and leave relative mouse mode while the
+    // window is still alive, then flush the pending Wayland requests.
+    // Tearing the window down with relative mode active makes SDL issue a
+    // pointer warp against a surface the compositor is already destroying,
+    // which crashes Hyprland (SEGV in wp_pointer_warp_v1, seen on 0.55).
+    apply_capture_mode(false, &mut canvas, &sdl.mouse());
+    event_pump.pump_events();
+
     if let Some(path) = stats_file {
         match recorder.write_report(
             path,
