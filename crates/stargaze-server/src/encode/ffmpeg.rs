@@ -189,7 +189,21 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
     )));
     encoder.set_bit_rate(config.bitrate_mbps as usize * 1_000_000);
     encoder.set_max_b_frames(0);
-    encoder.set_gop(config.framerate * 2); // keyframe every ~2 seconds
+    // Infinite GOP: no periodic keyframes. Periodic IDRs cause a visible
+    // quality "pulse" every GOP and waste bitrate; the client requests an
+    // IDR explicitly on packet loss (forced-idr below), which is all that's
+    // needed — the same strategy Sunshine/Moonlight use.
+    encoder.set_gop(i32::MAX.cast_unsigned());
+
+    // Constrain the rate controller to a one-frame VBV buffer so every
+    // frame (including on-demand IDRs) fits the per-frame bitrate budget.
+    // Large keyframes otherwise burst over the link and arrive late.
+    unsafe {
+        let raw_ctx = encoder.as_mut_ptr();
+        let per_frame_bits = (config.bitrate_mbps * 1_000_000 / config.framerate).cast_signed();
+        (*raw_ctx).rc_buffer_size = per_frame_bits;
+        (*raw_ctx).rc_max_rate = i64::from(config.bitrate_mbps) * 1_000_000;
+    }
 
     // Set color space parameters.
     unsafe {
@@ -201,10 +215,19 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
     }
 
     // Step 6: Open encoder with NVENC-specific options.
+    //
+    // p4 (balanced) instead of p1 (fastest): NVENC easily sustains p4 at
+    // 1440p60 and the quality difference is dramatic at streaming bitrates.
+    // Quarter-res multipass and spatial AQ distribute bits where the eye
+    // notices (text edges, flat gradients) — without them the picture has
+    // the typical "screen share" mosquito noise.
     let mut opts = ffmpeg_next::Dictionary::new();
-    opts.set("preset", "p1");
+    opts.set("preset", "p4");
     opts.set("tune", "ull");
     opts.set("rc", "cbr");
+    opts.set("multipass", "qres");
+    opts.set("spatial-aq", "1");
+    opts.set("aq-strength", "8");
     opts.set("delay", "0");
     opts.set("forced-idr", "1");
     opts.set("zerolatency", "1");

@@ -502,8 +502,8 @@ mod tests {
         let width = 640u32;
         let height = 480u32;
         let framerate = 30u32;
-        // GOP is framerate*2 = 60, so in 120 frames we'd normally get 2 keyframes.
-        // We'll request IDR at frame 15 and 45 to force extras.
+        // The GOP is infinite (keyframes only on demand), so we expect the
+        // initial keyframe plus the IDRs requested at frames 15 and 45.
         let num_frames = 120u32;
 
         let (frames_tx, frames_rx) = mpsc::channel::<stargaze_core::capture::CapturedFrame>(4);
@@ -578,8 +578,8 @@ mod tests {
         );
 
         assert!(total_count > 0, "should have received encoded packets");
-        // We should get at least 3 keyframes: the initial one + 2 forced IDRs.
-        // The natural GOP (every 60 frames) adds another, so expect >= 3.
+        // We should get at least 3 keyframes: the initial one + 2 forced IDRs
+        // (the GOP is infinite, so no periodic keyframes are added).
         assert!(
             keyframe_count >= 3,
             "expected at least 3 keyframes (1 initial + 2 IDR requests), got {keyframe_count}"
