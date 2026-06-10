@@ -1,14 +1,21 @@
-//! On-screen stats overlay (Moonlight-style), drawn in the top-left corner.
+//! On-screen stats overlay and session report (Moonlight-style).
 //!
-//! Collects per-frame [`FrameStats`] into a rolling window, formats them
-//! into text twice a second, and rasterizes the text with an embedded
-//! 8x8 bitmap font (no `SDL_ttf` dependency).
+//! The overlay collects per-frame [`FrameStats`] into a rolling window,
+//! formats them twice a second, and rasterizes the text with an embedded
+//! 8x8 bitmap font (no `SDL_ttf` dependency). The recorder accumulates
+//! every decoded frame for the whole session and can write a summary
+//! report (avg/min/max/std/worst 5%) for offline analysis.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
+use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use font8x8::legacy::BASIC_LEGACY;
 use stargaze_core::decode::FrameStats;
+
+use crate::transport::NetStats;
 
 /// Number of recent frames the rolling averages are computed over.
 const WINDOW: usize = 120;
@@ -28,6 +35,15 @@ struct Sample {
     rendered_at: Instant,
 }
 
+/// Snapshot of [`NetStats`] counters, used to compute rates between
+/// overlay refreshes.
+#[derive(Clone, Copy)]
+struct NetSnapshot {
+    bytes: u64,
+    frames: u64,
+    at: Instant,
+}
+
 /// Rolling pipeline statistics and cached overlay text.
 pub(super) struct StatsOverlay {
     /// Whether the overlay is currently displayed.
@@ -40,6 +56,8 @@ pub(super) struct StatsOverlay {
     /// Cached formatted text and when it was last refreshed.
     text: String,
     text_refreshed: Instant,
+    /// Counter snapshot from the previous refresh, for rate computation.
+    last_net: Option<NetSnapshot>,
 }
 
 impl StatsOverlay {
@@ -51,6 +69,7 @@ impl StatsOverlay {
             rendered: 0,
             text: String::new(),
             text_refreshed: Instant::now(),
+            last_net: None,
         }
     }
 
@@ -71,13 +90,31 @@ impl StatsOverlay {
         self.dropped += count;
     }
 
+    /// Total frames presented so far.
+    pub(super) fn rendered(&self) -> u64 {
+        self.rendered
+    }
+
+    /// Total decoded frames superseded before presentation.
+    pub(super) fn superseded(&self) -> u64 {
+        self.dropped
+    }
+
     /// Returns the overlay text, refreshing it at most every 500 ms.
     ///
     /// `rtt` is the current QUIC round-trip estimate, `video` is the
-    /// session geometry string (e.g. "3440x1440 @ 60").
-    pub(super) fn text(&mut self, rtt: Duration, video: &str) -> &str {
+    /// session geometry string (e.g. "3440x1440"), `net` the shared
+    /// receiver-side counters.
+    pub(super) fn text(&mut self, rtt: Duration, video: &str, net: &NetStats) -> &str {
         if self.text.is_empty() || self.text_refreshed.elapsed() >= TEXT_REFRESH {
-            self.text = self.format_text(rtt, video);
+            let snapshot = NetSnapshot {
+                bytes: net.video_bytes.load(Ordering::Relaxed),
+                frames: net.video_frames.load(Ordering::Relaxed),
+                at: Instant::now(),
+            };
+            let net_dropped = net.video_dropped.load(Ordering::Relaxed);
+            self.text = self.format_text(rtt, video, snapshot, net_dropped);
+            self.last_net = Some(snapshot);
             self.text_refreshed = Instant::now();
         }
         &self.text
@@ -85,7 +122,13 @@ impl StatsOverlay {
 
     // Sample window is bounded (≤ WINDOW = 120), precision loss is impossible.
     #[allow(clippy::cast_precision_loss)]
-    fn format_text(&self, rtt: Duration, video: &str) -> String {
+    fn format_text(
+        &self,
+        rtt: Duration,
+        video: &str,
+        net_now: NetSnapshot,
+        net_dropped: u64,
+    ) -> String {
         let n = self.samples.len().max(1) as f64;
         let avg = |f: fn(&FrameStats) -> u32| -> f64 {
             self.samples
@@ -101,39 +144,219 @@ impl StatsOverlay {
         let queue_ms = avg(|s| s.queue_us);
         let decode_ms = avg(|s| s.decode_us);
 
-        // FPS and bitrate over the sample window's real elapsed time.
-        let (fps, mbps) = match (self.samples.front(), self.samples.back()) {
+        // Receive rate from the network counters (counts every complete
+        // frame on the wire, including ones dropped before decode).
+        let (recv_fps, mbps) = match self.last_net {
+            Some(prev) => {
+                let span = net_now.at.duration_since(prev.at).as_secs_f64();
+                if span > 0.0 {
+                    (
+                        (net_now.frames - prev.frames) as f64 / span,
+                        (net_now.bytes - prev.bytes) as f64 * 8.0 / span / 1_000_000.0,
+                    )
+                } else {
+                    (0.0, 0.0)
+                }
+            }
+            None => (0.0, 0.0),
+        };
+
+        // Render rate from the rolling window of presented frames.
+        let render_fps = match (self.samples.front(), self.samples.back()) {
             (Some(first), Some(last)) if self.samples.len() >= 2 => {
                 let span = last
                     .rendered_at
                     .duration_since(first.rendered_at)
                     .as_secs_f64();
                 if span > 0.0 {
-                    let frames = (self.samples.len() - 1) as f64;
-                    let bytes: f64 = self
-                        .samples
-                        .iter()
-                        .map(|s| f64::from(s.stats.packet_bytes))
-                        .sum();
-                    (frames / span, bytes * 8.0 / span / 1_000_000.0)
+                    (self.samples.len() - 1) as f64 / span
                 } else {
-                    (0.0, 0.0)
+                    0.0
                 }
             }
-            _ => (0.0, 0.0),
+            _ => 0.0,
         };
 
         format!(
-            "VIDEO   {video} (render {fps:.1} fps)\n\
+            "VIDEO   {video} (recv {recv_fps:.1} fps / render {render_fps:.1} fps)\n\
              BITRATE {mbps:.1} Mbps\n\
              HOST    capture {capture_ms:.1} ms / encode {encode_ms:.1} ms\n\
-             NETWORK rtt {:.1} ms\n\
+             NETWORK rtt {:.1} ms / {net_dropped} dropped\n\
              CLIENT  queue {queue_ms:.1} ms / decode {decode_ms:.1} ms\n\
-             FRAMES  {} rendered / {} dropped",
+             FRAMES  {} rendered / {} superseded",
             rtt.as_secs_f64() * 1000.0,
             self.rendered,
             self.dropped,
         )
+    }
+}
+
+/// Summary statistics for one metric over the whole session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Summary {
+    avg: f64,
+    min: f64,
+    max: f64,
+    std: f64,
+    /// Mean of the worst 5% of samples (highest for latencies,
+    /// lowest for rates — controlled by the caller).
+    worst5: f64,
+}
+
+/// Computes avg/min/max/std and the worst-5% mean for `values`.
+///
+/// `worst_is_high` selects which tail is "worst": `true` for latencies
+/// (high is bad), `false` for rates like fps (low is bad).
+fn summarize(values: &[f64], worst_is_high: bool) -> Option<Summary> {
+    if values.is_empty() {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let n = values.len() as f64;
+    let avg = values.iter().sum::<f64>() / n;
+    let var = values.iter().map(|v| (v - avg).powi(2)).sum::<f64>() / n;
+
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let tail = values.len().div_ceil(20); // 5%, at least 1 sample
+    let worst: &[f64] = if worst_is_high {
+        &sorted[sorted.len() - tail..]
+    } else {
+        &sorted[..tail]
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let worst5 = worst.iter().sum::<f64>() / worst.len() as f64;
+
+    Some(Summary {
+        avg,
+        min: sorted[0],
+        max: sorted[sorted.len() - 1],
+        std: var.sqrt(),
+        worst5,
+    })
+}
+
+/// Records every decoded frame for the whole session and produces a
+/// text report for offline analysis (`--stats-file`).
+pub(super) struct StatsRecorder {
+    samples: Vec<FrameStats>,
+    /// Arrival time of each decoded frame (for instantaneous fps).
+    arrivals: Vec<Instant>,
+    started: Instant,
+}
+
+impl StatsRecorder {
+    pub(super) fn new() -> Self {
+        Self {
+            samples: Vec::new(),
+            arrivals: Vec::new(),
+            started: Instant::now(),
+        }
+    }
+
+    /// Records one decoded frame (rendered or superseded).
+    pub(super) fn record(&mut self, stats: FrameStats) {
+        self.samples.push(stats);
+        self.arrivals.push(Instant::now());
+    }
+
+    /// Writes the session report to `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the file cannot be written.
+    pub(super) fn write_report(
+        &self,
+        path: &Path,
+        video: &str,
+        rendered: u64,
+        superseded: u64,
+        net: &NetStats,
+    ) -> std::io::Result<()> {
+        let text = self.report_text(video, rendered, superseded, net);
+        std::fs::write(path, text)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn report_text(&self, video: &str, rendered: u64, superseded: u64, net: &NetStats) -> String {
+        let duration = self.started.elapsed().as_secs_f64();
+        let decoded = self.samples.len();
+        let net_bytes = net.video_bytes.load(Ordering::Relaxed);
+        let net_frames = net.video_frames.load(Ordering::Relaxed);
+        let net_dropped = net.video_dropped.load(Ordering::Relaxed);
+
+        let mut out = String::new();
+        let _ = writeln!(out, "Stargaze client session report");
+        let _ = writeln!(out, "==============================");
+        let _ = writeln!(out, "video:             {video}");
+        let _ = writeln!(out, "duration:          {duration:.1} s");
+        if duration > 0.0 {
+            let _ = writeln!(
+                out,
+                "frames received:   {net_frames} ({:.1} fps on the wire)",
+                net_frames as f64 / duration
+            );
+            let _ = writeln!(
+                out,
+                "frames decoded:    {decoded} ({:.1} fps)",
+                decoded as f64 / duration
+            );
+            let _ = writeln!(
+                out,
+                "avg bitrate:       {:.2} Mbps",
+                net_bytes as f64 * 8.0 / duration / 1_000_000.0
+            );
+        }
+        let _ = writeln!(out, "frames rendered:   {rendered}");
+        let _ = writeln!(out, "dropped (decoder backpressure): {net_dropped}");
+        let _ = writeln!(out, "superseded (render kept newer): {superseded}");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "{:<14} {:>9} {:>9} {:>9} {:>9} {:>9}",
+            "metric", "avg", "min", "max", "std", "worst 5%"
+        );
+
+        let mut row = |name: &str, values: &[f64], worst_is_high: bool| {
+            if let Some(s) = summarize(values, worst_is_high) {
+                let _ = writeln!(
+                    out,
+                    "{name:<14} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2}",
+                    s.avg, s.min, s.max, s.std, s.worst5
+                );
+            }
+        };
+
+        let ms = |f: fn(&FrameStats) -> u32| -> Vec<f64> {
+            self.samples
+                .iter()
+                .map(|s| f64::from(f(s)) / 1000.0)
+                .collect()
+        };
+        row("capture ms", &ms(|s| s.capture_us), true);
+        row("encode ms", &ms(|s| s.encode_us), true);
+        row("queue ms", &ms(|s| s.queue_us), true);
+        row("decode ms", &ms(|s| s.decode_us), true);
+        let sizes: Vec<f64> = self
+            .samples
+            .iter()
+            .map(|s| f64::from(s.packet_bytes) / 1024.0)
+            .collect();
+        row("frame KiB", &sizes, true);
+
+        // Instantaneous fps between consecutive decoded frames; for fps
+        // the *low* tail is the worst one.
+        let fps: Vec<f64> = self
+            .arrivals
+            .windows(2)
+            .filter_map(|w| {
+                let dt = w[1].duration_since(w[0]).as_secs_f64();
+                (dt > 0.0).then(|| 1.0 / dt)
+            })
+            .collect();
+        row("fps (5% low)", &fps, false);
+
+        out
     }
 }
 
@@ -197,6 +420,14 @@ mod tests {
         }
     }
 
+    fn net(bytes: u64, frames: u64, dropped: u64) -> NetStats {
+        let n = NetStats::default();
+        n.video_bytes.store(bytes, Ordering::Relaxed);
+        n.video_frames.store(frames, Ordering::Relaxed);
+        n.video_dropped.store(dropped, Ordering::Relaxed);
+        n
+    }
+
     #[test]
     fn overlay_text_contains_all_sections() {
         let mut overlay = StatsOverlay::new();
@@ -205,18 +436,20 @@ mod tests {
         }
         overlay.on_frames_dropped(3);
 
+        let net = net(1_000_000, 60, 7);
         let text = overlay
-            .text(Duration::from_millis(5), "1920x1080 @ 60")
+            .text(Duration::from_millis(5), "1920x1080", &net)
             .to_string();
         assert!(text.contains("VIDEO"), "missing video line: {text}");
-        assert!(text.contains("1920x1080 @ 60"));
+        assert!(text.contains("1920x1080"));
         assert!(text.contains("HOST"));
         assert!(text.contains("capture 2.0 ms"));
         assert!(text.contains("encode 3.0 ms"));
         assert!(text.contains("rtt 5.0 ms"));
+        assert!(text.contains("7 dropped"));
         assert!(text.contains("queue 1.0 ms"));
         assert!(text.contains("decode 4.0 ms"));
-        assert!(text.contains("10 rendered / 3 dropped"));
+        assert!(text.contains("10 rendered / 3 superseded"));
     }
 
     #[test]
@@ -232,8 +465,74 @@ mod tests {
     #[test]
     fn overlay_text_handles_empty_window() {
         let mut overlay = StatsOverlay::new();
-        let text = overlay.text(Duration::ZERO, "0x0 @ 0").to_string();
+        let n = net(0, 0, 0);
+        let text = overlay.text(Duration::ZERO, "0x0", &n).to_string();
         assert!(text.contains("VIDEO"));
         assert!(text.contains("0.0"));
+    }
+
+    #[test]
+    fn summarize_computes_expected_values() {
+        // 20 samples: 1..=19 plus one outlier at 100.
+        let mut values: Vec<f64> = (1..=19).map(f64::from).collect();
+        values.push(100.0);
+
+        let s = summarize(&values, true).unwrap();
+        assert!((s.min - 1.0).abs() < f64::EPSILON);
+        assert!((s.max - 100.0).abs() < f64::EPSILON);
+        // avg = (1+..+19 + 100)/20 = (190+100)/20 = 14.5
+        assert!((s.avg - 14.5).abs() < 1e-9);
+        // worst 5% of 20 samples = 1 sample = the outlier.
+        assert!((s.worst5 - 100.0).abs() < f64::EPSILON);
+        assert!(s.std > 0.0);
+
+        // For rates, the worst tail is the low one.
+        let s = summarize(&values, false).unwrap();
+        assert!((s.worst5 - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn summarize_empty_returns_none() {
+        assert!(summarize(&[], true).is_none());
+    }
+
+    #[test]
+    fn report_contains_all_metrics() {
+        let mut recorder = StatsRecorder::new();
+        for i in 0..50u32 {
+            recorder.record(stats(2_000 + i, 3_000, 1_000, 4_000));
+        }
+        let n = net(10_000_000, 60, 5);
+        let report = recorder.report_text("3440x1440", 45, 5, &n);
+
+        assert!(report.contains("Stargaze client session report"));
+        assert!(report.contains("video:             3440x1440"));
+        assert!(report.contains("frames received:   60"));
+        assert!(report.contains("frames decoded:    50"));
+        assert!(report.contains("frames rendered:   45"));
+        assert!(report.contains("dropped (decoder backpressure): 5"));
+        assert!(report.contains("capture ms"));
+        assert!(report.contains("encode ms"));
+        assert!(report.contains("queue ms"));
+        assert!(report.contains("decode ms"));
+        assert!(report.contains("frame KiB"));
+        assert!(report.contains("fps (5% low)"));
+        assert!(report.contains("worst 5%"));
+    }
+
+    #[test]
+    fn report_write_to_file() {
+        let mut recorder = StatsRecorder::new();
+        recorder.record(stats(1, 2, 3, 4));
+        let n = net(100, 1, 0);
+
+        let dir = std::env::temp_dir().join("stargaze-stats-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.txt");
+        recorder.write_report(&path, "1x1", 1, 0, &n).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("session report"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

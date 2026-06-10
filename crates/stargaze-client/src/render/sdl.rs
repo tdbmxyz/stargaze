@@ -9,7 +9,8 @@ use tracing::{info, warn};
 
 use super::audio::create_audio_queue;
 use super::input::{InputTracker, PadSlots, ShortcutAction, shortcut_action};
-use super::stats::{StatsOverlay, draw_overlay};
+use super::stats::{StatsOverlay, StatsRecorder, draw_overlay};
+use crate::transport::NetStats;
 
 /// Window title shown while input is captured ("inside" mode).
 const TITLE_CAPTURED: &str = "Stargaze";
@@ -131,6 +132,7 @@ fn toggle_fullscreen(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>) {
 #[allow(
     clippy::needless_pass_by_value,
     clippy::too_many_lines,
+    clippy::too_many_arguments,
     clippy::similar_names
 )]
 pub(super) fn run_sdl_loop(
@@ -141,6 +143,8 @@ pub(super) fn run_sdl_loop(
     fullscreen: bool,
     input_tx: std::sync::mpsc::Sender<InputEvent>,
     rtt_probe: super::RttProbe,
+    net_stats: &NetStats,
+    stats_file: Option<&std::path::Path>,
 ) -> Result<(), anyhow::Error> {
     let audio_queue: AudioQueue<f32> = create_audio_queue(sdl)?;
 
@@ -190,6 +194,7 @@ pub(super) fn run_sdl_loop(
     apply_capture_mode(captured, &mut canvas, &sdl.mouse());
 
     let mut overlay = StatsOverlay::new();
+    let mut recorder = StatsRecorder::new();
     let video_desc = format!("{}x{}", config.width, config.height);
 
     info!(
@@ -356,7 +361,10 @@ pub(super) fn run_sdl_loop(
         // queued frames, keeping only the latest.
         let mut latest_frame: Option<DecodedFrame> =
             match decoded_rx.recv_timeout(std::time::Duration::from_millis(2)) {
-                Ok(frame) => Some(frame),
+                Ok(frame) => {
+                    recorder.record(frame.stats);
+                    Some(frame)
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     info!("Decoded frame channel closed, stopping renderer");
@@ -364,6 +372,7 @@ pub(super) fn run_sdl_loop(
                 }
             };
         while let Ok(frame) = decoded_rx.try_recv() {
+            recorder.record(frame.stats);
             if latest_frame.is_some() {
                 overlay.on_frames_dropped(1);
             }
@@ -422,7 +431,9 @@ pub(super) fn run_sdl_loop(
 
         overlay.on_frame_rendered(frame.stats);
         if overlay.visible {
-            let text = overlay.text(rtt_probe(), &video_desc).to_string();
+            let text = overlay
+                .text(rtt_probe(), &video_desc, net_stats)
+                .to_string();
             if let Err(e) = draw_overlay(&mut canvas, &text) {
                 warn!("Stats overlay draw failed: {e}");
             }
@@ -435,6 +446,19 @@ pub(super) fn run_sdl_loop(
     // with stuck input (best-effort — the transport may already be gone).
     for ev in tracker.release_all() {
         let _ = input_tx.send(ev);
+    }
+
+    if let Some(path) = stats_file {
+        match recorder.write_report(
+            path,
+            &video_desc,
+            overlay.rendered(),
+            overlay.superseded(),
+            net_stats,
+        ) {
+            Ok(()) => info!(path = %path.display(), "Wrote session stats report"),
+            Err(e) => warn!("Failed to write stats report to {}: {e}", path.display()),
+        }
     }
 
     info!("Renderer shutting down");

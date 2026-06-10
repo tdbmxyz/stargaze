@@ -311,7 +311,9 @@ pub(crate) async fn receive_loop(
     video_tx: mpsc::Sender<ReassembledFrame>,
     audio_tx: mpsc::Sender<ReassembledFrame>,
     mut input_rx: mpsc::Receiver<InputEvent>,
+    net_stats: &super::NetStats,
 ) -> Result<(), TransportError> {
+    use std::sync::atomic::Ordering;
     let mut assembler = FrameAssembler::new();
     let mut total_frames: u64 = 0;
 
@@ -361,12 +363,18 @@ pub(crate) async fn receive_loop(
 
                     let send_result = match frame.stream_type {
                         STREAM_TYPE_VIDEO => {
+                            net_stats
+                                .video_bytes
+                                .fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+                            net_stats.video_frames.fetch_add(1, Ordering::Relaxed);
+
                             // Non-blocking send: if the decoder is behind,
                             // drop the frame rather than stalling datagram
                             // processing (which causes cascading loss).
                             match video_tx.try_send(frame) {
                                 Ok(()) => Ok(()),
                                 Err(mpsc::error::TrySendError::Full(f)) => {
+                                    net_stats.video_dropped.fetch_add(1, Ordering::Relaxed);
                                     // Channel full — decoder is behind. Drop
                                     // the frame and request an IDR: the gap
                                     // would otherwise corrupt decoding until

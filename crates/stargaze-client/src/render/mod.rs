@@ -13,6 +13,7 @@ pub type RttProbe = Box<dyn Fn() -> std::time::Duration + Send>;
 /// # Errors
 ///
 /// Returns an error if SDL2 initialization, window creation, or rendering fails.
+#[allow(clippy::too_many_arguments)]
 pub fn start_renderer(
     sdl: &sdl2::Sdl,
     config: &DecoderConfig,
@@ -21,6 +22,8 @@ pub fn start_renderer(
     fullscreen: bool,
     input_tx: std::sync::mpsc::Sender<InputEvent>,
     rtt_probe: RttProbe,
+    net_stats: std::sync::Arc<crate::transport::NetStats>,
+    stats_file: Option<std::path::PathBuf>,
 ) -> Result<(), anyhow::Error> {
     sdl::run_sdl_loop(
         sdl,
@@ -30,5 +33,7 @@ pub fn start_renderer(
         fullscreen,
         input_tx,
         rtt_probe,
+        &net_stats,
+        stats_file.as_deref(),
     )
 }

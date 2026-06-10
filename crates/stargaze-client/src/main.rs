@@ -36,6 +36,11 @@ struct Cli {
     /// Path to config file (default: ~/.config/stargaze/client.toml).
     #[arg(long)]
     config: Option<String>,
+
+    /// Write a session stats report (avg/min/max/std/worst 5% per pipeline
+    /// stage) to this file on exit.
+    #[arg(long)]
+    stats_file: Option<std::path::PathBuf>,
 }
 
 fn init_tracing() {
@@ -125,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         audio_frames,
         transport_input_tx,
         rtt_probe,
+        net_stats,
     ) = transport::connect(&cfg, session_request).await?;
 
     // Use the server-confirmed resolution for decoding and rendering.
@@ -195,6 +201,8 @@ async fn main() -> anyhow::Result<()> {
             cfg.fullscreen,
             sdl_input_tx,
             rtt_probe,
+            net_stats,
+            cli.stats_file.clone(),
         )
     })?;
 

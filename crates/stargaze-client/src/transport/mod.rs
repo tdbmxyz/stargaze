@@ -53,6 +53,21 @@ pub struct SessionRequest {
 /// Callback returning the current QUIC round-trip time estimate.
 pub type RttProbe = Box<dyn Fn() -> std::time::Duration + Send>;
 
+/// Receiver-side network counters, shared with the stats overlay.
+///
+/// Counted at reassembly time, so they reflect what actually arrives on
+/// the wire — unlike render-side stats, which miss frames dropped under
+/// decoder backpressure.
+#[derive(Debug, Default)]
+pub struct NetStats {
+    /// Total video payload bytes received (complete frames).
+    pub video_bytes: std::sync::atomic::AtomicU64,
+    /// Total complete video frames received.
+    pub video_frames: std::sync::atomic::AtomicU64,
+    /// Video frames dropped because the decoder was behind.
+    pub video_dropped: std::sync::atomic::AtomicU64,
+}
+
 /// # Errors
 ///
 /// Returns `TransportError` if connection or handshake fails.
@@ -67,6 +82,7 @@ pub async fn connect(
         mpsc::Receiver<ReassembledFrame>,
         mpsc::Sender<InputEvent>,
         RttProbe,
+        std::sync::Arc<NetStats>,
     ),
     TransportError,
 > {
@@ -104,9 +120,19 @@ pub async fn connect(
     let rtt_conn = connection.clone();
     let rtt_probe: RttProbe = Box::new(move || rtt_conn.rtt());
 
+    let net_stats = std::sync::Arc::new(NetStats::default());
+    let net_stats_clone = std::sync::Arc::clone(&net_stats);
+
     let task_handle = tokio::spawn(async move {
-        if let Err(e) =
-            receiver::receive_loop(connection, send_stream, video_tx, audio_tx, input_rx).await
+        if let Err(e) = receiver::receive_loop(
+            connection,
+            send_stream,
+            video_tx,
+            audio_tx,
+            input_rx,
+            &net_stats_clone,
+        )
+        .await
         {
             error!("Client transport error: {e}");
         }
@@ -119,5 +145,6 @@ pub async fn connect(
         audio_rx,
         input_tx,
         rtt_probe,
+        net_stats,
     ))
 }
