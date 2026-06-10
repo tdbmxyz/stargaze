@@ -18,9 +18,17 @@ use tracing::{error, info, warn};
 pub struct ServerTransport {
     /// Join handle for the transport task.
     task_handle: tokio::task::JoinHandle<()>,
+    /// Address the QUIC endpoint is bound to.
+    local_addr: std::net::SocketAddr,
 }
 
 impl ServerTransport {
+    /// Returns the address the QUIC endpoint is bound to.
+    #[must_use]
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.local_addr
+    }
+
     /// Waits for the transport task to complete.
     ///
     /// # Errors
@@ -88,10 +96,15 @@ pub fn start_server_transport(
         }
     });
 
-    Ok(ServerTransport { task_handle })
+    Ok(ServerTransport {
+        task_handle,
+        local_addr,
+    })
 }
 
-/// Main server loop: accept connections and stream packets.
+/// Main server loop: accepts clients one at a time, runs a streaming
+/// session for each, and goes back to accepting when the client
+/// disconnects — so a new client can reconnect to the running session.
 async fn run_server_loop(
     endpoint: quinn::Endpoint,
     config: ServerConfig,
@@ -100,27 +113,60 @@ async fn run_server_loop(
     idr_tx: watch::Sender<u64>,
     input_tx: mpsc::Sender<InputEvent>,
 ) -> Result<(), TransportError> {
-    // Accept one connection (MVP: single client).
-    let incoming = endpoint.accept().await.ok_or_else(|| {
-        TransportError::ConnectionError("endpoint closed before accepting".to_string())
-    })?;
+    loop {
+        let Some(incoming) = endpoint.accept().await else {
+            info!("Endpoint closed, transport exiting");
+            return Ok(());
+        };
 
-    let connection = incoming.await.map_err(|e| {
-        TransportError::ConnectionError(format!("failed to accept connection: {e}"))
-    })?;
+        let connection = match incoming.await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to accept connection: {e}");
+                continue;
+            }
+        };
 
-    info!(
-        remote = %connection.remote_address(),
-        "Client connected"
-    );
+        info!(
+            remote = %connection.remote_address(),
+            "Client connected"
+        );
 
-    // Perform session handshake.
+        if let Err(e) = run_session(
+            &config,
+            &connection,
+            &mut video_packets,
+            &mut audio_packets,
+            &idr_tx,
+            &input_tx,
+        )
+        .await
+        {
+            warn!("Session ended: {e}");
+        }
+
+        connection.close(quinn::VarInt::from_u32(0), b"session over");
+        info!("Client disconnected, waiting for a new connection");
+    }
+}
+
+/// Runs one streaming session on an established connection: handshake,
+/// then concurrent video/audio sending and control-message handling
+/// until the connection closes.
+async fn run_session(
+    config: &ServerConfig,
+    connection: &quinn::Connection,
+    video_packets: &mut mpsc::Receiver<EncodedPacket>,
+    audio_packets: &mut mpsc::Receiver<EncodedPacket>,
+    idr_tx: &watch::Sender<u64>,
+    input_tx: &mpsc::Sender<InputEvent>,
+) -> Result<(), TransportError> {
     let (mut send_stream, mut recv_stream) = connection.accept_bi().await.map_err(|e| {
         TransportError::ConnectionError(format!("failed to accept control stream: {e}"))
     })?;
 
     let session_response =
-        sender::handle_session_handshake(&config, &connection, &mut send_stream, &mut recv_stream)
+        sender::handle_session_handshake(config, connection, &mut send_stream, &mut recv_stream)
             .await?;
 
     info!(
@@ -128,41 +174,187 @@ async fn run_server_loop(
         session_response.0, session_response.1, session_response.2, session_response.3
     );
 
-    let control_handle = tokio::spawn(async move {
-        if let Err(e) = sender::handle_control_messages(&mut recv_stream, &idr_tx, &input_tx).await
-        {
-            warn!("Control stream error: {e}");
-        }
-    });
+    // Packets that queued up while no client was connected are stale —
+    // throw them away and force a fresh IDR so the new client can start
+    // decoding immediately.
+    while video_packets.try_recv().is_ok() {}
+    while audio_packets.try_recv().is_ok() {}
+    idr_tx.send_modify(|v| *v += 1);
 
-    // Run video and audio senders concurrently.
-    let video_conn = connection.clone();
-    let video_handle = tokio::spawn(async move {
-        if let Err(e) =
-            sender::send_packets(&video_conn, &mut video_packets, STREAM_TYPE_VIDEO).await
-        {
-            warn!("Video send error: {e}");
+    // Run the control listener and both senders until the connection dies:
+    // the control listener returns when the client closes, and the senders
+    // return on connection loss. Whichever finishes first ends the session
+    // (select! drops the other futures; mpsc recv is cancel-safe).
+    tokio::select! {
+        result = sender::handle_control_messages(&mut recv_stream, idr_tx, input_tx) => {
+            if let Err(e) = result {
+                warn!("Control stream error: {e}");
+            }
         }
-    });
-
-    let audio_handle = tokio::spawn(async move {
-        if let Err(e) =
-            sender::send_packets(&connection, &mut audio_packets, STREAM_TYPE_AUDIO).await
-        {
-            warn!("Audio send error: {e}");
+        result = sender::send_packets(connection, video_packets, STREAM_TYPE_VIDEO) => {
+            if let Err(e) = result {
+                warn!("Video send error: {e}");
+            }
         }
-    });
-
-    let (video_result, audio_result) = tokio::join!(video_handle, audio_handle);
-    if let Err(e) = video_result {
-        warn!("Video send task panicked: {e}");
+        result = sender::send_packets(connection, audio_packets, STREAM_TYPE_AUDIO) => {
+            if let Err(e) = result {
+                warn!("Audio send error: {e}");
+            }
+        }
     }
-    if let Err(e) = audio_result {
-        warn!("Audio send task panicked: {e}");
-    }
-
-    control_handle.abort();
-    endpoint.close(quinn::VarInt::from_u32(0), b"server shutdown");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use quinn::rustls;
+    use stargaze_core::transport::{
+        ControlMessage, deserialize_control_message, serialize_control_message,
+    };
+
+    use super::*;
+
+    /// Accepts any server certificate (test-only, mirrors the client's
+    /// LAN-MVP behavior).
+    #[derive(Debug)]
+    struct SkipServerVerification;
+
+    impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    /// Connects a test client and performs the session handshake.
+    /// Returns the endpoint (must stay alive) and the connection.
+    async fn connect_and_handshake(
+        addr: std::net::SocketAddr,
+    ) -> (quinn::Endpoint, quinn::Connection) {
+        let crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth();
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
+        ));
+
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+
+        let connection = endpoint
+            .connect(addr, "stargaze-server")
+            .unwrap()
+            .await
+            .expect("client connection should succeed");
+
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        let request = ControlMessage::SessionRequest {
+            width: 1920,
+            height: 1080,
+            framerate: 60,
+            codec: stargaze_core::config::Codec::H265,
+        };
+        send.write_all(&serialize_control_message(&request).unwrap())
+            .await
+            .unwrap();
+
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf).await.unwrap();
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        recv.read_exact(&mut body).await.unwrap();
+        let response = deserialize_control_message(&body).unwrap();
+        assert!(
+            matches!(response, ControlMessage::SessionResponse { .. }),
+            "expected SessionResponse, got {response:?}"
+        );
+
+        (endpoint, connection)
+    }
+
+    /// Regression test: after a client disconnects, the server must go
+    /// back to accepting so a new client can join the running session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_can_reconnect_after_disconnect() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let config = ServerConfig {
+            bind_address: "127.0.0.1".to_string(),
+            port: 0, // OS-assigned port
+            ..ServerConfig::default()
+        };
+
+        let (_video_tx, video_rx) = mpsc::channel::<EncodedPacket>(4);
+        let (_audio_tx, audio_rx) = mpsc::channel::<EncodedPacket>(4);
+        let (idr_tx, idr_rx) = tokio::sync::watch::channel(0u64);
+        let (input_tx, _input_rx) = mpsc::channel::<InputEvent>(8);
+
+        let transport = start_server_transport(&config, video_rx, audio_rx, idr_tx, input_tx)
+            .expect("transport should start");
+        let addr = transport.local_addr();
+
+        let run = async {
+            // First client connects, handshakes, and disconnects.
+            let (endpoint1, conn1) = connect_and_handshake(addr).await;
+            conn1.close(quinn::VarInt::from_u32(0), b"bye");
+            endpoint1.wait_idle().await;
+
+            // Second client must be able to connect and handshake.
+            let (_endpoint2, conn2) = connect_and_handshake(addr).await;
+
+            // Each session start forces an IDR so the joining client gets
+            // a keyframe immediately.
+            let mut idr_rx = idr_rx;
+            while *idr_rx.borrow() < 2 {
+                tokio::time::timeout(Duration::from_secs(1), idr_rx.changed())
+                    .await
+                    .expect("expected a second IDR request after reconnect")
+                    .unwrap();
+            }
+
+            conn2.close(quinn::VarInt::from_u32(0), b"bye");
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("reconnect test timed out");
+    }
 }

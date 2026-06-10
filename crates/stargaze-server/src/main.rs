@@ -229,7 +229,10 @@ async fn main() -> anyhow::Result<()> {
         input_tx,
     )?;
     let abort_handle = server_transport.abort_handle();
-    info!("Transport started, waiting for client connection...");
+    info!(
+        "Transport started on {}, waiting for client connection...",
+        server_transport.local_addr()
+    );
 
     // Wait for transport to finish (client disconnect or error) or Ctrl+C.
     tokio::select! {

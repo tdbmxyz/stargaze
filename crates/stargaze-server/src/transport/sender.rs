@@ -242,12 +242,21 @@ pub(crate) async fn send_packets(
                 max_datagram_size
             );
 
-            if let Err(e) = connection.send_datagram(Bytes::from(datagram)) {
-                debug!(
-                    frame = frame_index,
-                    fragment = i,
-                    "Datagram send failed: {e}"
-                );
+            match connection.send_datagram(Bytes::from(datagram)) {
+                Ok(()) => {}
+                // The client went away — end this session so the server
+                // can accept a new connection.
+                Err(quinn::SendDatagramError::ConnectionLost(e)) => {
+                    info!("Connection lost, sender exiting: {e}");
+                    return Ok(());
+                }
+                Err(e) => {
+                    debug!(
+                        frame = frame_index,
+                        fragment = i,
+                        "Datagram send failed: {e}"
+                    );
+                }
             }
         }
 
