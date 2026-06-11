@@ -33,17 +33,17 @@ impl ServerTransport {
     ///
     /// # Errors
     ///
-    /// Returns `TransportError` if the transport task panicked.
-    pub async fn join(self) -> Result<(), TransportError> {
-        self.task_handle
+    /// Returns `TransportError` if the transport task panicked or was aborted.
+    pub async fn join(&mut self) -> Result<(), TransportError> {
+        (&mut self.task_handle)
             .await
             .map_err(|e| TransportError::ConnectionError(format!("transport task panicked: {e}")))
     }
 
-    /// Returns an `AbortHandle` that can be used to abort the transport task
-    /// independently of the `ServerTransport` value.
-    pub fn abort_handle(&self) -> tokio::task::AbortHandle {
-        self.task_handle.abort_handle()
+    /// Aborts the transport task. Await [`join`](Self::join) afterwards to
+    /// make sure the task has finished and released its channel endpoints.
+    pub fn abort(&self) {
+        self.task_handle.abort();
     }
 }
 

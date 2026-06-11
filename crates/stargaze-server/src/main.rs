@@ -236,14 +236,13 @@ async fn main() -> anyhow::Result<()> {
     // session handshake advertises the correct dimensions to the client.
     let mut transport_cfg = cfg.clone();
     transport_cfg.resolution = capture_resolution;
-    let server_transport = transport::start_server_transport(
+    let mut server_transport = transport::start_server_transport(
         &transport_cfg,
         packets,
         audio_packets,
         idr_tx,
         input_tx,
     )?;
-    let abort_handle = server_transport.abort_handle();
     info!(
         "Transport started on {}, waiting for client connection...",
         server_transport.local_addr()
@@ -259,7 +258,12 @@ async fn main() -> anyhow::Result<()> {
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down gracefully");
-            abort_handle.abort();
+            // Abort the transport task and wait for it to finish so the
+            // packet receivers are dropped before the pipeline is joined —
+            // encoder threads parked in blocking_send() unblock on channel
+            // close.
+            server_transport.abort();
+            let _ = server_transport.join().await;
         }
     }
 
@@ -267,10 +271,14 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref mut child) = rsonance_child {
         mic_forward::stop_rsonance(child).await;
     }
-    audio_encoder_session.stop()?;
+    // Stop producers before consumers: the capture threads exit via their
+    // shutdown timers and drop their frame senders, which unblocks encoder
+    // threads parked in blocking_recv() so their joins can't hang when no
+    // frames are flowing.
     audio_capture_session.stop()?;
-    encoder_session.stop()?;
+    audio_encoder_session.stop()?;
     capture_session.stop()?;
+    encoder_session.stop()?;
     input_session
         .stop()
         .map_err(|e| anyhow::anyhow!("input session shutdown: {e}"))?;
