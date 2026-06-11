@@ -25,6 +25,8 @@ struct AudioCallbackData {
     channels: u16,
     /// Monotonic frame counter for PTS.
     pts: u64,
+    /// Number of frames dropped because the encoder channel was full.
+    dropped_count: u64,
 }
 
 /// Builds the SPA format pod for audio stream negotiation.
@@ -128,6 +130,7 @@ pub(crate) fn run_audio_capture(
         sample_rate: config.sample_rate,
         channels: config.channels,
         pts: 0,
+        dropped_count: 0,
     };
 
     let mainloop_ptr = mainloop.as_raw_ptr();
@@ -225,10 +228,27 @@ pub(crate) fn run_audio_capture(
             };
             data.pts += 1;
 
-            if data.tx.blocking_send(frame).is_err() {
-                info!("Audio frame receiver dropped, stopping capture");
-                unsafe {
-                    pipewire_sys::pw_main_loop_quit(mainloop_ptr);
+            // Never block the PipeWire realtime thread: while no client is
+            // connected the encoder backs up and the channel fills, and
+            // blocking here wedges the stream's data loop so audio never
+            // recovers. Drop the frame instead — same policy as the video
+            // capture.
+            match data.tx.try_send(frame) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    data.dropped_count += 1;
+                    if data.dropped_count.is_multiple_of(500) {
+                        info!(
+                            dropped = data.dropped_count,
+                            "Audio encoder behind, dropping captured audio frames"
+                        );
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    info!("Audio frame receiver dropped, stopping capture");
+                    unsafe {
+                        pipewire_sys::pw_main_loop_quit(mainloop_ptr);
+                    }
                 }
             }
         })
