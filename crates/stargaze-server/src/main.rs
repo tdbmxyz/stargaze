@@ -42,6 +42,14 @@ struct Cli {
     #[arg(long)]
     codec: Option<Codec>,
 
+    /// NVENC preset: p1 (fastest) … p7 (best quality).
+    #[arg(long)]
+    preset: Option<String>,
+
+    /// NVENC multipass mode: disabled, qres, or fullres.
+    #[arg(long)]
+    multipass: Option<String>,
+
     /// Enable microphone forwarding via rsonance.
     #[arg(long)]
     mic_forward: bool,
@@ -112,6 +120,12 @@ fn build_config(cli: &Cli) -> anyhow::Result<ServerConfig> {
     if let Some(codec) = cli.codec {
         cfg.codec = codec;
     }
+    if let Some(ref preset) = cli.preset {
+        cfg.encoder.preset.clone_from(preset);
+    }
+    if let Some(ref multipass) = cli.multipass {
+        cfg.encoder.multipass.clone_from(multipass);
+    }
     if cli.mic_forward {
         cfg.mic_forward.enabled = true;
     }
@@ -172,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
         height: capture_resolution.height,
         framerate: cfg.framerate,
         bitrate_mbps: cfg.bitrate,
+        tuning: cfg.encoder.clone(),
     };
     let (encoder_session, packets, idr_tx) = encode::start_encoder(encoder_config, frames)?;
     info!("Encoder started");
@@ -315,6 +330,7 @@ mod tests {
             height: 1080,
             framerate: 30,
             bitrate_mbps: 10,
+            tuning: stargaze_core::config::EncoderTuning::default(),
         };
         let (encoder_session, mut packets, _idr_tx) =
             encode::start_encoder(encoder_config, frames).expect("encoder should start");
@@ -389,6 +405,7 @@ mod tests {
             height,
             framerate,
             bitrate_mbps: 5,
+            tuning: stargaze_core::config::EncoderTuning::default(),
         };
 
         // Start encoder — this initializes CUDA + NVENC on a dedicated thread.
@@ -516,6 +533,7 @@ mod tests {
             height,
             framerate,
             bitrate_mbps: 2,
+            tuning: stargaze_core::config::EncoderTuning::default(),
         };
 
         let (encoder_session, mut packets, idr_tx) =

@@ -33,6 +33,8 @@ pub struct EncoderConfig {
     pub framerate: u32,
     /// Target bitrate in Mbps.
     pub bitrate_mbps: u32,
+    /// NVENC tuning (preset, multipass).
+    pub tuning: crate::config::EncoderTuning,
 }
 
 /// Errors from the video encoding subsystem.
@@ -119,6 +121,7 @@ mod tests {
             height: 1080,
             framerate: 60,
             bitrate_mbps: 20,
+            tuning: crate::config::EncoderTuning::default(),
         };
         assert_eq!(cfg.width, 1920);
         assert_eq!(cfg.height, 1080);

@@ -146,6 +146,32 @@ impl Default for MicForwardConfig {
     }
 }
 
+// --- EncoderTuning ---
+
+/// NVENC encoder tuning knobs.
+///
+/// The defaults balance quality and speed for 1440p-class streaming; drop
+/// the preset (e.g. `p3`) or set `multipass = "disabled"` if the encoder
+/// becomes the pipeline bottleneck (visible as high `encode` time in the
+/// client stats overlay).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EncoderTuning {
+    /// NVENC preset: `p1` (fastest) … `p7` (best quality).
+    pub preset: String,
+    /// NVENC multipass mode: `disabled`, `qres`, or `fullres`.
+    pub multipass: String,
+}
+
+impl Default for EncoderTuning {
+    fn default() -> Self {
+        Self {
+            preset: "p4".to_string(),
+            multipass: "qres".to_string(),
+        }
+    }
+}
+
 // --- ServerConfig ---
 
 /// Configuration for the stargaze server.
@@ -164,6 +190,8 @@ pub struct ServerConfig {
     pub bitrate: u32,
     /// Video codec to use.
     pub codec: Codec,
+    /// NVENC encoder tuning.
+    pub encoder: EncoderTuning,
     /// Mic forwarding configuration.
     pub mic_forward: MicForwardConfig,
     /// Cursor rendering configuration.
@@ -179,6 +207,7 @@ impl Default for ServerConfig {
             framerate: 60,
             bitrate: 20,
             codec: Codec::default(),
+            encoder: EncoderTuning::default(),
             mic_forward: MicForwardConfig::default(),
             cursor: CursorConfig::default(),
         }
@@ -288,6 +317,31 @@ mod tests {
         assert_eq!(config.mic_forward.port, 9001);
         assert_eq!(config.mic_forward.rsonance_binary, "rsonance");
         assert!(config.cursor.show_cursor);
+        assert_eq!(config.encoder.preset, "p4");
+        assert_eq!(config.encoder.multipass, "qres");
+    }
+
+    #[test]
+    fn test_encoder_tuning_from_toml() {
+        let toml = r#"
+            [encoder]
+            preset = "p2"
+            multipass = "disabled"
+        "#;
+        let config: ServerConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(config.encoder.preset, "p2");
+        assert_eq!(config.encoder.multipass, "disabled");
+        // Unspecified fields keep their defaults.
+        assert_eq!(config.framerate, 60);
+    }
+
+    #[test]
+    fn test_encoder_tuning_defaults_when_absent() {
+        let toml = "port = 1234";
+        let config: ServerConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(config.port, 1234);
+        assert_eq!(config.encoder.preset, "p4");
+        assert_eq!(config.encoder.multipass, "qres");
     }
 
     #[test]

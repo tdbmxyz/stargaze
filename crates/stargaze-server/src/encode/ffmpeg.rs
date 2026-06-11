@@ -216,16 +216,16 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
 
     // Step 6: Open encoder with NVENC-specific options.
     //
-    // p4 (balanced) instead of p1 (fastest): NVENC easily sustains p4 at
-    // 1440p60 and the quality difference is dramatic at streaming bitrates.
-    // Quarter-res multipass and spatial AQ distribute bits where the eye
-    // notices (text edges, flat gradients) — without them the picture has
-    // the typical "screen share" mosquito noise.
+    // Preset and multipass come from config (defaults p4/qres): the
+    // quality difference over p1 is dramatic at streaming bitrates.
+    // Spatial AQ distributes bits where the eye notices (text edges,
+    // flat gradients) — without it the picture has the typical
+    // "screen share" mosquito noise.
     let mut opts = ffmpeg_next::Dictionary::new();
-    opts.set("preset", "p4");
+    opts.set("preset", &config.tuning.preset);
     opts.set("tune", "ull");
     opts.set("rc", "cbr");
-    opts.set("multipass", "qres");
+    opts.set("multipass", &config.tuning.multipass);
     opts.set("spatial-aq", "1");
     opts.set("aq-strength", "8");
     opts.set("delay", "0");
@@ -270,8 +270,13 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
     debug!("Extracted CUDA context from FFmpeg hw device: {cuda_ctx:?}");
 
     info!(
-        "NVENC encoder initialized: {}x{} @ {}fps, {} Mbps, H.265",
-        config.width, config.height, config.framerate, config.bitrate_mbps
+        "NVENC encoder initialized: {}x{} @ {}fps, {} Mbps, H.265 (preset {}, multipass {})",
+        config.width,
+        config.height,
+        config.framerate,
+        config.bitrate_mbps,
+        config.tuning.preset,
+        config.tuning.multipass
     );
 
     Ok(FfmpegEncoder {
