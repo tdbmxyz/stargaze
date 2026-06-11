@@ -156,7 +156,15 @@ impl GpuNv12Converter {
     fn new(width: u32, height: u32) -> Result<Self, EncodeError> {
         use cudarc::driver::sys as cu;
 
-        let ptx = cudarc::nvrtc::compile_ptx(NV12_KERNEL_SRC)
+        // cudarc panics (rather than returning Err) when libnvrtc.so cannot
+        // be dlopen'd — contain that so a missing NVRTC degrades to the CPU
+        // conversion path instead of killing the encoder thread.
+        let ptx = std::panic::catch_unwind(|| cudarc::nvrtc::compile_ptx(NV12_KERNEL_SRC))
+            .map_err(|_| {
+                EncodeError::InitError(
+                    "libnvrtc not found (install the CUDA NVRTC runtime library)".to_string(),
+                )
+            })?
             .map_err(|e| EncodeError::InitError(format!("NVRTC compile failed: {e:?}")))?;
         let ptx_src = std::ffi::CString::new(ptx.to_src())
             .map_err(|e| EncodeError::InitError(format!("PTX contains NUL: {e}")))?;
@@ -1196,41 +1204,6 @@ impl EglCudaBridge {
             gl::UseProgram(0);
         }
 
-        // DEBUG: dump glReadPixels from FBO on first frame to isolate GL vs CUDA.
-        static GL_DUMP_DONE: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !GL_DUMP_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let w = self.width as usize;
-            let h = self.height as usize;
-            let mut pixels = vec![0u8; w * h * 4];
-            unsafe {
-                gl::Finish();
-                gl::ReadPixels(
-                    0,
-                    0,
-                    self.width as i32,
-                    self.height as i32,
-                    gl::RGBA,
-                    gl::UNSIGNED_BYTE,
-                    pixels.as_mut_ptr().cast(),
-                );
-            }
-            let mut rgb = Vec::with_capacity(w * h * 3);
-            for pixel in pixels.chunks_exact(4) {
-                rgb.push(pixel[0]);
-                rgb.push(pixel[1]);
-                rgb.push(pixel[2]);
-            }
-            let header = format!("P6\n{w} {h}\n255\n");
-            let path = "/tmp/stargaze_gl_blit.ppm";
-            if let Ok(mut f) = std::fs::File::create(path) {
-                use std::io::Write;
-                let _ = f.write_all(header.as_bytes());
-                let _ = f.write_all(&rgb);
-                tracing::info!(path, width = w, height = h, "Dumped GL FBO readback to PPM");
-            }
-        }
-
         let gl_err = unsafe { gl::GetError() };
 
         unsafe {
@@ -1322,6 +1295,12 @@ impl EglCudaBridge {
 
 impl Drop for EglCudaBridge {
     fn drop(&mut self) {
+        // GL deletions need this thread's GL context; the caller is
+        // expected to have the CUDA context current (see FfmpegEncoder's
+        // Drop) for the resource unregistration and kernel teardown.
+        let _ = self
+            .egl
+            .make_current(self.display, None, None, Some(self.context));
         if !self.cuda_resource.is_null() {
             unsafe {
                 cudarc::driver::sys::cuGraphicsUnregisterResource(self.cuda_resource);

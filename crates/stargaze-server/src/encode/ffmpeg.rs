@@ -45,7 +45,14 @@ pub(crate) struct FfmpegEncoder {
     /// EGL-GL-CUDA bridge for DMA-BUF import. Lazily initialized on first
     /// DMA-BUF frame (requires CUDA context to be active).
     egl_bridge: Option<super::egl_cuda::EglCudaBridge>,
+    /// Consecutive GPU NV12 path failures. The path is disabled (with an
+    /// error log) once this hits `MAX_GPU_PATH_FAILURES` so a persistent
+    /// failure can't silently pin every frame to the slow CPU fallback.
+    gpu_path_failures: u32,
 }
+
+/// Consecutive GPU-path failures after which the GPU NV12 path is disabled.
+const MAX_GPU_PATH_FAILURES: u32 = 30;
 
 // Safety: FfmpegEncoder is only used on the dedicated encoder thread.
 // FFmpeg contexts are not thread-safe, but we never share them across threads.
@@ -53,6 +60,20 @@ unsafe impl Send for FfmpegEncoder {}
 
 impl Drop for FfmpegEncoder {
     fn drop(&mut self) {
+        // The EGL bridge holds CUDA resources (registered GL image, kernel
+        // module, device buffer) that belong to the context owned by
+        // `hw_device_ctx` — release them before the context can be
+        // destroyed, with the context current as the driver API requires.
+        if let Some(bridge) = self.egl_bridge.take() {
+            unsafe {
+                let res = cudarc::driver::sys::cuCtxPushCurrent_v2(self.cuda_ctx);
+                drop(bridge);
+                if res == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    let mut old: cudarc::driver::sys::CUcontext = ptr::null_mut();
+                    cudarc::driver::sys::cuCtxPopCurrent_v2(&raw mut old);
+                }
+            }
+        }
         unsafe {
             if !self.hw_frames_ctx.is_null() {
                 ffmpeg_sys_next::av_buffer_unref(&raw mut self.hw_frames_ctx);
@@ -288,6 +309,7 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
         extradata,
         sw_scaler: None,
         egl_bridge: None,
+        gpu_path_failures: 0,
     })
 }
 
@@ -653,13 +675,15 @@ fn upload_dmabuf_and_encode(
 
     // Fully-GPU path: EGL → GL → CUDA kernel → NV12 hw frame, no CPU
     // round trip. Falls through to the CPU path on per-frame errors.
-    if encoder
-        .egl_bridge
-        .as_ref()
-        .is_some_and(super::egl_cuda::EglCudaBridge::has_gpu_path)
+    if encoder.gpu_path_failures < MAX_GPU_PATH_FAILURES
+        && encoder
+            .egl_bridge
+            .as_ref()
+            .is_some_and(super::egl_cuda::EglCudaBridge::has_gpu_path)
     {
         match gpu_import_and_encode(encoder, info, pts, force_idr) {
             Ok(()) => {
+                encoder.gpu_path_failures = 0;
                 unsafe {
                     let mut old: cu::CUcontext = ptr::null_mut();
                     cu::cuCtxPopCurrent_v2(&raw mut old);
@@ -667,8 +691,15 @@ fn upload_dmabuf_and_encode(
                 return Ok(());
             }
             Err(e) => {
-                if pts < 3 {
+                encoder.gpu_path_failures += 1;
+                if encoder.gpu_path_failures <= 3 {
                     warn!(frame = pts, error = %e, "GPU NV12 path failed, using CPU fallback");
+                } else if encoder.gpu_path_failures == MAX_GPU_PATH_FAILURES {
+                    error!(
+                        error = %e,
+                        "GPU NV12 path failed {MAX_GPU_PATH_FAILURES} frames in a row — \
+                         disabling it; encoding will stay on the slow CPU conversion path"
+                    );
                 }
             }
         }
@@ -698,32 +729,6 @@ fn upload_dmabuf_and_encode(
             });
         }
     };
-
-    // DEBUG: dump first frame as PPM to verify pixel data before encoding.
-    if pts == 0 {
-        let w = info.width as usize;
-        let h = info.height as usize;
-        let mut rgb = Vec::with_capacity(w * h * 3);
-        for pixel in cpu_buf.chunks_exact(4) {
-            rgb.push(pixel[0]);
-            rgb.push(pixel[1]);
-            rgb.push(pixel[2]);
-        }
-        let header = format!("P6\n{w} {h}\n255\n");
-        let path = "/tmp/stargaze_frame0.ppm";
-        if let Ok(mut f) = std::fs::File::create(path) {
-            use std::io::Write;
-            let _ = f.write_all(header.as_bytes());
-            let _ = f.write_all(&rgb);
-            info!(
-                path,
-                width = w,
-                height = h,
-                buf_len = cpu_buf.len(),
-                "Dumped frame 0 to PPM"
-            );
-        }
-    }
 
     unsafe {
         let mut old: cu::CUcontext = ptr::null_mut();
@@ -854,17 +859,6 @@ fn drain_packets(
                 let raw_data = packet.data().map_or_else(Vec::new, <[u8]>::to_vec);
                 let is_keyframe = packet.is_key();
 
-                if frame_counter < 3 || is_keyframe && frame_counter < 300 {
-                    let preview_len = raw_data.len().min(64);
-                    info!(
-                        frame = frame_counter,
-                        size = raw_data.len(),
-                        is_keyframe,
-                        first_bytes = ?&raw_data[..preview_len],
-                        "Encoder packet dump"
-                    );
-                }
-
                 let data = if is_keyframe && !extradata.is_empty() {
                     let mut buf = Vec::with_capacity(extradata.len() + raw_data.len());
                     buf.extend_from_slice(extradata);
@@ -948,4 +942,286 @@ fn flush_encoder(
     }
 
     debug!("Encoder flushed");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::raw::{c_int, c_void};
+
+    use super::*;
+
+    // Minimal libgbm bindings for allocating a real DMA-BUF in tests.
+    type GbmCreateDeviceFn = unsafe extern "C" fn(c_int) -> *mut c_void;
+    type GbmDeviceDestroyFn = unsafe extern "C" fn(*mut c_void);
+    type GbmBoCreateFn = unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> *mut c_void;
+    type GbmBoDestroyFn = unsafe extern "C" fn(*mut c_void);
+    type GbmBoGetFdFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+    type GbmBoGetStrideFn = unsafe extern "C" fn(*mut c_void) -> u32;
+    type GbmBoGetModifierFn = unsafe extern "C" fn(*mut c_void) -> u64;
+    #[allow(clippy::type_complexity)]
+    type GbmBoMapFn = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut u32,
+        *mut *mut c_void,
+    ) -> *mut c_void;
+    type GbmBoUnmapFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
+
+    const GBM_FORMAT_ARGB8888: u32 = 0x3432_5241; // fourcc 'AR24'
+    const GBM_BO_USE_SCANOUT: u32 = 1;
+    const GBM_BO_USE_RENDERING: u32 = 4;
+    const GBM_BO_USE_LINEAR: u32 = 16;
+    const GBM_BO_TRANSFER_WRITE: u32 = 2;
+
+    /// A GBM-allocated linear buffer exported as a DMA-BUF, used to feed
+    /// the encoder a real DMA-BUF without a compositor.
+    struct GbmTestBuffer {
+        lib: libloading::Library,
+        device: *mut c_void,
+        bo: *mut c_void,
+        drm_fd: c_int,
+        width: u32,
+        height: u32,
+    }
+
+    impl GbmTestBuffer {
+        fn new(width: u32, height: u32) -> Result<Self, String> {
+            let lib = unsafe { libloading::Library::new("libgbm.so.1") }
+                .map_err(|e| format!("libgbm.so.1 not available: {e}"))?;
+            let create_device: GbmCreateDeviceFn =
+                unsafe { *lib.get(b"gbm_create_device\0").map_err(|e| e.to_string())? };
+            let bo_create: GbmBoCreateFn =
+                unsafe { *lib.get(b"gbm_bo_create\0").map_err(|e| e.to_string())? };
+            let device_destroy: GbmDeviceDestroyFn = unsafe {
+                *lib.get(b"gbm_device_destroy\0")
+                    .map_err(|e| e.to_string())?
+            };
+
+            // Find a render node whose GBM backend can allocate the buffer.
+            for i in 128..136 {
+                let path = format!("/dev/dri/renderD{i}\0");
+                let drm_fd =
+                    unsafe { libc::open(path.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
+                if drm_fd < 0 {
+                    eprintln!(
+                        "renderD{i}: open failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                    continue;
+                }
+                let device = unsafe { create_device(drm_fd) };
+                if device.is_null() {
+                    eprintln!("renderD{i}: gbm_create_device failed");
+                    unsafe { libc::close(drm_fd) };
+                    continue;
+                }
+                // Flag support differs per GBM backend (the NVIDIA one
+                // rejects some combinations with EINVAL) — try a few.
+                let flag_choices = [
+                    GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR,
+                    GBM_BO_USE_LINEAR,
+                    GBM_BO_USE_RENDERING,
+                    GBM_BO_USE_SCANOUT,
+                ];
+                let mut bo = ptr::null_mut();
+                for flags in flag_choices {
+                    bo = unsafe { bo_create(device, width, height, GBM_FORMAT_ARGB8888, flags) };
+                    if !bo.is_null() {
+                        break;
+                    }
+                    eprintln!(
+                        "renderD{i}: gbm_bo_create(flags={flags:#x}) failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                if bo.is_null() {
+                    unsafe {
+                        device_destroy(device);
+                        libc::close(drm_fd);
+                    }
+                    continue;
+                }
+                return Ok(Self {
+                    lib,
+                    device,
+                    bo,
+                    drm_fd,
+                    width,
+                    height,
+                });
+            }
+            Err("no DRM render node could allocate a GBM buffer".to_string())
+        }
+
+        /// Fills the buffer with a gradient. Best-effort: some GBM backends
+        /// don't support CPU mapping; the encode path doesn't care about
+        /// the pixel contents.
+        #[allow(clippy::cast_possible_truncation)] // x % 256 always fits u8
+        fn fill(&self) {
+            let Ok(bo_map) = (unsafe { self.lib.get::<GbmBoMapFn>(b"gbm_bo_map\0") }) else {
+                return;
+            };
+            let Ok(bo_unmap) = (unsafe { self.lib.get::<GbmBoUnmapFn>(b"gbm_bo_unmap\0") }) else {
+                return;
+            };
+            let mut stride = 0u32;
+            let mut map_data: *mut c_void = ptr::null_mut();
+            let ptr = unsafe {
+                bo_map(
+                    self.bo,
+                    0,
+                    0,
+                    self.width,
+                    self.height,
+                    GBM_BO_TRANSFER_WRITE,
+                    &raw mut stride,
+                    &raw mut map_data,
+                )
+            };
+            if ptr.is_null() {
+                return;
+            }
+            unsafe {
+                let buf = std::slice::from_raw_parts_mut(
+                    ptr.cast::<u8>(),
+                    stride as usize * self.height as usize,
+                );
+                for y in 0..self.height as usize {
+                    for x in 0..self.width as usize {
+                        let o = y * stride as usize + x * 4;
+                        buf[o] = (x % 256) as u8; // B
+                        buf[o + 1] = (y % 256) as u8; // G
+                        buf[o + 2] = ((x + y) % 256) as u8; // R
+                        buf[o + 3] = 255; // A
+                    }
+                }
+                bo_unmap(self.bo, map_data);
+            }
+        }
+
+        /// Exports the buffer as a `DmaBufInfo` (fresh fd each call).
+        fn export(&self) -> Result<stargaze_core::capture::DmaBufInfo, String> {
+            let bo_get_fd: GbmBoGetFdFn = unsafe {
+                *self
+                    .lib
+                    .get(b"gbm_bo_get_fd\0")
+                    .map_err(|e| e.to_string())?
+            };
+            let bo_get_stride: GbmBoGetStrideFn = unsafe {
+                *self
+                    .lib
+                    .get(b"gbm_bo_get_stride\0")
+                    .map_err(|e| e.to_string())?
+            };
+            let bo_get_modifier: GbmBoGetModifierFn = unsafe {
+                *self
+                    .lib
+                    .get(b"gbm_bo_get_modifier\0")
+                    .map_err(|e| e.to_string())?
+            };
+            let fd = unsafe { bo_get_fd(self.bo) };
+            if fd < 0 {
+                return Err("gbm_bo_get_fd failed".to_string());
+            }
+            Ok(stargaze_core::capture::DmaBufInfo {
+                fd: unsafe { OwnedFd::from_raw_fd(fd) },
+                width: self.width,
+                height: self.height,
+                format: PixelFormat::Bgra8,
+                modifier: unsafe { bo_get_modifier(self.bo) },
+                stride: unsafe { bo_get_stride(self.bo) },
+                offset: 0,
+            })
+        }
+    }
+
+    impl Drop for GbmTestBuffer {
+        fn drop(&mut self) {
+            unsafe {
+                if let Ok(bo_destroy) = self.lib.get::<GbmBoDestroyFn>(b"gbm_bo_destroy\0") {
+                    bo_destroy(self.bo);
+                }
+                if let Ok(device_destroy) =
+                    self.lib.get::<GbmDeviceDestroyFn>(b"gbm_device_destroy\0")
+                {
+                    device_destroy(self.device);
+                }
+                libc::close(self.drm_fd);
+            }
+        }
+    }
+
+    /// End-to-end check of the fully-GPU DMA-BUF encode path: a real
+    /// DMA-BUF (GBM, linear ARGB8888) must go through EGL import, the
+    /// CUDA NV12 kernel, and NVENC without ever hitting the CPU fallback.
+    ///
+    /// This is the regression test for the silent CPU-fallback bug where
+    /// a missing/incompatible libnvrtc capped the pipeline at ~70 fps.
+    #[test]
+    #[ignore = "requires NVIDIA GPU, NVENC, NVRTC, and a DRM render node"]
+    fn gpu_dmabuf_path_encodes_without_cpu_fallback() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let width = 1280u32;
+        let height = 720u32;
+
+        let buffer = GbmTestBuffer::new(width, height).expect("GBM buffer allocation");
+        buffer.fill();
+
+        let config = EncoderConfig {
+            width,
+            height,
+            framerate: 60,
+            bitrate_mbps: 5,
+            tuning: stargaze_core::config::EncoderTuning::default(),
+        };
+        let mut encoder = init_encoder(&config).expect("NVENC encoder init");
+
+        let (packets_tx, mut packets_rx) = mpsc::channel::<EncodedPacket>(64);
+        let mut packet = ffmpeg_next::Packet::empty();
+
+        for pts in 0..5u64 {
+            let info = buffer.export().expect("DMA-BUF export");
+            upload_dmabuf_and_encode(&mut encoder, &info, pts, pts == 0)
+                .expect("DMA-BUF upload + encode");
+            drain_packets(
+                &mut encoder.encoder,
+                &mut packet,
+                &packets_tx,
+                pts,
+                &encoder.extradata,
+                0,
+                0,
+                std::time::Instant::now(),
+            );
+        }
+
+        let bridge = encoder.egl_bridge.as_ref().expect("EGL bridge initialized");
+        assert!(
+            bridge.has_gpu_path(),
+            "GPU NV12 converter must initialize (is libnvrtc available and \
+             matching cudarc's CUDA version feature?)"
+        );
+        assert_eq!(
+            encoder.gpu_path_failures, 0,
+            "every frame must take the GPU path, not the CPU fallback"
+        );
+
+        let mut count = 0u32;
+        let mut got_keyframe = false;
+        while let Ok(pkt) = packets_rx.try_recv() {
+            assert!(!pkt.data.is_empty());
+            got_keyframe |= pkt.is_keyframe;
+            count += 1;
+        }
+        assert!(count > 0, "encoder should have produced packets");
+        assert!(got_keyframe, "first frame should be an IDR keyframe");
+    }
 }

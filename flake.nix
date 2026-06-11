@@ -171,6 +171,9 @@
             # CUDA runtime + toolkit
             pkgsCuda.cudaPackages.cuda_cudart
             pkgsCuda.cudaPackages.cuda_nvml_dev
+            # Runtime kernel compilation (GPU NV12 converter dlopens libnvrtc).
+            # Pinned to CUDA 13 to match cudarc's "cuda-13020" feature.
+            pkgsCuda.cudaPackages_13.cuda_nvrtc
           ];
 
           env = bindgenEnv // {
@@ -191,6 +194,7 @@
                 pkgsCuda.libopus
                 pkgsCuda.cudaPackages.cuda_cudart
                 pkgsCuda.cudaPackages.cuda_nvml_dev
+                pkgsCuda.cudaPackages_13.cuda_nvrtc
                 pkgsCuda.libglvnd
                 pkgsCuda.mesa
               ]
