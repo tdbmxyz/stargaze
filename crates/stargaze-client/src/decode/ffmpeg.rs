@@ -419,7 +419,8 @@ fn drain_decoded_frames(
             );
         }
 
-        // Convert to YUV420P planes for the renderer.
+        // Extract planes in the decoder's native layout — the renderer
+        // uploads NV12 and I420 textures directly, so no repacking here.
         // VAAPI typically transfers to NV12; software decode outputs YUV420P.
         let mut output = if format == ffmpeg_next::format::Pixel::NV12 {
             let src = if is_vaapi {
@@ -427,7 +428,7 @@ fn drain_decoded_frames(
             } else {
                 &*decoded_frame
             };
-            extract_nv12_to_yuv420p(src, width, height)
+            extract_nv12(src, width, height)
         } else if format == ffmpeg_next::format::Pixel::YUV420P {
             let src = if is_vaapi {
                 &decoder.sw_frame
@@ -472,6 +473,7 @@ fn plane_stride(frame: &ffmpeg_next::frame::Video, index: usize) -> usize {
 }
 
 /// Extracts YUV420P planes from a frame, stripping stride padding.
+#[allow(clippy::many_single_char_names)] // y/u/v are the domain names
 fn extract_yuv420p(frame: &ffmpeg_next::frame::Video, width: u32, height: u32) -> DecodedFrame {
     let w = width as usize;
     let h = height as usize;
@@ -485,14 +487,12 @@ fn extract_yuv420p(frame: &ffmpeg_next::frame::Video, width: u32, height: u32) -
     let u_data = frame.data(1);
     let v_data = frame.data(2);
 
-    let y_plane = copy_plane(y_data, y_stride, w, h);
-    let u_plane = copy_plane(u_data, u_stride, cw, ch);
-    let v_plane = copy_plane(v_data, v_stride, cw, ch);
+    let y = copy_plane(y_data, y_stride, w, h);
+    let u = copy_plane(u_data, u_stride, cw, ch);
+    let v = copy_plane(v_data, v_stride, cw, ch);
 
     DecodedFrame {
-        y_plane,
-        u_plane,
-        v_plane,
+        pixels: stargaze_core::decode::FramePixels::I420 { y, u, v },
         width,
         height,
         pts: frame.pts().map_or(0, i64::cast_unsigned),
@@ -500,44 +500,19 @@ fn extract_yuv420p(frame: &ffmpeg_next::frame::Video, width: u32, height: u32) -
     }
 }
 
-/// Extracts YUV420P planes from an NV12 frame (interleaved UV → split U + V).
-fn extract_nv12_to_yuv420p(
-    frame: &ffmpeg_next::frame::Video,
-    width: u32,
-    height: u32,
-) -> DecodedFrame {
+/// Extracts NV12 planes (Y + interleaved UV) from a frame, stripping
+/// stride padding. The UV plane stays interleaved — SDL renders NV12
+/// textures natively, so deinterleaving here would be wasted work.
+fn extract_nv12(frame: &ffmpeg_next::frame::Video, width: u32, height: u32) -> DecodedFrame {
     let w = width as usize;
     let h = height as usize;
-    let cw = w / 2;
-    let ch = h / 2;
 
-    let y_stride = frame.stride(0);
-    let uv_stride = frame.stride(1);
-    let y_data = frame.data(0);
-    let uv_data = frame.data(1);
-
-    let y_plane = copy_plane(y_data, y_stride, w, h);
-
-    // NV12: UV plane is interleaved (U0 V0 U1 V1 ...).  Split into separate
-    // U and V planes.  Row-sliced with exact chunks so the inner loop has
-    // no bounds checks and vectorizes — this runs per frame on the full
-    // chroma plane, so the scalar version showed up in decode time.
-    let mut u_plane = vec![0u8; cw * ch];
-    let mut v_plane = vec![0u8; cw * ch];
-    for row in 0..ch {
-        let src = &uv_data[row * uv_stride..row * uv_stride + cw * 2];
-        let dst_u = &mut u_plane[row * cw..(row + 1) * cw];
-        let dst_v = &mut v_plane[row * cw..(row + 1) * cw];
-        for ((pair, u), v) in src.chunks_exact(2).zip(dst_u).zip(dst_v) {
-            *u = pair[0];
-            *v = pair[1];
-        }
-    }
+    let y = copy_plane(frame.data(0), frame.stride(0), w, h);
+    // UV plane: one byte pair per 2x2 block → `w` bytes per row, h/2 rows.
+    let uv = copy_plane(frame.data(1), frame.stride(1), w, h / 2);
 
     DecodedFrame {
-        y_plane,
-        u_plane,
-        v_plane,
+        pixels: stargaze_core::decode::FramePixels::Nv12 { y, uv },
         width,
         height,
         pts: frame.pts().map_or(0, i64::cast_unsigned),
@@ -639,10 +614,12 @@ mod tests {
         assert_eq!(plane_stride(&frame, 2), 0);
     }
 
-    /// NV12 → YUV420P extraction must deinterleave the UV plane correctly
-    /// and produce planes sized for the visible area (stride stripped).
+    /// NV12 extraction keeps the UV plane interleaved (the renderer
+    /// uploads NV12 textures directly) and strips stride padding.
     #[test]
-    fn extract_nv12_deinterleaves_uv_and_strips_stride() {
+    fn extract_nv12_keeps_interleaved_uv_and_strips_stride() {
+        use stargaze_core::decode::FramePixels;
+
         ffmpeg_next::init().expect("ffmpeg init");
         let (w, h) = (64u32, 36u32);
         let mut frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::NV12, w, h);
@@ -655,19 +632,26 @@ mod tests {
             chunk[1] = 0x55;
         }
 
-        let out = extract_nv12_to_yuv420p(&frame, w, h);
+        let out = extract_nv12(&frame, w, h);
         let (w, h) = (w as usize, h as usize);
-        assert_eq!(out.y_plane.len(), w * h);
-        assert_eq!(out.u_plane.len(), (w / 2) * (h / 2));
-        assert_eq!(out.v_plane.len(), (w / 2) * (h / 2));
-        assert!(out.y_plane.iter().all(|&b| b == 0x11));
-        assert!(out.u_plane.iter().all(|&b| b == 0xAA));
-        assert!(out.v_plane.iter().all(|&b| b == 0x55));
+        match &out.pixels {
+            FramePixels::Nv12 { y, uv } => {
+                assert_eq!(y.len(), w * h);
+                assert_eq!(uv.len(), w * h / 2);
+                assert!(y.iter().all(|&b| b == 0x11));
+                for pair in uv.chunks_exact(2) {
+                    assert_eq!(pair, [0xAA, 0x55], "UV must stay interleaved");
+                }
+            }
+            FramePixels::I420 { .. } => panic!("expected NV12 pixels"),
+        }
         assert_eq!(out.pts, 42);
     }
 
     #[test]
     fn extract_yuv420p_strips_stride() {
+        use stargaze_core::decode::FramePixels;
+
         ffmpeg_next::init().expect("ffmpeg init");
         let (w, h) = (64u32, 36u32);
         let mut frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, w, h);
@@ -677,11 +661,16 @@ mod tests {
 
         let out = extract_yuv420p(&frame, w, h);
         let (w, h) = (w as usize, h as usize);
-        assert_eq!(out.y_plane.len(), w * h);
-        assert_eq!(out.u_plane.len(), (w / 2) * (h / 2));
-        assert_eq!(out.v_plane.len(), (w / 2) * (h / 2));
-        assert!(out.u_plane.iter().all(|&b| b == 2));
-        assert!(out.v_plane.iter().all(|&b| b == 3));
+        match &out.pixels {
+            FramePixels::I420 { y, u, v } => {
+                assert_eq!(y.len(), w * h);
+                assert_eq!(u.len(), (w / 2) * (h / 2));
+                assert_eq!(v.len(), (w / 2) * (h / 2));
+                assert!(u.iter().all(|&b| b == 2));
+                assert!(v.iter().all(|&b| b == 3));
+            }
+            FramePixels::Nv12 { .. } => panic!("expected I420 pixels"),
+        }
     }
 
     #[test]

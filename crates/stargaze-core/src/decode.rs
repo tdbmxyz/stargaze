@@ -6,22 +6,37 @@
 use crate::config::Codec;
 use thiserror::Error;
 
+/// Pixel data of a decoded 4:2:0 frame, in the layout the decoder
+/// produced it — the renderer uploads either layout directly, so no
+/// repacking happens on the decode path.
+#[derive(Debug, Clone)]
+pub enum FramePixels {
+    /// Planar YUV 4:2:0 (I420): separate Y, U, V planes.
+    /// Typical software-decode output.
+    I420 {
+        /// Y (luma) plane, `width * height` bytes.
+        y: Vec<u8>,
+        /// U (chroma-blue) plane, `(width/2) * (height/2)` bytes.
+        u: Vec<u8>,
+        /// V (chroma-red) plane, `(width/2) * (height/2)` bytes.
+        v: Vec<u8>,
+    },
+    /// Semi-planar NV12: Y plane plus interleaved UV plane.
+    /// Typical hardware-decode (VAAPI) output — kept as-is to avoid a
+    /// per-frame deinterleave on the client.
+    Nv12 {
+        /// Y (luma) plane, `width * height` bytes.
+        y: Vec<u8>,
+        /// Interleaved UV plane (U0 V0 U1 V1 ...), `width * height / 2` bytes.
+        uv: Vec<u8>,
+    },
+}
+
 /// A decoded video frame ready for rendering.
-///
-/// Contains raw pixel data in YUV420P (planar) format with three
-/// separate planes: Y (luma), U (chroma-blue), V (chroma-red).
-///
-/// - Y plane:  `width * height` bytes
-/// - U plane:  `(width / 2) * (height / 2)` bytes
-/// - V plane:  `(width / 2) * (height / 2)` bytes
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
-    /// Y (luma) plane data.
-    pub y_plane: Vec<u8>,
-    /// U (chroma-blue) plane data.
-    pub u_plane: Vec<u8>,
-    /// V (chroma-red) plane data.
-    pub v_plane: Vec<u8>,
+    /// Pixel planes in the decoder's native 4:2:0 layout.
+    pub pixels: FramePixels,
     /// Frame width in pixels.
     pub width: u32,
     /// Frame height in pixels.
@@ -134,45 +149,54 @@ mod tests {
         let y_size = (width * height) as usize;
         let chroma_size = ((width / 2) * (height / 2)) as usize;
         let frame = DecodedFrame {
-            y_plane: vec![128; y_size],
-            u_plane: vec![128; chroma_size],
-            v_plane: vec![128; chroma_size],
+            pixels: FramePixels::I420 {
+                y: vec![128; y_size],
+                u: vec![128; chroma_size],
+                v: vec![128; chroma_size],
+            },
             width,
             height,
             pts: 0,
             stats: FrameStats::default(),
         };
-        assert_eq!(frame.y_plane.len(), y_size);
-        assert_eq!(frame.u_plane.len(), chroma_size);
-        assert_eq!(frame.v_plane.len(), chroma_size);
+        match &frame.pixels {
+            FramePixels::I420 { y, u, v } => {
+                assert_eq!(y.len(), y_size);
+                assert_eq!(u.len(), chroma_size);
+                assert_eq!(v.len(), chroma_size);
+            }
+            FramePixels::Nv12 { .. } => panic!("expected I420"),
+        }
         assert_eq!(frame.width, 1920);
         assert_eq!(frame.height, 1080);
         assert_eq!(frame.pts, 0);
     }
 
     #[test]
-    fn decoded_frame_yuv420p_plane_sizes() {
+    fn decoded_frame_nv12_plane_sizes() {
         let width: u32 = 640;
         let height: u32 = 480;
         let y_size = (width * height) as usize;
-        let chroma_size = ((width / 2) * (height / 2)) as usize;
+        let uv_size = (width * height / 2) as usize;
 
         let frame = DecodedFrame {
-            y_plane: vec![0; y_size],
-            u_plane: vec![0; chroma_size],
-            v_plane: vec![0; chroma_size],
+            pixels: FramePixels::Nv12 {
+                y: vec![0; y_size],
+                uv: vec![0; uv_size],
+            },
             width,
             height,
             pts: 100,
             stats: FrameStats::default(),
         };
 
-        assert_eq!(y_size, 307_200);
-        assert_eq!(chroma_size, 76_800);
-        assert_eq!(
-            frame.y_plane.len() + frame.u_plane.len() + frame.v_plane.len(),
-            y_size + 2 * chroma_size
-        );
+        match &frame.pixels {
+            FramePixels::Nv12 { y, uv } => {
+                assert_eq!(y.len(), 307_200);
+                assert_eq!(uv.len(), 153_600);
+            }
+            FramePixels::I420 { .. } => panic!("expected NV12"),
+        }
     }
 
     #[test]

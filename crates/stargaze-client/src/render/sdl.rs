@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::anyhow;
 use sdl2::audio::AudioQueue;
 use sdl2::controller::GameController;
-use stargaze_core::decode::{DecodedFrame, DecoderConfig};
+use stargaze_core::decode::{DecodedFrame, DecoderConfig, FramePixels};
 use stargaze_core::input::{GamepadAxis, GamepadButton, InputEvent, MouseButton};
 use tracing::{info, warn};
 
@@ -172,13 +172,10 @@ pub(super) fn run_sdl_loop(
         .map_err(|e| anyhow!("canvas creation failed: {e}"))?;
 
     let texture_creator = canvas.texture_creator();
-    let mut texture = texture_creator
-        .create_texture_streaming(
-            sdl2::pixels::PixelFormatEnum::IYUV,
-            config.width,
-            config.height,
-        )
-        .map_err(|e| anyhow!("texture creation failed: {e}"))?;
+    // The streaming texture is created on the first decoded frame, in the
+    // decoder's native pixel layout (NV12 for hardware decode, IYUV for
+    // software decode), and recreated if the layout changes mid-session.
+    let mut texture: Option<(sdl2::pixels::PixelFormatEnum, sdl2::render::Texture<'_>)> = None;
 
     let mut event_pump = sdl
         .event_pump()
@@ -392,6 +389,11 @@ pub(super) fn run_sdl_loop(
             continue;
         };
 
+        let wanted_format = match &frame.pixels {
+            FramePixels::I420 { .. } => sdl2::pixels::PixelFormatEnum::IYUV,
+            FramePixels::Nv12 { .. } => sdl2::pixels::PixelFormatEnum::NV12,
+        };
+
         static RENDER_DIAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let rn = RENDER_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if rn < 5 {
@@ -401,32 +403,49 @@ pub(super) fn run_sdl_loop(
                 frame_height = frame.height,
                 texture_width = config.width,
                 texture_height = config.height,
-                y_plane_len = frame.y_plane.len(),
-                u_plane_len = frame.u_plane.len(),
-                v_plane_len = frame.v_plane.len(),
-                y_pitch = frame.width as usize,
-                chroma_pitch = frame.width as usize / 2,
+                texture_format = ?wanted_format,
                 "SDL render diagnostics"
             );
         }
 
-        let y_pitch = frame.width as usize;
-        let chroma_pitch = frame.width as usize / 2;
+        let tex = match &mut texture {
+            Some((fmt, tex)) if *fmt == wanted_format => tex,
+            slot => {
+                let tex = texture_creator
+                    .create_texture_streaming(wanted_format, config.width, config.height)
+                    .map_err(|e| anyhow!("texture creation failed: {e}"))?;
+                info!(format = ?wanted_format, "Created streaming texture");
+                &mut slot.insert((wanted_format, tex)).1
+            }
+        };
 
-        texture
-            .update_yuv(
-                None,
-                &frame.y_plane,
-                y_pitch,
-                &frame.u_plane,
-                chroma_pitch,
-                &frame.v_plane,
-                chroma_pitch,
-            )
-            .map_err(|e| anyhow!("texture update failed: {e}"))?;
+        let y_pitch = frame.width as usize;
+        match &frame.pixels {
+            FramePixels::I420 { y, u, v } => {
+                tex.update_yuv(None, y, y_pitch, u, y_pitch / 2, v, y_pitch / 2)
+                    .map_err(|e| anyhow!("texture update failed: {e}"))?;
+            }
+            FramePixels::Nv12 { y, uv } => {
+                // rust-sdl2 doesn't wrap SDL_UpdateNVTexture; call it
+                // directly. UV pitch equals the Y pitch for NV12.
+                let ret = unsafe {
+                    sdl2::sys::SDL_UpdateNVTexture(
+                        tex.raw(),
+                        std::ptr::null(),
+                        y.as_ptr(),
+                        i32::try_from(y_pitch).unwrap_or(i32::MAX),
+                        uv.as_ptr(),
+                        i32::try_from(y_pitch).unwrap_or(i32::MAX),
+                    )
+                };
+                if ret != 0 {
+                    return Err(anyhow!("SDL_UpdateNVTexture failed: {}", sdl2::get_error()));
+                }
+            }
+        }
 
         canvas
-            .copy(&texture, None, None)
+            .copy(tex, None, None)
             .map_err(|e| anyhow!("canvas copy failed: {e}"))?;
 
         overlay.on_frame_rendered(frame.stats);
