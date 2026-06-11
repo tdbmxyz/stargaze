@@ -99,6 +99,198 @@ fn load_cu_graphics_gl_register_image() -> Result<CuGraphicsGLRegisterImageFn, E
     }
 }
 
+// ── GPU NV12 conversion ─────────────────────────────────────────────────
+
+/// CUDA kernel: RGBA → NV12, BT.709 limited range (matches the CPU
+/// converter in `super::convert` and the colorspace the encoder
+/// advertises). One thread per 2x2 pixel block.
+const NV12_KERNEL_SRC: &str = r#"
+extern "C" __global__ void rgba_to_nv12(
+    const unsigned char* __restrict__ src, unsigned long long src_pitch,
+    unsigned char* __restrict__ y_plane, unsigned long long y_pitch,
+    unsigned char* __restrict__ uv_plane, unsigned long long uv_pitch,
+    int width, int height)
+{
+    int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    int yy = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
+    if (x >= width || yy >= height) return;
+
+    int rsum = 0, gsum = 0, bsum = 0;
+    for (int dy = 0; dy < 2; dy++) {
+        const unsigned char* row = src + (unsigned long long)(yy + dy) * src_pitch + x * 4;
+        unsigned char* yrow = y_plane + (unsigned long long)(yy + dy) * y_pitch + x;
+        for (int dx = 0; dx < 2; dx++) {
+            int r = row[dx * 4 + 0];
+            int g = row[dx * 4 + 1];
+            int b = row[dx * 4 + 2];
+            rsum += r; gsum += g; bsum += b;
+            yrow[dx] = (unsigned char)(((47 * r + 157 * g + 16 * b + 128) >> 8) + 16);
+        }
+    }
+    int r = (rsum + 2) >> 2;
+    int g = (gsum + 2) >> 2;
+    int b = (bsum + 2) >> 2;
+    int u = ((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128;
+    int v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
+    unsigned char* uv = uv_plane + (unsigned long long)(yy / 2) * uv_pitch + x;
+    uv[0] = (unsigned char)min(max(u, 16), 240);
+    uv[1] = (unsigned char)min(max(v, 16), 240);
+}
+"#;
+
+/// On-GPU RGBA→NV12 converter: NVRTC-compiled kernel plus a persistent
+/// pitched device buffer the GL texture is copied into before conversion.
+struct GpuNv12Converter {
+    module: cudarc::driver::sys::CUmodule,
+    func: cudarc::driver::sys::CUfunction,
+    rgba_buf: cudarc::driver::sys::CUdeviceptr,
+    rgba_pitch: usize,
+}
+
+impl GpuNv12Converter {
+    /// Compiles the kernel and allocates the staging buffer.
+    ///
+    /// Requires the CUDA context to be current on this thread. Fails
+    /// gracefully (caller falls back to the CPU path) when NVRTC is not
+    /// available at runtime.
+    fn new(width: u32, height: u32) -> Result<Self, EncodeError> {
+        use cudarc::driver::sys as cu;
+
+        let ptx = cudarc::nvrtc::compile_ptx(NV12_KERNEL_SRC)
+            .map_err(|e| EncodeError::InitError(format!("NVRTC compile failed: {e:?}")))?;
+        let ptx_src = std::ffi::CString::new(ptx.to_src())
+            .map_err(|e| EncodeError::InitError(format!("PTX contains NUL: {e}")))?;
+
+        unsafe {
+            let mut module: cu::CUmodule = ptr::null_mut();
+            let res = cu::cuModuleLoadData(&raw mut module, ptx_src.as_ptr().cast());
+            if res != cu::CUresult::CUDA_SUCCESS {
+                return Err(EncodeError::InitError(format!(
+                    "cuModuleLoadData failed: {res:?}"
+                )));
+            }
+
+            let mut func: cu::CUfunction = ptr::null_mut();
+            let res = cu::cuModuleGetFunction(&raw mut func, module, c"rgba_to_nv12".as_ptr());
+            if res != cu::CUresult::CUDA_SUCCESS {
+                cu::cuModuleUnload(module);
+                return Err(EncodeError::InitError(format!(
+                    "cuModuleGetFunction failed: {res:?}"
+                )));
+            }
+
+            let mut rgba_buf: cu::CUdeviceptr = 0;
+            let mut rgba_pitch: usize = 0;
+            let res = cu::cuMemAllocPitch_v2(
+                &raw mut rgba_buf,
+                &raw mut rgba_pitch,
+                width as usize * 4,
+                height as usize,
+                16,
+            );
+            if res != cu::CUresult::CUDA_SUCCESS {
+                cu::cuModuleUnload(module);
+                return Err(EncodeError::InitError(format!(
+                    "cuMemAllocPitch failed: {res:?}"
+                )));
+            }
+
+            info!(
+                width,
+                height, "GPU NV12 converter initialized (NVRTC kernel)"
+            );
+            Ok(Self {
+                module,
+                func,
+                rgba_buf,
+                rgba_pitch,
+            })
+        }
+    }
+
+    /// Launches the conversion kernel: staging RGBA buffer → NV12 planes.
+    ///
+    /// Requires the CUDA context to be current on this thread.
+    unsafe fn launch(
+        &self,
+        y_plane: cudarc::driver::sys::CUdeviceptr,
+        y_pitch: usize,
+        uv_plane: cudarc::driver::sys::CUdeviceptr,
+        uv_pitch: usize,
+        width: u32,
+        height: u32,
+    ) -> Result<(), EncodeError> {
+        use cudarc::driver::sys as cu;
+
+        let src_pitch = self.rgba_pitch as u64;
+        let y_pitch = y_pitch as u64;
+        let uv_pitch = uv_pitch as u64;
+        let w = width.cast_signed();
+        let h = height.cast_signed();
+
+        let mut params: [*mut c_void; 8] = [
+            ptr::from_ref(&self.rgba_buf).cast_mut().cast(),
+            ptr::from_ref(&src_pitch).cast_mut().cast(),
+            ptr::from_ref(&y_plane).cast_mut().cast(),
+            ptr::from_ref(&y_pitch).cast_mut().cast(),
+            ptr::from_ref(&uv_plane).cast_mut().cast(),
+            ptr::from_ref(&uv_pitch).cast_mut().cast(),
+            ptr::from_ref(&w).cast_mut().cast(),
+            ptr::from_ref(&h).cast_mut().cast(),
+        ];
+
+        // One thread per 2x2 block.
+        let block = (16u32, 16u32);
+        let grid_x = width.div_ceil(2).div_ceil(block.0);
+        let grid_y = height.div_ceil(2).div_ceil(block.1);
+
+        unsafe {
+            let res = cu::cuLaunchKernel(
+                self.func,
+                grid_x,
+                grid_y,
+                1,
+                block.0,
+                block.1,
+                1,
+                0,               // shared mem
+                ptr::null_mut(), // default stream
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            );
+            if res != cu::CUresult::CUDA_SUCCESS {
+                return Err(EncodeError::EncodeFrameError {
+                    frame: 0,
+                    reason: format!("cuLaunchKernel(rgba_to_nv12) failed: {res:?}"),
+                });
+            }
+            // The encoder consumes the frame on its own stream — make the
+            // conversion result visible before send_frame.
+            let res = cu::cuCtxSynchronize();
+            if res != cu::CUresult::CUDA_SUCCESS {
+                return Err(EncodeError::EncodeFrameError {
+                    frame: 0,
+                    reason: format!("cuCtxSynchronize after NV12 kernel failed: {res:?}"),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GpuNv12Converter {
+    fn drop(&mut self) {
+        unsafe {
+            if self.rgba_buf != 0 {
+                cudarc::driver::sys::cuMemFree_v2(self.rgba_buf);
+            }
+            if !self.module.is_null() {
+                cudarc::driver::sys::cuModuleUnload(self.module);
+            }
+        }
+    }
+}
+
 // ── EglCudaBridge ───────────────────────────────────────────────────────
 
 /// Manages EGL context, GL texture, and CUDA-GL interop for DMA-BUF import.
@@ -124,6 +316,9 @@ pub(crate) struct EglCudaBridge {
     gbm_destroy_fn: Option<GbmDeviceDestroyFn>,
     /// DRM render node fd (must outlive the GBM device).
     drm_fd: RawFd,
+    /// On-GPU NV12 converter. `None` when NVRTC is unavailable — frames
+    /// then take the legacy GPU→CPU→GPU path.
+    gpu_converter: Option<GpuNv12Converter>,
 }
 
 // Safety: EglCudaBridge is only used on the dedicated encoder thread.
@@ -356,6 +551,16 @@ impl EglCudaBridge {
             resource
         };
 
+        // Compile the on-GPU NV12 converter while the CUDA context is
+        // still current. Failure is non-fatal (CPU fallback path).
+        let gpu_converter = match GpuNv12Converter::new(width, height) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!("GPU NV12 converter unavailable ({e}), using CPU conversion fallback");
+                None
+            }
+        };
+
         unsafe {
             let mut old: cudarc::driver::sys::CUcontext = ptr::null_mut();
             cudarc::driver::sys::cuCtxPopCurrent_v2(&mut old);
@@ -363,7 +568,9 @@ impl EglCudaBridge {
 
         info!(
             width,
-            height, "EGL-GL-CUDA bridge initialized (headless, DMA-BUF import ready)"
+            height,
+            gpu_nv12 = gpu_converter.is_some(),
+            "EGL-GL-CUDA bridge initialized (headless, DMA-BUF import ready)"
         );
 
         Ok(Self {
@@ -381,7 +588,13 @@ impl EglCudaBridge {
             gbm_device,
             gbm_destroy_fn,
             drm_fd,
+            gpu_converter,
         })
+    }
+
+    /// Whether the fully-GPU import path (no CPU round trip) is available.
+    pub(crate) fn has_gpu_path(&self) -> bool {
+        self.gpu_converter.is_some()
     }
 
     /// Compile the external-texture blit shader and create a fullscreen quad VAO.
@@ -692,81 +905,122 @@ impl EglCudaBridge {
         ))
     }
 
-    /// Import a DMA-BUF frame: EGL image → GL texture → CUDA device → CPU buffer.
+    /// Import a DMA-BUF frame fully on the GPU: EGL image → GL texture →
+    /// CUDA staging buffer → NV12 kernel directly into the encoder's
+    /// hardware frame planes. No CPU round trip.
     ///
-    /// Returns a linear (de-tiled) CPU buffer of BGRA/RGBA pixels.
-    /// The caller feeds this into `upload_cpu_data_and_encode()`.
-    #[allow(clippy::too_many_lines)]
-    pub(crate) fn import_dmabuf_to_cpu(&self, info: &DmaBufInfo) -> Result<Vec<u8>, EncodeError> {
-        use std::os::unix::io::AsRawFd;
+    /// Requires the CUDA context to be current on this thread and
+    /// [`Self::has_gpu_path`] to be true.
+    pub(crate) fn import_dmabuf_to_hw_frame(
+        &self,
+        info: &DmaBufInfo,
+        hw_frame: &mut ffmpeg_next::frame::Video,
+    ) -> Result<(), EncodeError> {
+        use cudarc::driver::sys as cu;
 
-        // DEBUG: dump raw DMA-BUF mmap on first frame to verify source data.
-        static RAW_DUMP_DONE: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !RAW_DUMP_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let fd = info.fd.as_raw_fd();
-            let size = info.stride as usize * info.height as usize;
-            let mapped = unsafe {
-                libc::mmap(
-                    ptr::null_mut(),
-                    size,
-                    libc::PROT_READ,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                )
-            };
-            if mapped != libc::MAP_FAILED {
-                let raw = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), size) };
-                let w = info.width as usize;
-                let h = info.height as usize;
-                let stride = info.stride as usize;
-                let mut rgb = Vec::with_capacity(w * h * 3);
-                for row in 0..h {
-                    for col in 0..w {
-                        let off = row * stride + col * 4;
-                        let [b, g, r, _a] = [raw[off], raw[off + 1], raw[off + 2], raw[off + 3]];
-                        rgb.push(r);
-                        rgb.push(g);
-                        rgb.push(b);
-                    }
+        let converter =
+            self.gpu_converter
+                .as_ref()
+                .ok_or_else(|| EncodeError::EncodeFrameError {
+                    frame: 0,
+                    reason: "GPU NV12 converter not available".to_string(),
+                })?;
+
+        self.import_and_blit(info)?;
+
+        // Map the GL texture and copy device-to-device into the staging
+        // buffer (the kernel can't read a CUarray through a raw pointer).
+        unsafe {
+            gl::Finish();
+
+            let mut resource = self.cuda_resource;
+            let res = cu::cuGraphicsMapResources(1, &raw mut resource, ptr::null_mut());
+            if res != cu::CUresult::CUDA_SUCCESS {
+                return Err(EncodeError::EncodeFrameError {
+                    frame: 0,
+                    reason: format!("cuGraphicsMapResources failed: {res:?}"),
+                });
+            }
+
+            let mut cuda_array: cu::CUarray = ptr::null_mut();
+            let res = cu::cuGraphicsSubResourceGetMappedArray(&raw mut cuda_array, resource, 0, 0);
+            if res == cu::CUresult::CUDA_SUCCESS {
+                let copy_desc = cu::CUDA_MEMCPY2D {
+                    srcXInBytes: 0,
+                    srcY: 0,
+                    srcMemoryType: cu::CUmemorytype::CU_MEMORYTYPE_ARRAY,
+                    srcHost: ptr::null(),
+                    srcDevice: 0,
+                    srcArray: cuda_array,
+                    srcPitch: 0,
+
+                    dstXInBytes: 0,
+                    dstY: 0,
+                    dstMemoryType: cu::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+                    dstHost: ptr::null_mut(),
+                    dstDevice: converter.rgba_buf,
+                    dstArray: ptr::null_mut(),
+                    dstPitch: converter.rgba_pitch,
+
+                    WidthInBytes: self.width as usize * 4,
+                    Height: self.height as usize,
+                };
+                let copy_res = cu::cuMemcpy2D_v2(&raw const copy_desc);
+
+                let mut resource = self.cuda_resource;
+                cu::cuGraphicsUnmapResources(1, &raw mut resource, ptr::null_mut());
+
+                if copy_res != cu::CUresult::CUDA_SUCCESS {
+                    return Err(EncodeError::EncodeFrameError {
+                        frame: 0,
+                        reason: format!("cuMemcpy2D (array→device) failed: {copy_res:?}"),
+                    });
                 }
-                let header = format!("P6\n{w} {h}\n255\n");
-                let path = "/tmp/stargaze_raw_dmabuf.ppm";
-                if let Ok(mut f) = std::fs::File::create(path) {
-                    use std::io::Write;
-                    let _ = f.write_all(header.as_bytes());
-                    let _ = f.write_all(&rgb);
-                    tracing::info!(
-                        path,
-                        width = w,
-                        height = h,
-                        stride,
-                        size,
-                        fd,
-                        "Dumped raw DMA-BUF mmap to PPM"
-                    );
-                }
-                unsafe { libc::munmap(mapped, size) };
             } else {
-                tracing::warn!("Raw DMA-BUF mmap failed (tiled memory?) — skipping dump");
+                let mut resource = self.cuda_resource;
+                cu::cuGraphicsUnmapResources(1, &raw mut resource, ptr::null_mut());
+                return Err(EncodeError::EncodeFrameError {
+                    frame: 0,
+                    reason: format!("cuGraphicsSubResourceGetMappedArray failed: {res:?}"),
+                });
             }
         }
 
+        // Convert into the hw frame's NV12 planes.
+        unsafe {
+            let raw = hw_frame.as_mut_ptr();
+            let y_plane = (*raw).data[0] as cu::CUdeviceptr;
+            let uv_plane = (*raw).data[1] as cu::CUdeviceptr;
+            let y_pitch = usize::try_from((*raw).linesize[0]).unwrap_or(self.width as usize);
+            let uv_pitch = usize::try_from((*raw).linesize[1]).unwrap_or(self.width as usize);
+            converter.launch(
+                y_plane,
+                y_pitch,
+                uv_plane,
+                uv_pitch,
+                self.width,
+                self.height,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Shared front half of both import paths: create the EGL image from
+    /// the DMA-BUF and blit it into the persistent GL texture.
+    fn import_and_blit(&self, info: &DmaBufInfo) -> Result<(), EncodeError> {
+        use std::os::unix::io::AsRawFd;
+
         // Ensure EGL context is current on this thread.
-        // EGL contexts are thread-local — after cuCtxPushCurrent or thread migration
-        // the EGL context may no longer be current.
         self.egl
             .make_current(self.display, None, None, Some(self.context))
             .map_err(|e| EncodeError::EncodeFrameError {
                 frame: 0,
-                reason: format!("eglMakeCurrent failed in import_dmabuf_to_cpu: {e}"),
+                reason: format!("eglMakeCurrent failed in import_and_blit: {e}"),
             })?;
 
         let drm_fourcc = pixel_format_to_drm_fourcc(info.format);
 
-        // Step 1: Create EGL image from DMA-BUF.
-        // create_image takes &[Attrib] where Attrib = usize
         let mut attribs: Vec<khronos_egl::Attrib> = vec![
             EGL_LINUX_DRM_FOURCC_EXT,
             drm_fourcc as khronos_egl::Attrib,
@@ -798,7 +1052,6 @@ impl EglCudaBridge {
 
         attribs.push(khronos_egl::ATTRIB_NONE);
 
-        // create_image(display, ctx, target: Enum, buffer: ClientBuffer, attribs: &[Attrib])
         let egl_image = self
             .egl
             .create_image(
@@ -813,38 +1066,22 @@ impl EglCudaBridge {
                 reason: format!("eglCreateImage (DMA-BUF) failed: {e}"),
             })?;
 
-        // Log DMA-BUF fd diagnostics on first few frames.
-        {
-            use std::os::unix::io::AsRawFd;
-            let raw_fd = info.fd.as_raw_fd();
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            let stat_ok = unsafe { libc::fstat(raw_fd, &mut stat) } == 0;
-            if stat_ok {
-                // S_IFCHR = 0o020000 (character device — expected for DMA-BUF)
-                let file_type = stat.st_mode & libc::S_IFMT;
-                debug!(
-                    fd = raw_fd,
-                    file_type = format_args!("0o{file_type:o}"),
-                    dev = stat.st_rdev,
-                    size = stat.st_size,
-                    "DMA-BUF fd diagnostics"
-                );
-            } else {
-                warn!(fd = raw_fd, "fstat on DMA-BUF fd failed");
-            }
-        }
-
-        // Step 2: Bind EGL image to a temp texture, blit to persistent texture, read pixels.
         let copy_result = unsafe { self.egl_image_to_gl_texture(egl_image) };
 
         // Always destroy the EGL image (it's per-frame).
         let _ = self.egl.destroy_image(self.display, egl_image);
 
-        copy_result?;
+        copy_result
+    }
 
-        // Step 3: Map CUDA resource, get array, copy to host.
+    /// Import a DMA-BUF frame: EGL image → GL texture → CUDA device → CPU buffer.
+    ///
+    /// Returns a linear (de-tiled) CPU buffer of BGRA/RGBA pixels.
+    /// The caller feeds this into `upload_cpu_data_and_encode()`.
+    /// Fallback path when the GPU converter is unavailable.
+    pub(crate) fn import_dmabuf_to_cpu(&self, info: &DmaBufInfo) -> Result<Vec<u8>, EncodeError> {
+        self.import_and_blit(info)?;
         let cpu_buf = unsafe { self.gl_texture_to_cpu_via_cuda()? };
-
         Ok(cpu_buf)
     }
 
@@ -1123,5 +1360,24 @@ impl Drop for EglCudaBridge {
         if self.drm_fd >= 0 {
             unsafe { libc::close(self.drm_fd) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies the NV12 kernel compiles under NVRTC.
+    ///
+    /// Requires an NVIDIA driver with libnvrtc available.
+    /// Run manually with:
+    /// ```bash
+    /// cargo test --package stargaze-server -- --ignored nv12_kernel_compiles
+    /// ```
+    #[test]
+    #[ignore = "requires NVIDIA driver with NVRTC"]
+    fn nv12_kernel_compiles() {
+        let ptx = cudarc::nvrtc::compile_ptx(NV12_KERNEL_SRC);
+        assert!(ptx.is_ok(), "kernel must compile: {:?}", ptx.err());
     }
 }

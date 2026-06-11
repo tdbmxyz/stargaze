@@ -539,6 +539,16 @@ fn upload_cpu_data_and_encode(
         });
     }
 
+    send_hw_frame(encoder, &mut hw_frame, pts, force_idr)
+}
+
+/// Stamps pts / forced-IDR on a hardware frame and submits it to NVENC.
+fn send_hw_frame(
+    encoder: &mut FfmpegEncoder,
+    hw_frame: &mut ffmpeg_next::frame::Video,
+    pts: u64,
+    force_idr: bool,
+) -> Result<(), EncodeError> {
     hw_frame.set_pts(Some(pts.cast_signed()));
     if force_idr {
         unsafe {
@@ -547,13 +557,11 @@ fn upload_cpu_data_and_encode(
     }
     encoder
         .encoder
-        .send_frame(&hw_frame)
+        .send_frame(hw_frame)
         .map_err(|e| EncodeError::EncodeFrameError {
             frame: pts,
             reason: format!("avcodec_send_frame failed: {e}"),
-        })?;
-
-    Ok(())
+        })
 }
 
 /// Legacy conversion path via `sws_scale` for formats the direct
@@ -638,6 +646,29 @@ fn upload_dmabuf_and_encode(
         }
     }
 
+    // Fully-GPU path: EGL → GL → CUDA kernel → NV12 hw frame, no CPU
+    // round trip. Falls through to the CPU path on per-frame errors.
+    if encoder
+        .egl_bridge
+        .as_ref()
+        .is_some_and(super::egl_cuda::EglCudaBridge::has_gpu_path)
+    {
+        match gpu_import_and_encode(encoder, info, pts, force_idr) {
+            Ok(()) => {
+                unsafe {
+                    let mut old: cu::CUcontext = ptr::null_mut();
+                    cu::cuCtxPopCurrent_v2(&raw mut old);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                if pts < 3 {
+                    warn!(frame = pts, error = %e, "GPU NV12 path failed, using CPU fallback");
+                }
+            }
+        }
+    }
+
     let bridge = encoder.egl_bridge.as_ref().unwrap();
 
     let cpu_buf = match bridge.import_dmabuf_to_cpu(info) {
@@ -707,6 +738,36 @@ fn upload_dmabuf_and_encode(
         pts,
         force_idr,
     )
+}
+
+/// GPU-only encode: allocate the NV12 hardware frame and let the EGL
+/// bridge import + convert the DMA-BUF directly into it.
+///
+/// The CUDA context must already be pushed on this thread.
+fn gpu_import_and_encode(
+    encoder: &mut FfmpegEncoder,
+    info: &stargaze_core::capture::DmaBufInfo,
+    pts: u64,
+    force_idr: bool,
+) -> Result<(), EncodeError> {
+    let mut hw_frame = ffmpeg_next::frame::Video::empty();
+    let ret = unsafe {
+        ffmpeg_sys_next::av_hwframe_get_buffer(encoder.hw_frames_ctx, hw_frame.as_mut_ptr(), 0)
+    };
+    if ret < 0 {
+        return Err(EncodeError::EncodeFrameError {
+            frame: pts,
+            reason: format!("av_hwframe_get_buffer failed (error code {ret})"),
+        });
+    }
+
+    encoder
+        .egl_bridge
+        .as_ref()
+        .expect("bridge checked by caller")
+        .import_dmabuf_to_hw_frame(info, &mut hw_frame)?;
+
+    send_hw_frame(encoder, &mut hw_frame, pts, force_idr)
 }
 
 fn try_mmap_dmabuf_fallback(
