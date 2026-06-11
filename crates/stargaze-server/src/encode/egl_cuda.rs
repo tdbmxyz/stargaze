@@ -101,15 +101,17 @@ fn load_cu_graphics_gl_register_image() -> Result<CuGraphicsGLRegisterImageFn, E
 
 // ── GPU NV12 conversion ─────────────────────────────────────────────────
 
-/// CUDA kernel: RGBA → NV12, BT.709 limited range (matches the CPU
-/// converter in `super::convert` and the colorspace the encoder
-/// advertises). One thread per 2x2 pixel block.
+/// CUDA kernel: 8-bit RGB (any channel order) → NV12, BT.709 limited
+/// range (matches the CPU converter in `super::convert` and the
+/// colorspace the encoder advertises). One thread per 2x2 pixel block.
+/// `r_off`/`g_off`/`b_off` are the byte offsets of the channels within a
+/// 4-byte pixel (RGBA = 0,1,2; BGRA = 2,1,0).
 const NV12_KERNEL_SRC: &str = r#"
 extern "C" __global__ void rgba_to_nv12(
     const unsigned char* __restrict__ src, unsigned long long src_pitch,
     unsigned char* __restrict__ y_plane, unsigned long long y_pitch,
     unsigned char* __restrict__ uv_plane, unsigned long long uv_pitch,
-    int width, int height)
+    int width, int height, int r_off, int g_off, int b_off)
 {
     int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     int yy = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
@@ -120,9 +122,9 @@ extern "C" __global__ void rgba_to_nv12(
         const unsigned char* row = src + (unsigned long long)(yy + dy) * src_pitch + x * 4;
         unsigned char* yrow = y_plane + (unsigned long long)(yy + dy) * y_pitch + x;
         for (int dx = 0; dx < 2; dx++) {
-            int r = row[dx * 4 + 0];
-            int g = row[dx * 4 + 1];
-            int b = row[dx * 4 + 2];
+            int r = row[dx * 4 + r_off];
+            int g = row[dx * 4 + g_off];
+            int b = row[dx * 4 + b_off];
             rsum += r; gsum += g; bsum += b;
             yrow[dx] = (unsigned char)(((47 * r + 157 * g + 16 * b + 128) >> 8) + 16);
         }
@@ -138,13 +140,20 @@ extern "C" __global__ void rgba_to_nv12(
 }
 "#;
 
-/// On-GPU RGBA→NV12 converter: NVRTC-compiled kernel plus a persistent
-/// pitched device buffer the GL texture is copied into before conversion.
-struct GpuNv12Converter {
+/// On-GPU RGB→NV12 converter: NVRTC-compiled kernel plus a persistent
+/// pitched device staging buffer the source pixels are copied into
+/// before conversion. Sources can be a GL texture (DMA-BUF path) or CPU
+/// memory (`MemFd` capture path, via a pinned staging buffer).
+pub(crate) struct GpuNv12Converter {
     module: cudarc::driver::sys::CUmodule,
     func: cudarc::driver::sys::CUfunction,
     rgba_buf: cudarc::driver::sys::CUdeviceptr,
     rgba_pitch: usize,
+    /// Pinned host staging buffer for CPU-frame uploads
+    /// (`rgba_pitch * height` bytes). Null until first use.
+    host_buf: *mut c_void,
+    width: u32,
+    height: u32,
 }
 
 impl GpuNv12Converter {
@@ -153,7 +162,7 @@ impl GpuNv12Converter {
     /// Requires the CUDA context to be current on this thread. Fails
     /// gracefully (caller falls back to the CPU path) when NVRTC is not
     /// available at runtime.
-    fn new(width: u32, height: u32) -> Result<Self, EncodeError> {
+    pub(crate) fn new(width: u32, height: u32) -> Result<Self, EncodeError> {
         use cudarc::driver::sys as cu;
 
         // cudarc panics (rather than returning Err) when libnvrtc.so cannot
@@ -212,13 +221,98 @@ impl GpuNv12Converter {
                 func,
                 rgba_buf,
                 rgba_pitch,
+                host_buf: ptr::null_mut(),
+                width,
+                height,
             })
+        }
+    }
+
+    /// Uploads a CPU 8-bit RGB frame (any stride and channel order) into
+    /// the staging device buffer through pinned host memory, then runs
+    /// the NV12 kernel into the given hardware-frame planes.
+    ///
+    /// `order` is the (R, G, B) byte-offset triple within each 4-byte
+    /// pixel. Requires the CUDA context to be current on this thread.
+    ///
+    /// # Safety
+    /// `y_plane` / `uv_plane` must be valid NV12 device planes of at
+    /// least `height` / `height / 2` rows with the given pitches.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn convert_host_frame(
+        &mut self,
+        data: &[u8],
+        src_stride: usize,
+        order: (usize, usize, usize),
+        y_plane: cudarc::driver::sys::CUdeviceptr,
+        y_pitch: usize,
+        uv_plane: cudarc::driver::sys::CUdeviceptr,
+        uv_pitch: usize,
+    ) -> Result<(), EncodeError> {
+        use cudarc::driver::sys as cu;
+
+        let h = self.height as usize;
+        let row_bytes = self.width as usize * 4;
+        let staging_size = self.rgba_pitch * h;
+        if data.len() < (h - 1) * src_stride + row_bytes {
+            return Err(EncodeError::EncodeFrameError {
+                frame: 0,
+                reason: format!(
+                    "frame data too short: {} bytes for {}x{} stride {src_stride}",
+                    data.len(),
+                    self.width,
+                    self.height
+                ),
+            });
+        }
+
+        unsafe {
+            if self.host_buf.is_null() {
+                let res = cu::cuMemHostAlloc(&raw mut self.host_buf, staging_size, 0);
+                if res != cu::CUresult::CUDA_SUCCESS {
+                    return Err(EncodeError::EncodeFrameError {
+                        frame: 0,
+                        reason: format!("cuMemHostAlloc({staging_size}) failed: {res:?}"),
+                    });
+                }
+            }
+
+            // Pack rows into the pinned buffer at the device pitch so a
+            // single linear host→device copy works.
+            let host = std::slice::from_raw_parts_mut(self.host_buf.cast::<u8>(), staging_size);
+            if src_stride == self.rgba_pitch {
+                host.copy_from_slice(&data[..staging_size]);
+            } else {
+                for y in 0..h {
+                    host[y * self.rgba_pitch..y * self.rgba_pitch + row_bytes]
+                        .copy_from_slice(&data[y * src_stride..y * src_stride + row_bytes]);
+                }
+            }
+
+            let res = cu::cuMemcpyHtoD_v2(self.rgba_buf, self.host_buf, staging_size);
+            if res != cu::CUresult::CUDA_SUCCESS {
+                return Err(EncodeError::EncodeFrameError {
+                    frame: 0,
+                    reason: format!("cuMemcpyHtoD (pinned→staging) failed: {res:?}"),
+                });
+            }
+
+            self.launch(
+                y_plane,
+                y_pitch,
+                uv_plane,
+                uv_pitch,
+                self.width,
+                self.height,
+                order,
+            )
         }
     }
 
     /// Launches the conversion kernel: staging RGBA buffer → NV12 planes.
     ///
     /// Requires the CUDA context to be current on this thread.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
         y_plane: cudarc::driver::sys::CUdeviceptr,
@@ -227,6 +321,7 @@ impl GpuNv12Converter {
         uv_pitch: usize,
         width: u32,
         height: u32,
+        order: (usize, usize, usize),
     ) -> Result<(), EncodeError> {
         use cudarc::driver::sys as cu;
 
@@ -235,8 +330,11 @@ impl GpuNv12Converter {
         let uv_pitch = uv_pitch as u64;
         let w = width.cast_signed();
         let h = height.cast_signed();
+        let r_off = i32::try_from(order.0).unwrap_or(0);
+        let g_off = i32::try_from(order.1).unwrap_or(1);
+        let b_off = i32::try_from(order.2).unwrap_or(2);
 
-        let mut params: [*mut c_void; 8] = [
+        let mut params: [*mut c_void; 11] = [
             ptr::from_ref(&self.rgba_buf).cast_mut().cast(),
             ptr::from_ref(&src_pitch).cast_mut().cast(),
             ptr::from_ref(&y_plane).cast_mut().cast(),
@@ -245,6 +343,9 @@ impl GpuNv12Converter {
             ptr::from_ref(&uv_pitch).cast_mut().cast(),
             ptr::from_ref(&w).cast_mut().cast(),
             ptr::from_ref(&h).cast_mut().cast(),
+            ptr::from_ref(&r_off).cast_mut().cast(),
+            ptr::from_ref(&g_off).cast_mut().cast(),
+            ptr::from_ref(&b_off).cast_mut().cast(),
         ];
 
         // One thread per 2x2 block.
@@ -272,13 +373,17 @@ impl GpuNv12Converter {
                     reason: format!("cuLaunchKernel(rgba_to_nv12) failed: {res:?}"),
                 });
             }
-            // The encoder consumes the frame on its own stream — make the
-            // conversion result visible before send_frame.
-            let res = cu::cuCtxSynchronize();
+            // The encoder consumes the frame outside our stream — the
+            // kernel's writes must be complete before send_frame. Sync
+            // only the default stream (our copy + kernel chain):
+            // cuCtxSynchronize would also wait on FFmpeg/NVENC's pending
+            // stream work and serialize conversion with the hardware
+            // encode of the previous frame (~10 ms/frame at 3440x1440).
+            let res = cu::cuStreamSynchronize(ptr::null_mut());
             if res != cu::CUresult::CUDA_SUCCESS {
                 return Err(EncodeError::EncodeFrameError {
                     frame: 0,
-                    reason: format!("cuCtxSynchronize after NV12 kernel failed: {res:?}"),
+                    reason: format!("cuStreamSynchronize after NV12 kernel failed: {res:?}"),
                 });
             }
         }
@@ -286,9 +391,16 @@ impl GpuNv12Converter {
     }
 }
 
+// Safety: only used on the dedicated encoder thread; the raw handles are
+// never shared across threads.
+unsafe impl Send for GpuNv12Converter {}
+
 impl Drop for GpuNv12Converter {
     fn drop(&mut self) {
         unsafe {
+            if !self.host_buf.is_null() {
+                cudarc::driver::sys::cuMemFreeHost(self.host_buf);
+            }
             if self.rgba_buf != 0 {
                 cudarc::driver::sys::cuMemFree_v2(self.rgba_buf);
             }
@@ -1001,6 +1113,8 @@ impl EglCudaBridge {
             let uv_plane = (*raw).data[1] as cu::CUdeviceptr;
             let y_pitch = usize::try_from((*raw).linesize[0]).unwrap_or(self.width as usize);
             let uv_pitch = usize::try_from((*raw).linesize[1]).unwrap_or(self.width as usize);
+            // The GL blit always writes RGBA regardless of the source
+            // DMA-BUF format.
             converter.launch(
                 y_plane,
                 y_pitch,
@@ -1008,6 +1122,7 @@ impl EglCudaBridge {
                 uv_pitch,
                 self.width,
                 self.height,
+                (0, 1, 2),
             )?;
         }
 
@@ -1017,8 +1132,6 @@ impl EglCudaBridge {
     /// Shared front half of both import paths: create the EGL image from
     /// the DMA-BUF and blit it into the persistent GL texture.
     fn import_and_blit(&self, info: &DmaBufInfo) -> Result<(), EncodeError> {
-        use std::os::unix::io::AsRawFd;
-
         // Ensure EGL context is current on this thread.
         self.egl
             .make_current(self.display, None, None, Some(self.context))
@@ -1026,6 +1139,19 @@ impl EglCudaBridge {
                 frame: 0,
                 reason: format!("eglMakeCurrent failed in import_and_blit: {e}"),
             })?;
+
+        let egl_image = self.create_egl_image(info)?;
+        let copy_result = unsafe { self.egl_image_to_gl_texture(egl_image) };
+
+        // Always destroy the EGL image (it's per-frame).
+        let _ = self.egl.destroy_image(self.display, egl_image);
+
+        copy_result
+    }
+
+    /// Creates a per-frame EGL image from a DMA-BUF fd.
+    fn create_egl_image(&self, info: &DmaBufInfo) -> Result<khronos_egl::Image, EncodeError> {
+        use std::os::unix::io::AsRawFd;
 
         let drm_fourcc = pixel_format_to_drm_fourcc(info.format);
 
@@ -1060,8 +1186,7 @@ impl EglCudaBridge {
 
         attribs.push(khronos_egl::ATTRIB_NONE);
 
-        let egl_image = self
-            .egl
+        self.egl
             .create_image(
                 self.display,
                 unsafe { khronos_egl::Context::from_ptr(khronos_egl::NO_CONTEXT) },
@@ -1072,14 +1197,7 @@ impl EglCudaBridge {
             .map_err(|e| EncodeError::EncodeFrameError {
                 frame: 0,
                 reason: format!("eglCreateImage (DMA-BUF) failed: {e}"),
-            })?;
-
-        let copy_result = unsafe { self.egl_image_to_gl_texture(egl_image) };
-
-        // Always destroy the EGL image (it's per-frame).
-        let _ = self.egl.destroy_image(self.display, egl_image);
-
-        copy_result
+            })
     }
 
     /// Import a DMA-BUF frame: EGL image → GL texture → CUDA device → CPU buffer.

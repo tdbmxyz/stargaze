@@ -148,6 +148,15 @@ pub(super) fn run_sdl_loop(
 ) -> Result<(), anyhow::Error> {
     let audio_queue: AudioQueue<f32> = create_audio_queue(sdl)?;
 
+    // The stream is BT.709 limited range (the server's converter and the
+    // encoder both advertise it). SDL's automatic mode picks BT.601 —
+    // sdl2-compat does so even for HD — which subtly shifts every color.
+    unsafe {
+        sdl2::sys::SDL_SetYUVConversionMode(
+            sdl2::sys::SDL_YUV_CONVERSION_MODE::SDL_YUV_CONVERSION_BT709,
+        );
+    }
+
     let video = sdl
         .video()
         .map_err(|e| anyhow!("SDL2 video init failed: {e}"))?;
@@ -532,5 +541,132 @@ fn map_gamepad_button(btn: sdl2::controller::Button) -> Option<GamepadButton> {
         sdl2::controller::Button::DPadLeft => Some(GamepadButton::DPadLeft),
         sdl2::controller::Button::DPadRight => Some(GamepadButton::DPadRight),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Renders known BT.709 limited-range YUV data through both an NV12
+    /// texture (the VAAPI decode path) and an IYUV texture (the software
+    /// decode path) and reads the composited pixels back.
+    ///
+    /// Catches platform/SDL regressions in NV12 rendering (colorspace,
+    /// UV interleave, plane upload) that unit tests can't see.
+    #[test]
+    #[ignore = "requires a display (Wayland/X11) and a GPU renderer"]
+    #[allow(clippy::similar_names)] // y/u/v/uv are the domain names
+    fn nv12_and_iyuv_render_the_same_bt709_colors() {
+        let (w, h) = (64u32, 608u32);
+
+        // BT.709 limited-range encodings produced by the server's converter:
+        // left half pure red, right half pure green.
+        let red = (63u8, 102u8, 240u8);
+        let green = (172u8, 41u8, 26u8);
+
+        let mut y_plane = vec![0u8; (w * h) as usize];
+        let mut u_plane = vec![0u8; (w * h / 4) as usize];
+        let mut v_plane = vec![0u8; (w * h / 4) as usize];
+        let mut uv_plane = vec![0u8; (w * h / 2) as usize];
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let (y, _, _) = if col < (w as usize) / 2 { red } else { green };
+                y_plane[row * w as usize + col] = y;
+            }
+        }
+        for row in 0..(h as usize) / 2 {
+            for col in 0..(w as usize) / 2 {
+                let (_, u, v) = if col < (w as usize) / 4 { red } else { green };
+                u_plane[row * (w as usize / 2) + col] = u;
+                v_plane[row * (w as usize / 2) + col] = v;
+                uv_plane[row * w as usize + col * 2] = u;
+                uv_plane[row * w as usize + col * 2 + 1] = v;
+            }
+        }
+
+        let sdl = sdl2::init().expect("SDL init");
+        // The stream is BT.709; SDL must not guess (sdl2-compat defaults
+        // to BT.601 regardless of resolution).
+        unsafe {
+            sdl2::sys::SDL_SetYUVConversionMode(
+                sdl2::sys::SDL_YUV_CONVERSION_MODE::SDL_YUV_CONVERSION_BT709,
+            );
+        }
+        let video = sdl.video().expect("SDL video");
+        let window = video
+            .window("stargaze-nv12-test", w, h)
+            .hidden()
+            .build()
+            .expect("window");
+        let mut canvas = window.into_canvas().build().expect("canvas");
+        eprintln!("SDL renderer: {}", canvas.info().name);
+        let texture_creator = canvas.texture_creator();
+
+        let mut readback = |format: sdl2::pixels::PixelFormatEnum| -> Vec<u8> {
+            let mut tex = texture_creator
+                .create_texture_streaming(format, w, h)
+                .expect("texture");
+            match format {
+                sdl2::pixels::PixelFormatEnum::NV12 => {
+                    let ret = unsafe {
+                        sdl2::sys::SDL_UpdateNVTexture(
+                            tex.raw(),
+                            std::ptr::null(),
+                            y_plane.as_ptr(),
+                            w.cast_signed(),
+                            uv_plane.as_ptr(),
+                            w.cast_signed(),
+                        )
+                    };
+                    assert_eq!(ret, 0, "SDL_UpdateNVTexture: {}", sdl2::get_error());
+                }
+                sdl2::pixels::PixelFormatEnum::IYUV => {
+                    tex.update_yuv(
+                        None,
+                        &y_plane,
+                        w as usize,
+                        &u_plane,
+                        w as usize / 2,
+                        &v_plane,
+                        w as usize / 2,
+                    )
+                    .expect("update_yuv");
+                }
+                _ => unreachable!(),
+            }
+            canvas.clear();
+            canvas.copy(&tex, None, None).expect("copy");
+            canvas
+                .read_pixels(None, sdl2::pixels::PixelFormatEnum::RGB24)
+                .expect("read_pixels")
+        };
+
+        let nv12 = readback(sdl2::pixels::PixelFormatEnum::NV12);
+        let iyuv = readback(sdl2::pixels::PixelFormatEnum::IYUV);
+
+        let sample = |buf: &[u8], x: usize, y: usize| -> (u8, u8, u8) {
+            let o = (y * w as usize + x) * 3;
+            (buf[o], buf[o + 1], buf[o + 2])
+        };
+        // Sample away from the half boundary (chroma filtering bleeds).
+        let report = |name: &str, buf: &[u8]| {
+            let r = sample(buf, 16, 300);
+            let g = sample(buf, 48, 300);
+            eprintln!(
+                "{name}: red half -> {r:?} (want ~(255,0,0)), green half -> {g:?} (want ~(0,255,0))"
+            );
+            (r, g)
+        };
+        let (nv_r, nv_g) = report("NV12", &nv12);
+        let (iy_r, iy_g) = report("IYUV", &iyuv);
+
+        let close = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            (i16::from(a.0) - i16::from(b.0)).abs() <= 12
+                && (i16::from(a.1) - i16::from(b.1)).abs() <= 12
+                && (i16::from(a.2) - i16::from(b.2)).abs() <= 12
+        };
+        assert!(close(iy_r, (255, 0, 0)), "IYUV red wrong: {iy_r:?}");
+        assert!(close(iy_g, (0, 255, 0)), "IYUV green wrong: {iy_g:?}");
+        assert!(close(nv_r, (255, 0, 0)), "NV12 red wrong: {nv_r:?}");
+        assert!(close(nv_g, (0, 255, 0)), "NV12 green wrong: {nv_g:?}");
     }
 }

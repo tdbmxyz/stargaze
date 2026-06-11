@@ -49,6 +49,13 @@ pub(crate) struct FfmpegEncoder {
     /// error log) once this hits `MAX_GPU_PATH_FAILURES` so a persistent
     /// failure can't silently pin every frame to the slow CPU fallback.
     gpu_path_failures: u32,
+    /// On-GPU converter for CPU-memory (`MemFd`/mmap) frames. Lazily
+    /// initialized on the first such frame; `None` until then or when
+    /// NVRTC is unavailable.
+    gpu_converter: Option<super::egl_cuda::GpuNv12Converter>,
+    /// Consecutive GPU conversion failures for CPU-memory frames; same
+    /// disable semantics as `gpu_path_failures`.
+    gpu_convert_failures: u32,
 }
 
 /// Consecutive GPU-path failures after which the GPU NV12 path is disabled.
@@ -60,14 +67,16 @@ unsafe impl Send for FfmpegEncoder {}
 
 impl Drop for FfmpegEncoder {
     fn drop(&mut self) {
-        // The EGL bridge holds CUDA resources (registered GL image, kernel
-        // module, device buffer) that belong to the context owned by
-        // `hw_device_ctx` — release them before the context can be
-        // destroyed, with the context current as the driver API requires.
-        if let Some(bridge) = self.egl_bridge.take() {
+        // The EGL bridge and the CPU-frame converter hold CUDA resources
+        // (registered GL image, kernel module, device/pinned buffers)
+        // that belong to the context owned by `hw_device_ctx` — release
+        // them before the context can be destroyed, with the context
+        // current as the driver API requires.
+        if self.egl_bridge.is_some() || self.gpu_converter.is_some() {
             unsafe {
                 let res = cudarc::driver::sys::cuCtxPushCurrent_v2(self.cuda_ctx);
-                drop(bridge);
+                drop(self.egl_bridge.take());
+                drop(self.gpu_converter.take());
                 if res == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                     let mut old: cudarc::driver::sys::CUcontext = ptr::null_mut();
                     cudarc::driver::sys::cuCtxPopCurrent_v2(&raw mut old);
@@ -310,6 +319,8 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
         sw_scaler: None,
         egl_bridge: None,
         gpu_path_failures: 0,
+        gpu_converter: None,
+        gpu_convert_failures: 0,
     })
 }
 
@@ -502,15 +513,42 @@ fn upload_cpu_data_and_encode(
 ) -> Result<(), EncodeError> {
     let w = width as usize;
     let h = height as usize;
+
+    let min_len = (h - 1) * stride as usize + w * bytes_per_pixel(format);
+    let direct = super::convert::channel_order(format).filter(|_| data.len() >= min_len);
+
+    // Fastest path: pinned upload + CUDA kernel straight into the
+    // encoder's hardware frame (~3 ms at 3440x1440 vs ~14 ms for the
+    // parallel CPU converter). Falls back to the CPU path per frame.
+    if let Some(order) = direct
+        && encoder.gpu_convert_failures < MAX_GPU_PATH_FAILURES
+    {
+        match gpu_convert_and_encode(encoder, data, width, height, stride, order, pts, force_idr) {
+            Ok(()) => {
+                encoder.gpu_convert_failures = 0;
+                return Ok(());
+            }
+            Err(e) => {
+                encoder.gpu_convert_failures += 1;
+                if encoder.gpu_convert_failures <= 3 {
+                    warn!(frame = pts, error = %e, "GPU conversion failed, using CPU fallback");
+                } else if encoder.gpu_convert_failures == MAX_GPU_PATH_FAILURES {
+                    error!(
+                        error = %e,
+                        "GPU conversion failed {MAX_GPU_PATH_FAILURES} frames in a row — \
+                         disabling it; encoding will stay on the slower CPU conversion path"
+                    );
+                }
+            }
+        }
+    }
+
     let mut nv12_frame =
         ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::NV12, width, height);
 
     // Fast path: direct parallel RGB→NV12 (BT.709, matching the encoder's
     // advertised colorspace). The sws path is single-threaded and was the
     // pipeline bottleneck at high resolutions.
-    let min_len = (h - 1) * stride as usize + w * bytes_per_pixel(format);
-    let direct = super::convert::channel_order(format).filter(|_| data.len() >= min_len);
-
     if let Some(order) = direct {
         let y_stride = nv12_frame.stride(0);
         let uv_stride = nv12_frame.stride(1);
@@ -567,6 +605,88 @@ fn upload_cpu_data_and_encode(
     }
 
     send_hw_frame(encoder, &mut hw_frame, pts, force_idr)
+}
+
+/// GPU conversion for CPU-memory frames: pinned host staging → CUDA
+/// kernel → NV12 hardware frame → NVENC, skipping the CPU converter and
+/// the separate NV12 upload.
+#[allow(clippy::too_many_arguments)]
+fn gpu_convert_and_encode(
+    encoder: &mut FfmpegEncoder,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    order: (usize, usize, usize),
+    pts: u64,
+    force_idr: bool,
+) -> Result<(), EncodeError> {
+    use cudarc::driver::sys as cu;
+
+    unsafe {
+        let res = cu::cuCtxPushCurrent_v2(encoder.cuda_ctx);
+        if res != cu::CUresult::CUDA_SUCCESS {
+            return Err(EncodeError::EncodeFrameError {
+                frame: pts,
+                reason: format!("cuCtxPushCurrent failed: {res:?}"),
+            });
+        }
+    }
+
+    let result = (|| {
+        if encoder.gpu_converter.is_none() {
+            match super::egl_cuda::GpuNv12Converter::new(width, height) {
+                Ok(conv) => encoder.gpu_converter = Some(conv),
+                Err(e) => {
+                    // Converter init failure (typically missing NVRTC) is
+                    // permanent — don't retry it every frame.
+                    encoder.gpu_convert_failures = MAX_GPU_PATH_FAILURES;
+                    warn!("GPU converter unavailable ({e}), using CPU conversion");
+                    return Err(e);
+                }
+            }
+        }
+
+        let mut hw_frame = ffmpeg_next::frame::Video::empty();
+        let ret = unsafe {
+            ffmpeg_sys_next::av_hwframe_get_buffer(encoder.hw_frames_ctx, hw_frame.as_mut_ptr(), 0)
+        };
+        if ret < 0 {
+            return Err(EncodeError::EncodeFrameError {
+                frame: pts,
+                reason: format!("av_hwframe_get_buffer failed (error code {ret})"),
+            });
+        }
+
+        unsafe {
+            let raw = hw_frame.as_mut_ptr();
+            let y_plane = (*raw).data[0] as cu::CUdeviceptr;
+            let uv_plane = (*raw).data[1] as cu::CUdeviceptr;
+            let y_pitch = usize::try_from((*raw).linesize[0]).unwrap_or(width as usize);
+            let uv_pitch = usize::try_from((*raw).linesize[1]).unwrap_or(width as usize);
+            encoder
+                .gpu_converter
+                .as_mut()
+                .expect("converter initialized above")
+                .convert_host_frame(
+                    data,
+                    stride as usize,
+                    order,
+                    y_plane,
+                    y_pitch,
+                    uv_plane,
+                    uv_pitch,
+                )?;
+        }
+
+        send_hw_frame(encoder, &mut hw_frame, pts, force_idr)
+    })();
+
+    unsafe {
+        let mut old: cu::CUcontext = ptr::null_mut();
+        cu::cuCtxPopCurrent_v2(&raw mut old);
+    }
+    result
 }
 
 /// Stamps pts / forced-IDR on a hardware frame and submits it to NVENC.
@@ -977,6 +1097,7 @@ mod tests {
     const GBM_BO_USE_RENDERING: u32 = 4;
     const GBM_BO_USE_LINEAR: u32 = 16;
     const GBM_BO_TRANSFER_WRITE: u32 = 2;
+    const GBM_BO_TRANSFER_READ: u32 = 1;
 
     /// A GBM-allocated linear buffer exported as a DMA-BUF, used to feed
     /// the encoder a real DMA-BUF without a compositor.
@@ -1091,13 +1212,52 @@ mod tests {
                     ptr.cast::<u8>(),
                     stride as usize * self.height as usize,
                 );
+                // Pattern encodes the absolute row in G (coarse) and R
+                // (fine): row = G * 8 + R / 32. Column (mod 256) is in B.
                 for y in 0..self.height as usize {
                     for x in 0..self.width as usize {
                         let o = y * stride as usize + x * 4;
                         buf[o] = (x % 256) as u8; // B
-                        buf[o + 1] = (y % 256) as u8; // G
-                        buf[o + 2] = ((x + y) % 256) as u8; // R
+                        buf[o + 1] = (y / 8) as u8; // G
+                        buf[o + 2] = ((y % 8) * 32) as u8; // R
                         buf[o + 3] = 255; // A
+                    }
+                }
+                bo_unmap(self.bo, map_data);
+            }
+            // Read back a few rows to verify the write actually reached
+            // the buffer object (NVIDIA's GBM map goes through a staging
+            // blit that could fail silently).
+            let mut stride = 0u32;
+            let mut map_data: *mut c_void = ptr::null_mut();
+            let ptr = unsafe {
+                bo_map(
+                    self.bo,
+                    0,
+                    0,
+                    self.width,
+                    self.height,
+                    GBM_BO_TRANSFER_READ,
+                    &raw mut stride,
+                    &raw mut map_data,
+                )
+            };
+            if ptr.is_null() {
+                eprintln!("readback map failed");
+                return;
+            }
+            unsafe {
+                let buf = std::slice::from_raw_parts(
+                    ptr.cast::<u8>(),
+                    stride as usize * self.height as usize,
+                );
+                let last = self.height as usize - 1;
+                for row in [0usize, last / 2, last] {
+                    let o = row * stride as usize + 8 * 4; // x = 8
+                    let expected = [8u8, (row / 8) as u8, ((row % 8) * 32) as u8, 255];
+                    let got = &buf[o..o + 4];
+                    if got != expected {
+                        eprintln!("fill readback row {row}: got {got:?} expected {expected:?}");
                     }
                 }
                 bo_unmap(self.bo, map_data);
@@ -1223,5 +1383,370 @@ mod tests {
         }
         assert!(count > 0, "encoder should have produced packets");
         assert!(got_keyframe, "first frame should be an IDR keyframe");
+    }
+
+    /// Encodes 30 frames of `buffer` and writes the raw HEVC bitstream to
+    /// `path`. When `use_gpu` is false the GPU NV12 path is disabled so
+    /// the frames take the CPU conversion fallback. Returns the per-frame
+    /// `upload_dmabuf_and_encode` durations and whether the GPU path
+    /// stayed active for every frame.
+    fn encode_frames_to_file(
+        use_gpu: bool,
+        buffer: &GbmTestBuffer,
+        path: &str,
+    ) -> (Vec<std::time::Duration>, bool) {
+        use std::io::Write;
+
+        let config = EncoderConfig {
+            width: buffer.width,
+            height: buffer.height,
+            framerate: 175,
+            bitrate_mbps: 60,
+            tuning: stargaze_core::config::EncoderTuning::default(),
+        };
+        let mut encoder = init_encoder(&config).expect("NVENC encoder init");
+        if !use_gpu {
+            encoder.gpu_path_failures = MAX_GPU_PATH_FAILURES;
+        }
+
+        let (packets_tx, mut packets_rx) = mpsc::channel::<EncodedPacket>(1024);
+        let mut packet = ffmpeg_next::Packet::empty();
+        let mut timings = Vec::new();
+
+        for pts in 0..30u64 {
+            let info = buffer.export().expect("DMA-BUF export");
+            let start = std::time::Instant::now();
+            upload_dmabuf_and_encode(&mut encoder, &info, pts, pts == 0)
+                .expect("DMA-BUF upload + encode");
+            timings.push(start.elapsed());
+            drain_packets(
+                &mut encoder.encoder,
+                &mut packet,
+                &packets_tx,
+                pts,
+                &encoder.extradata,
+                0,
+                0,
+                std::time::Instant::now(),
+            );
+        }
+        flush_encoder(
+            &mut encoder.encoder,
+            &mut packet,
+            &packets_tx,
+            &encoder.extradata,
+        );
+
+        let mut file = std::fs::File::create(path).expect("create bitstream file");
+        while let Ok(pkt) = packets_rx.try_recv() {
+            file.write_all(&pkt.data).expect("write bitstream");
+        }
+
+        let gpu_active = use_gpu && encoder.gpu_path_failures == 0;
+        (timings, gpu_active)
+    }
+
+    /// Diagnostic: encode the same full-resolution DMA-BUF through the
+    /// GPU NV12 path and the CPU fallback path, dump both bitstreams to
+    /// /tmp for visual comparison, and print per-frame timings.
+    ///
+    /// Decode the outputs with e.g.:
+    /// `ffmpeg -y -i /tmp/stargaze_gpu_path.h265 -frames:v 1 /tmp/gpu.png`
+    #[test]
+    #[ignore = "requires NVIDIA GPU, NVENC, NVRTC, and a DRM render node"]
+    fn gpu_vs_cpu_path_visual_diagnostic() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let buffer = GbmTestBuffer::new(3440, 1440).expect("GBM buffer allocation");
+        buffer.fill();
+
+        let (gpu_timings, gpu_active) =
+            encode_frames_to_file(true, &buffer, "/tmp/stargaze_gpu_path.h265");
+        assert!(gpu_active, "GPU path must stay active for every frame");
+        let (cpu_timings, _) = encode_frames_to_file(false, &buffer, "/tmp/stargaze_cpu_path.h265");
+
+        let report = |name: &str, timings: &[std::time::Duration]| {
+            // Skip the first frame (bridge/encoder warmup).
+            let us: Vec<u128> = timings
+                .iter()
+                .skip(1)
+                .map(std::time::Duration::as_micros)
+                .collect();
+            let avg = us.iter().sum::<u128>() / us.len() as u128;
+            let min = us.iter().min().copied().unwrap_or(0);
+            let max = us.iter().max().copied().unwrap_or(0);
+            eprintln!("{name}: avg {avg} us, min {min} us, max {max} us (29 frames)");
+        };
+        report("GPU path", &gpu_timings);
+        report("CPU path", &cpu_timings);
+    }
+
+    /// Diagnostic: bypass the encoder and inspect the raw output of the
+    /// EGL import + blit (via the GPU→CPU readback). Prints which source
+    /// row each output row actually contains.
+    #[test]
+    #[ignore = "requires NVIDIA GPU, NVENC, NVRTC, and a DRM render node"]
+    fn blit_row_mapping_diagnostic() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let (width, height) = (3440u32, 1440u32);
+        let buffer = GbmTestBuffer::new(width, height).expect("GBM buffer allocation");
+        buffer.fill();
+
+        let config = EncoderConfig {
+            width,
+            height,
+            framerate: 175,
+            bitrate_mbps: 60,
+            tuning: stargaze_core::config::EncoderTuning::default(),
+        };
+        let mut encoder = init_encoder(&config).expect("NVENC encoder init");
+
+        // One encode call to lazily initialize the EGL bridge.
+        let info = buffer.export().expect("DMA-BUF export");
+        upload_dmabuf_and_encode(&mut encoder, &info, 0, true).expect("encode");
+
+        unsafe {
+            let res = cudarc::driver::sys::cuCtxPushCurrent_v2(encoder.cuda_ctx);
+            assert_eq!(res, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+        }
+        let bridge = encoder.egl_bridge.as_ref().expect("bridge");
+        let info = buffer.export().expect("DMA-BUF export");
+        let rgba = bridge.import_dmabuf_to_cpu(&info).expect("blit readback");
+        unsafe {
+            let mut old: cudarc::driver::sys::CUcontext = ptr::null_mut();
+            cudarc::driver::sys::cuCtxPopCurrent_v2(&raw mut old);
+        }
+
+        report_row_mapping(&rgba, width, height, false);
+    }
+
+    /// Prints which source row each output row contains, given a
+    /// tightly-packed readback of a buffer filled by
+    /// [`GbmTestBuffer::fill`] (pattern: row = G*8 + R/32). `bgra` selects
+    /// the channel order of the readback (raw DMA-BUF bytes are BGRA, the
+    /// GL blit outputs RGBA).
+    #[allow(clippy::many_single_char_names)] // pixel/coordinate shorthand
+    fn report_row_mapping(rgba: &[u8], width: u32, height: u32, bgra: bool) {
+        let (r_off, b_off) = if bgra { (2, 0) } else { (0, 2) };
+        let w = width as usize;
+        let mut first_black = None;
+        for y in 0..height as usize {
+            let o = (y * w + 8) * 4;
+            let (r, g, b, a) = (rgba[o + r_off], rgba[o + 1], rgba[o + b_off], rgba[o + 3]);
+            if (r, g, b, a) == (0, 0, 0, 0) && first_black.is_none() {
+                first_black = Some(y);
+            }
+            if y % 64 == 0 || y == 455 || y == 456 || y == 1439 {
+                let src_row = usize::from(g) * 8 + usize::from(r) / 32;
+                eprintln!("out row {y}: rgba=({r},{g},{b},{a}) -> source row {src_row}");
+            }
+        }
+        eprintln!("first all-zero output row: {first_black:?}");
+    }
+
+    /// Builds a tightly-specified BGRA test frame: four solid quadrants
+    /// (red, green, blue, white) with `stride` bytes per row.
+    fn bgra_quadrant_frame(width: u32, height: u32, stride: usize) -> Vec<u8> {
+        let (w, h) = (width as usize, height as usize);
+        let mut data = vec![0u8; (h - 1) * stride + w * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let bgra: [u8; 4] = match (x < w / 2, y < h / 2) {
+                    (true, true) => [0, 0, 255, 255],       // red
+                    (false, true) => [0, 255, 0, 255],      // green
+                    (true, false) => [255, 0, 0, 255],      // blue
+                    (false, false) => [255, 255, 255, 255], // white
+                };
+                data[y * stride + x * 4..y * stride + x * 4 + 4].copy_from_slice(&bgra);
+            }
+        }
+        data
+    }
+
+    /// Encodes `frames` repetitions of a CPU-memory BGRA frame and
+    /// returns the encoded packets, whether the GPU converter handled
+    /// every frame, and the per-frame upload+encode durations.
+    fn encode_cpu_frames(
+        use_gpu: bool,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+        frames: u64,
+    ) -> (Vec<Vec<u8>>, bool, Vec<std::time::Duration>) {
+        // Tuning overridable for throughput experiments, e.g.
+        // STARGAZE_TEST_PRESET=p1 STARGAZE_TEST_MULTIPASS=disabled.
+        let tuning = stargaze_core::config::EncoderTuning {
+            preset: std::env::var("STARGAZE_TEST_PRESET").unwrap_or_else(|_| "p4".to_string()),
+            multipass: std::env::var("STARGAZE_TEST_MULTIPASS")
+                .unwrap_or_else(|_| "qres".to_string()),
+        };
+        let config = EncoderConfig {
+            width,
+            height,
+            framerate: 175,
+            bitrate_mbps: 60,
+            tuning,
+        };
+        let mut encoder = init_encoder(&config).expect("NVENC encoder init");
+        if !use_gpu {
+            encoder.gpu_convert_failures = MAX_GPU_PATH_FAILURES;
+        }
+
+        let (packets_tx, mut packets_rx) = mpsc::channel::<EncodedPacket>(1024);
+        let mut packet = ffmpeg_next::Packet::empty();
+        let mut timings = Vec::new();
+        for pts in 0..frames {
+            let start = std::time::Instant::now();
+            upload_cpu_data_and_encode(
+                &mut encoder,
+                data,
+                width,
+                height,
+                stride,
+                PixelFormat::Bgra8,
+                pts,
+                pts == 0,
+            )
+            .expect("upload + encode");
+            timings.push(start.elapsed());
+            drain_packets(
+                &mut encoder.encoder,
+                &mut packet,
+                &packets_tx,
+                pts,
+                &encoder.extradata,
+                0,
+                0,
+                std::time::Instant::now(),
+            );
+        }
+        flush_encoder(
+            &mut encoder.encoder,
+            &mut packet,
+            &packets_tx,
+            &encoder.extradata,
+        );
+
+        let mut packets = Vec::new();
+        while let Ok(pkt) = packets_rx.try_recv() {
+            packets.push(pkt.data);
+        }
+        let gpu_active =
+            use_gpu && encoder.gpu_convert_failures == 0 && encoder.gpu_converter.is_some();
+        (packets, gpu_active, timings)
+    }
+
+    /// Decodes HEVC packets with the software decoder and returns the
+    /// last decoded frame (YUV420P).
+    fn decode_packets(packets: &[Vec<u8>]) -> ffmpeg_next::frame::Video {
+        let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::HEVC).expect("HEVC decoder");
+        let ctx = ffmpeg_next::codec::Context::new_with_codec(codec);
+        let mut decoder = ctx.decoder().video().expect("video decoder");
+        // avcodec_receive_frame unrefs the destination on every call, so
+        // the last *successful* frame must be kept aside — the loop always
+        // ends with a failing call that would wipe it.
+        let mut frame = ffmpeg_next::frame::Video::empty();
+        let mut last = None;
+        for data in packets {
+            let pkt = ffmpeg_next::Packet::copy(data);
+            if decoder.send_packet(&pkt).is_ok() {
+                while decoder.receive_frame(&mut frame).is_ok() {
+                    last = Some(frame.clone());
+                }
+            }
+        }
+        let _ = decoder.send_eof();
+        while decoder.receive_frame(&mut frame).is_ok() {
+            last = Some(frame.clone());
+        }
+        last.expect("decoder should produce at least one frame")
+    }
+
+    /// Samples decoded Y/U/V at a pixel position (YUV420P layout).
+    fn sample_yuv(frame: &ffmpeg_next::frame::Video, x: usize, y: usize) -> (u8, u8, u8) {
+        let luma = frame.data(0)[y * frame.stride(0) + x];
+        let cb = frame.data(1)[(y / 2) * frame.stride(1) + x / 2];
+        let cr = frame.data(2)[(y / 2) * frame.stride(2) + x / 2];
+        (luma, cb, cr)
+    }
+
+    /// Round-trip correctness for CPU-memory (`MemFd`) frames through
+    /// both the GPU converter and the CPU fallback: known BGRA quadrants
+    /// must come back as the expected BT.709 limited-range YUV.
+    ///
+    /// This is the regression test for scrambled/discolored encodes: any
+    /// channel-order, stride, pitch, or layout bug in either conversion
+    /// path shifts the sampled values far beyond the tolerance.
+    #[test]
+    #[ignore = "requires NVIDIA GPU, NVENC, NVRTC"]
+    fn cpu_frame_gpu_and_cpu_conversions_round_trip_correct_colors() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        let (width, height) = (3440u32, 1440u32);
+        // Padded stride exercises the row-repacking path.
+        let stride = width as usize * 4 + 256;
+        let data = bgra_quadrant_frame(width, height, stride);
+
+        // BT.709 limited-range encodings of the quadrant colors
+        // (matching both converters' integer math).
+        let expected = [
+            ("red", (63u8, 102u8, 240u8)),
+            ("green", (172, 41, 26)),
+            ("blue", (31, 240, 118)),
+            ("white", (235, 128, 128)),
+        ];
+        let (w, h) = (width as usize, height as usize);
+        let centers = [
+            (w / 4, h / 4),
+            (3 * w / 4, h / 4),
+            (w / 4, 3 * h / 4),
+            (3 * w / 4, 3 * h / 4),
+        ];
+
+        for use_gpu in [true, false] {
+            let name = if use_gpu { "GPU" } else { "CPU" };
+            let (packets, gpu_active, timings) = encode_cpu_frames(
+                use_gpu,
+                &data,
+                width,
+                height,
+                u32::try_from(stride).expect("stride fits u32"),
+                10,
+            );
+            if use_gpu {
+                assert!(gpu_active, "GPU converter must handle every frame");
+            }
+            let us: Vec<u128> = timings
+                .iter()
+                .skip(1)
+                .map(std::time::Duration::as_micros)
+                .collect();
+            eprintln!(
+                "{name} conversion: avg {} us/frame (frames 1..10)",
+                us.iter().sum::<u128>() / us.len() as u128
+            );
+
+            let frame = decode_packets(&packets);
+            assert_eq!(frame.format(), ffmpeg_next::format::Pixel::YUV420P);
+            for ((color, (ey, eu, ev)), (cx, cy)) in expected.iter().zip(centers) {
+                let (luma, cb, cr) = sample_yuv(&frame, cx, cy);
+                let ok = (i16::from(luma) - i16::from(*ey)).abs() <= 12
+                    && (i16::from(cb) - i16::from(*eu)).abs() <= 12
+                    && (i16::from(cr) - i16::from(*ev)).abs() <= 12;
+                assert!(
+                    ok,
+                    "{name} path, {color} quadrant: got YUV ({luma},{cb},{cr}), \
+                     expected ~({ey},{eu},{ev})"
+                );
+            }
+        }
     }
 }

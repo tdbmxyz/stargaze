@@ -322,8 +322,13 @@ fn ack_format(stream: &pipewire::stream::Stream, modifier: u64) {
         info!("Requesting DMA-BUF buffers (modifier 0x{modifier:x})");
         1 << SPA_DATA_DMA_BUF
     } else {
-        info!("Requesting MemPtr + MemFd + DMA-BUF buffers (no real DRM modifier)");
-        (1 << SPA_DATA_MEM_PTR) | (1 << SPA_DATA_MEM_FD) | (1 << SPA_DATA_DMA_BUF)
+        // No DMA-BUF here on purpose: with a LINEAR (0) or invalid
+        // modifier the NVIDIA EGL/CUDA import reads the buffer scrambled
+        // (verified on driver 595.71.05 — the GPU-side view of a linear
+        // DMA-BUF doesn't match its actual memory). Shared-memory buffers
+        // are correct and the GPU converter keeps them fast.
+        info!("Requesting MemPtr + MemFd buffers (no real DRM modifier)");
+        (1 << SPA_DATA_MEM_PTR) | (1 << SPA_DATA_MEM_FD)
     };
 
     // 1. SPA_PARAM_Buffers — only dataType (producer owns buffer layout).
