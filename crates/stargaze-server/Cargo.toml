@@ -2,6 +2,7 @@
 name = "stargaze-server"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 stargaze-core = { path = "../stargaze-core" }

@@ -22,6 +22,8 @@ The project is inspired by the [Sunshine](https://github.com/LizardByte/Sunshine
 
 The goal is **not** to be feature-complete with Sunshine+Moonlight. The MVP targets a single specific use case (see below).
 
+The project is **licensed AGPL-3.0-or-later** (see `LICENSE`), chosen for GPL-3.0 compatibility with Sunshine/Moonlight as a precaution against derived/copied code. It is a personal, hardware-specific, largely vibe-coded project provided **as-is, with no warranty and no liability** on the author's part — portability beyond the owner's own setup is out of scope for now. Preserve SPDX/license metadata and do not relicense without explicit instruction.
+
 ## MVP Target Environment
 
 - **Server**: Linux Wayland (Hyprland), headless, NVIDIA GPU (modern — NVENC-capable)

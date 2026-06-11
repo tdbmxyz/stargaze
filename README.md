@@ -2,7 +2,10 @@
 
 A Rust-native, low-latency desktop and game streaming system for Linux/Wayland.
 
-Stargaze streams a Wayland desktop from a host machine (the **server**) to another machine on the LAN (the **client**) with hardware video encoding, Opus audio, and full keyboard/mouse/gamepad forwarding. It is inspired by the [Sunshine](https://github.com/LizardByte/Sunshine) + [Moonlight](https://github.com/moonlight-stream/moonlight-qt) ecosystem, rebuilt as a deliberately simple two-binary architecture in Rust.
+Stargaze streams a Wayland desktop from a host machine (the **server**) to another machine on the LAN (the **client**) with hardware video encoding, Opus audio, and full keyboard/mouse/gamepad forwarding. It is **largely inspired by** the [Sunshine](https://github.com/LizardByte/Sunshine) + [Moonlight](https://github.com/moonlight-stream/moonlight-qt) ecosystem, rebuilt as a deliberately simple two-binary architecture in Rust.
+
+> [!IMPORTANT]
+> **Status: personal project, "vibe-coded".** Stargaze is, for now, nearly fully vibe-coded — written largely through AI-assisted, exploratory iteration rather than a rigorous engineering process. It was built **specifically for the owner's own hardware** (a particular Hyprland + NVIDIA host and AMD client; see [Requirements](#requirements)) and there is **no plan to make it work on more devices for now**. Expect rough edges. Use at your own risk — see [License & disclaimer](#license--disclaimer).
 
 ## Features
 
@@ -123,3 +126,15 @@ RUST_LOG=debug stargaze-client --server 192.168.1.10
 ## Project status
 
 All MVP milestones (capture, encode, transport, decode, render, audio, input, mic forwarding, cursor) are implemented. See [`docs/roadmap.md`](docs/roadmap.md) for follow-up work and known issues, and [`AGENTS.md`](AGENTS.md) for architecture invariants and development conventions.
+
+This is a personal, hardware-specific project (see the note at the top). It is largely vibe-coded and targets only the owner's own setup; portability to other hardware, distributions, or compositors is explicitly out of scope for now.
+
+## License & disclaimer
+
+Stargaze is licensed under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later). See [`LICENSE`](LICENSE) for the full text.
+
+The AGPL-3.0 was chosen deliberately for **compatibility with the GPL-3.0** under which [Sunshine](https://github.com/LizardByte/Sunshine) and [Moonlight](https://github.com/moonlight-stream/moonlight-qt) are distributed — as a precaution, in case any code, patterns, or protocol details turn out to have been derived or copied from those projects. Licensing under a GPL-3.0-compatible copyleft license keeps Stargaze in the clear with respect to their terms.
+
+**No warranty.** This software is provided **"as is", without warranty of any kind**, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement, as set out in sections 15 and 16 of the AGPL-3.0.
+
+**No liability.** The owner/author cannot be held responsible or liable for anything arising from the use of this software — including any damage, data loss, or other consequences. **Only the end user is responsible** for how they build, run, and use it. By using Stargaze you accept all risk.
