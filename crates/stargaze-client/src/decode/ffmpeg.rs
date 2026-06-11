@@ -28,11 +28,21 @@ pub(crate) struct FfmpegDecoder {
     hw_device_ctx: *mut ffmpeg_sys_next::AVBufferRef,
     /// Whether the decoder is using hardware acceleration.
     hw_accel: bool,
-    /// Lazily created scaler to YUV420P (for non-YUV420P output).
-    scaler: Option<ffmpeg_next::software::scaling::Context>,
-    /// Reusable software frame for `av_hwframe_transfer_data`.
-    sw_frame: ffmpeg_next::frame::Video,
 }
+
+/// A decoded frame in CPU memory, shipped from the decode thread to the
+/// extraction thread so plane extraction overlaps the next decode.
+pub(crate) struct RawDecodedFrame {
+    /// CPU-side frame (NV12 after VAAPI transfer, YUV420P from software
+    /// decode). Buffers are refcounted `AVBuffer`s.
+    pub(crate) frame: ffmpeg_next::frame::Video,
+    /// Pipeline timings accumulated so far (decode_us already filled).
+    pub(crate) stats: FrameStats,
+}
+
+// Safety: the frame owns CPU-side refcounted buffers and is accessed by
+// one thread at a time (moved through the channel).
+unsafe impl Send for RawDecodedFrame {}
 
 // Safety: FfmpegDecoder is only used on the dedicated decoder thread.
 unsafe impl Send for FfmpegDecoder {}
@@ -203,8 +213,6 @@ fn init_vaapi_decoder(_config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeEr
         decoder,
         hw_device_ctx,
         hw_accel: true,
-        scaler: None,
-        sw_frame: ffmpeg_next::frame::Video::empty(),
     })
 }
 
@@ -244,8 +252,6 @@ fn init_software_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, Decode
         decoder,
         hw_device_ctx: ptr::null_mut(),
         hw_accel: false,
-        scaler: None,
-        sw_frame: ffmpeg_next::frame::Video::empty(),
     })
 }
 
@@ -263,10 +269,9 @@ fn init_software_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, Decode
 pub(crate) fn run_decode_loop(
     decoder: &mut FfmpegDecoder,
     frames_rx: &mut mpsc::Receiver<ReassembledFrame>,
-    decoded_tx: &std::sync::mpsc::Sender<DecodedFrame>,
+    raw_tx: &std::sync::mpsc::SyncSender<RawDecodedFrame>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<(), DecodeError> {
-    let mut decoded_frame = ffmpeg_next::frame::Video::empty();
     let mut packet_counter: u64 = 0;
 
     loop {
@@ -316,7 +321,7 @@ pub(crate) fn run_decode_loop(
             continue;
         }
 
-        drain_decoded_frames(decoder, &mut decoded_frame, decoded_tx, stats, decode_start)?;
+        drain_decoded_frames(decoder, raw_tx, stats, decode_start);
     }
 
     // Flush: send EOF and drain remaining frames.
@@ -325,15 +330,55 @@ pub(crate) fn run_decode_loop(
     } else {
         drain_decoded_frames(
             decoder,
-            &mut decoded_frame,
-            decoded_tx,
+            raw_tx,
             FrameStats::default(),
             std::time::Instant::now(),
-        )?;
+        );
     }
 
     info!("Decoder loop finished");
     Ok(())
+}
+
+/// Runs the plane-extraction loop on its own thread: receives raw CPU
+/// frames from the decode thread, extracts pixel planes in the frame's
+/// native layout, and sends [`DecodedFrame`]s to the renderer.
+///
+/// Running extraction separately overlaps the (expensive) VAAPI GPU→CPU
+/// transfer of the next frame with the plane copies of the current one.
+pub(crate) fn run_extract_loop(
+    raw_rx: &std::sync::mpsc::Receiver<RawDecodedFrame>,
+    decoded_tx: &std::sync::mpsc::Sender<DecodedFrame>,
+) {
+    let mut scaler: Option<ffmpeg_next::software::scaling::Context> = None;
+
+    while let Ok(raw) = raw_rx.recv() {
+        let frame = &raw.frame;
+        let (width, height, format) = (frame.width(), frame.height(), frame.format());
+
+        let mut output = if format == ffmpeg_next::format::Pixel::NV12 {
+            extract_nv12(frame, width, height)
+        } else if format == ffmpeg_next::format::Pixel::YUV420P {
+            extract_yuv420p(frame, width, height)
+        } else {
+            // Arbitrary format — convert via sws_scale.
+            match scale_to_yuv420p(&mut scaler, frame, width, height) {
+                Ok(yuv_frame) => extract_yuv420p(&yuv_frame, width, height),
+                Err(e) => {
+                    warn!("Frame conversion failed: {e}, skipping frame");
+                    continue;
+                }
+            }
+        };
+
+        output.stats = raw.stats;
+
+        if decoded_tx.send(output).is_err() {
+            info!("Decoded frame receiver dropped, stopping extraction");
+            return;
+        }
+    }
+    info!("Extraction loop finished");
 }
 
 /// Converts a duration to whole microseconds, saturating at `u32::MAX`.
@@ -341,17 +386,19 @@ fn saturating_us(d: std::time::Duration) -> u32 {
     u32::try_from(d.as_micros()).unwrap_or(u32::MAX)
 }
 
-/// Drains all available decoded frames from the codec, converts to YUV420P
-/// planes, and sends them to the renderer.
+/// Drains all available decoded frames from the codec, transfers hardware
+/// frames to CPU, and ships them to the extraction thread.
 fn drain_decoded_frames(
     decoder: &mut FfmpegDecoder,
-    decoded_frame: &mut ffmpeg_next::frame::Video,
-    decoded_tx: &std::sync::mpsc::Sender<DecodedFrame>,
+    raw_tx: &std::sync::mpsc::SyncSender<RawDecodedFrame>,
     stats: FrameStats,
     decode_start: std::time::Instant,
-) -> Result<(), DecodeError> {
+) {
     loop {
-        match decoder.decoder.receive_frame(decoded_frame) {
+        // A fresh frame each iteration: ownership moves to the extraction
+        // thread. receive_frame fills it from the decoder's buffer pool.
+        let mut decoded_frame = ffmpeg_next::frame::Video::empty();
+        match decoder.decoder.receive_frame(&mut decoded_frame) {
             Ok(()) => {}
             Err(ffmpeg_next::Error::Other {
                 errno: libc::EAGAIN,
@@ -366,10 +413,11 @@ fn drain_decoded_frames(
         let is_vaapi =
             decoder.hw_accel && decoded_frame.format() == ffmpeg_next::format::Pixel::VAAPI;
 
-        if is_vaapi {
+        let cpu_frame = if is_vaapi {
+            let mut sw_frame = ffmpeg_next::frame::Video::empty();
             let ret = unsafe {
                 ffmpeg_sys_next::av_hwframe_transfer_data(
-                    decoder.sw_frame.as_mut_ptr(),
+                    sw_frame.as_mut_ptr(),
                     decoded_frame.as_ptr(),
                     0,
                 )
@@ -378,84 +426,42 @@ fn drain_decoded_frames(
                 warn!("av_hwframe_transfer_data failed (error {ret}), skipping frame");
                 continue;
             }
-            decoder.sw_frame.set_pts(decoded_frame.pts());
-        }
-
-        // Pick the source frame: sw_frame after hw transfer, or decoded_frame.
-        let (width, height, format) = if is_vaapi {
-            (
-                decoder.sw_frame.width(),
-                decoder.sw_frame.height(),
-                decoder.sw_frame.format(),
-            )
+            sw_frame.set_pts(decoded_frame.pts());
+            sw_frame
         } else {
-            (
-                decoded_frame.width(),
-                decoded_frame.height(),
-                decoded_frame.format(),
-            )
+            decoded_frame
         };
 
         // Log decoded frame details for first few frames.
         static DIAG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let diag_n = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if diag_n < 5 {
-            let src = if is_vaapi {
-                &decoder.sw_frame
-            } else {
-                &*decoded_frame
-            };
             info!(
                 frame = diag_n,
-                decoded_width = width,
-                decoded_height = height,
-                decoded_format = ?format,
+                decoded_width = cpu_frame.width(),
+                decoded_height = cpu_frame.height(),
+                decoded_format = ?cpu_frame.format(),
                 hw_accel = decoder.hw_accel,
-                planes = src.planes(),
-                stride_0 = plane_stride(src, 0),
-                stride_1 = plane_stride(src, 1),
-                stride_2 = plane_stride(src, 2),
+                planes = cpu_frame.planes(),
+                stride_0 = plane_stride(&cpu_frame, 0),
+                stride_1 = plane_stride(&cpu_frame, 1),
+                stride_2 = plane_stride(&cpu_frame, 2),
                 "Decoded frame diagnostics"
             );
         }
 
-        // Extract planes in the decoder's native layout — the renderer
-        // uploads NV12 and I420 textures directly, so no repacking here.
-        // VAAPI typically transfers to NV12; software decode outputs YUV420P.
-        let mut output = if format == ffmpeg_next::format::Pixel::NV12 {
-            let src = if is_vaapi {
-                &decoder.sw_frame
-            } else {
-                &*decoded_frame
-            };
-            extract_nv12(src, width, height)
-        } else if format == ffmpeg_next::format::Pixel::YUV420P {
-            let src = if is_vaapi {
-                &decoder.sw_frame
-            } else {
-                &*decoded_frame
-            };
-            extract_yuv420p(src, width, height)
-        } else {
-            // Arbitrary format — use sws_scale to convert.  We must avoid
-            // holding a borrow on decoder.sw_frame while mutably borrowing
-            // decoder for the scaler, so always use decoded_frame here (the
-            // scaler handles any format, and this path is never VAAPI).
-            let yuv_frame = scale_to_yuv420p(decoder, decoded_frame, width, height)?;
-            extract_yuv420p(&yuv_frame, width, height)
+        let raw = RawDecodedFrame {
+            frame: cpu_frame,
+            stats: FrameStats {
+                decode_us: saturating_us(decode_start.elapsed()),
+                ..stats
+            },
         };
 
-        output.stats = FrameStats {
-            decode_us: saturating_us(decode_start.elapsed()),
-            ..stats
-        };
-
-        if decoded_tx.send(output).is_err() {
-            return Ok(());
+        if raw_tx.send(raw).is_err() {
+            return;
         }
     }
-
-    Ok(())
 }
 
 /// Returns the stride of plane `index`, or 0 if the frame has fewer planes.
@@ -537,13 +543,12 @@ fn copy_plane(data: &[u8], stride: usize, width: usize, height: usize) -> Vec<u8
 
 /// Uses sws_scale to convert an arbitrary pixel format to YUV420P.
 fn scale_to_yuv420p(
-    decoder: &mut FfmpegDecoder,
+    cached_scaler: &mut Option<ffmpeg_next::software::scaling::Context>,
     src: &ffmpeg_next::frame::Video,
     width: u32,
     height: u32,
 ) -> Result<ffmpeg_next::frame::Video, DecodeError> {
-    let needs_new = decoder
-        .scaler
+    let needs_new = cached_scaler
         .as_ref()
         .is_none_or(|s| s.input().width != width || s.input().height != height);
 
@@ -558,10 +563,10 @@ fn scale_to_yuv420p(
             ffmpeg_next::software::scaling::Flags::BILINEAR,
         )
         .map_err(|e| DecodeError::FfmpegError(format!("failed to create scaler: {e}")))?;
-        decoder.scaler = Some(scaler);
+        *cached_scaler = Some(scaler);
     }
 
-    let scaler = decoder.scaler.as_mut().expect("scaler just created");
+    let scaler = cached_scaler.as_mut().expect("scaler just created");
     let mut yuv =
         ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
     scaler
