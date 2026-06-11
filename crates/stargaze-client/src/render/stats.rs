@@ -140,6 +140,7 @@ impl StatsOverlay {
         };
 
         let capture_ms = avg(|s| s.capture_us);
+        let convert_ms = avg(|s| s.convert_us);
         let encode_ms = avg(|s| s.encode_us);
         let queue_ms = avg(|s| s.queue_us);
         let decode_ms = avg(|s| s.decode_us);
@@ -180,7 +181,7 @@ impl StatsOverlay {
         format!(
             "VIDEO   {video} (recv {recv_fps:.1} fps / render {render_fps:.1} fps)\n\
              BITRATE {mbps:.1} Mbps\n\
-             HOST    capture {capture_ms:.1} ms / encode {encode_ms:.1} ms\n\
+             HOST    capture {capture_ms:.1} / convert {convert_ms:.1} / encode {encode_ms:.1} ms\n\
              NETWORK rtt {:.1} ms / {net_dropped} dropped\n\
              CLIENT  queue {queue_ms:.1} ms / decode {decode_ms:.1} ms\n\
              FRAMES  {} rendered / {} superseded",
@@ -256,8 +257,12 @@ impl StatsRecorder {
 
     /// Records one decoded frame (rendered or superseded).
     pub(super) fn record(&mut self, stats: FrameStats) {
+        self.record_at(stats, Instant::now());
+    }
+
+    fn record_at(&mut self, stats: FrameStats, at: Instant) {
         self.samples.push(stats);
-        self.arrivals.push(Instant::now());
+        self.arrivals.push(at);
     }
 
     /// Writes the session report to `path`.
@@ -334,6 +339,7 @@ impl StatsRecorder {
                 .collect()
         };
         row("capture ms", &ms(|s| s.capture_us), true);
+        row("convert ms", &ms(|s| s.convert_us), true);
         row("encode ms", &ms(|s| s.encode_us), true);
         row("queue ms", &ms(|s| s.queue_us), true);
         row("decode ms", &ms(|s| s.decode_us), true);
@@ -344,19 +350,39 @@ impl StatsRecorder {
             .collect();
         row("frame KiB", &sizes, true);
 
-        // Instantaneous fps between consecutive decoded frames; for fps
-        // the *low* tail is the worst one.
-        let fps: Vec<f64> = self
-            .arrivals
-            .windows(2)
-            .filter_map(|w| {
-                let dt = w[1].duration_since(w[0]).as_secs_f64();
-                (dt > 0.0).then(|| 1.0 / dt)
-            })
-            .collect();
-        row("fps (5% low)", &fps, false);
+        // Frames per wall-clock second. Bucketing is robust against the
+        // bursty arrival pattern of the render loop (instantaneous 1/dt
+        // explodes when frames drain back-to-back). For fps the *low*
+        // tail is the worst one.
+        row("fps (per sec)", &self.fps_buckets(), false);
 
         out
+    }
+
+    /// Decoded-frame counts per whole elapsed second. The trailing
+    /// partial second is discarded so it doesn't read as a low outlier.
+    fn fps_buckets(&self) -> Vec<f64> {
+        let Some(first) = self.arrivals.first() else {
+            return Vec::new();
+        };
+        let total_secs = self
+            .arrivals
+            .last()
+            .map_or(0.0, |last| last.duration_since(*first).as_secs_f64());
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let buckets = total_secs.floor() as usize;
+        if buckets == 0 {
+            return Vec::new();
+        }
+        let mut counts = vec![0u32; buckets];
+        for t in &self.arrivals {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let idx = t.duration_since(*first).as_secs_f64().floor() as usize;
+            if idx < buckets {
+                counts[idx] += 1;
+            }
+        }
+        counts.into_iter().map(f64::from).collect()
     }
 }
 
@@ -413,6 +439,7 @@ mod tests {
     fn stats(capture_us: u32, encode_us: u32, queue_us: u32, decode_us: u32) -> FrameStats {
         FrameStats {
             capture_us,
+            convert_us: 1_000,
             encode_us,
             queue_us,
             decode_us,
@@ -443,8 +470,7 @@ mod tests {
         assert!(text.contains("VIDEO"), "missing video line: {text}");
         assert!(text.contains("1920x1080"));
         assert!(text.contains("HOST"));
-        assert!(text.contains("capture 2.0 ms"));
-        assert!(text.contains("encode 3.0 ms"));
+        assert!(text.contains("capture 2.0 / convert 1.0 / encode 3.0 ms"));
         assert!(text.contains("rtt 5.0 ms"));
         assert!(text.contains("7 dropped"));
         assert!(text.contains("queue 1.0 ms"));
@@ -512,12 +538,41 @@ mod tests {
         assert!(report.contains("frames rendered:   45"));
         assert!(report.contains("dropped (decoder backpressure): 5"));
         assert!(report.contains("capture ms"));
+        assert!(report.contains("convert ms"));
         assert!(report.contains("encode ms"));
         assert!(report.contains("queue ms"));
         assert!(report.contains("decode ms"));
         assert!(report.contains("frame KiB"));
-        assert!(report.contains("fps (5% low)"));
         assert!(report.contains("worst 5%"));
+    }
+
+    #[test]
+    fn fps_buckets_are_robust_to_bursty_arrivals() {
+        let mut recorder = StatsRecorder::new();
+        let t0 = Instant::now();
+        // 3 full seconds at 30 fps, but delivered in bursts: all 30
+        // frames of each second arrive within the same millisecond.
+        for sec in 0..3u64 {
+            for i in 0..30u64 {
+                recorder.record_at(
+                    stats(1, 1, 1, 1),
+                    t0 + Duration::from_secs(sec) + Duration::from_micros(i * 30),
+                );
+            }
+        }
+        // A trailing partial second that must be discarded.
+        recorder.record_at(stats(1, 1, 1, 1), t0 + Duration::from_secs(3));
+        recorder.record_at(stats(1, 1, 1, 1), t0 + Duration::from_millis(3_100));
+
+        let buckets = recorder.fps_buckets();
+        assert_eq!(buckets.len(), 3);
+        // Each full bucket holds ~30 frames; no million-fps outliers.
+        for b in &buckets {
+            assert!((29.0..=31.0).contains(b), "bucket out of range: {b}");
+        }
+
+        let s = summarize(&buckets, false).unwrap();
+        assert!(s.max <= 31.0, "max fps must stay sane, got {}", s.max);
     }
 
     #[test]

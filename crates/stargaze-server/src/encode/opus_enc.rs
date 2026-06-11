@@ -145,6 +145,7 @@ pub(crate) fn run_opus_encode_loop(
                 pts,
                 is_keyframe: false,
                 capture_us: 0,
+                convert_us: 0,
                 encode_us: 0,
             };
 

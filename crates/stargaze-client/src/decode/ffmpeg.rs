@@ -301,6 +301,7 @@ pub(crate) fn run_decode_loop(
         let decode_start = std::time::Instant::now();
         let stats = FrameStats {
             capture_us: frame.capture_us,
+            convert_us: frame.convert_us,
             encode_us: frame.encode_us,
             queue_us: saturating_us(decode_start.duration_since(frame.received_at)),
             decode_us: 0, // filled in when the decoded frame pops out

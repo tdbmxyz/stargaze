@@ -82,6 +82,7 @@ async fn test_transport_localhost_round_trip() {
                     pts: u64::try_from(frame_idx).unwrap(),
                     is_keyframe: frame_idx == 0,
                     capture_us: u32::MAX,
+                    convert_us: u32::MAX,
                     encode_us: u32::MAX,
                 };
                 let header_size = serialize_header(&sample_header).unwrap().len();
@@ -101,6 +102,7 @@ async fn test_transport_localhost_round_trip() {
                         pts: u64::try_from(frame_idx).unwrap(),
                         is_keyframe: frame_idx == 0,
                         capture_us: 1_000,
+                        convert_us: 1_500,
                         encode_us: 2_000,
                     };
 

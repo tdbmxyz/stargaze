@@ -39,6 +39,8 @@ pub struct DecodedFrame {
 pub struct FrameStats {
     /// Host: capture → start of encoding.
     pub capture_us: u32,
+    /// Host: frame preparation (pixel conversion + GPU upload).
+    pub convert_us: u32,
     /// Host: encode duration.
     pub encode_us: u32,
     /// Client: frame fully received → decode started.

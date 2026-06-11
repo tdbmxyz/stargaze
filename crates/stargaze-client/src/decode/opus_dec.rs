@@ -200,6 +200,7 @@ mod tests {
                     is_keyframe: false,
                     data: encoded[..encoded_len].to_vec(),
                     capture_us: 0,
+                    convert_us: 0,
                     encode_us: 0,
                     received_at: std::time::Instant::now(),
                 })

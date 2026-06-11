@@ -12,6 +12,9 @@ pub struct EncodedPacket {
     /// Microseconds from capture to the start of encoding (host side).
     /// Zero when unknown (e.g. audio packets).
     pub capture_us: u32,
+    /// Microseconds spent preparing the frame for the encoder (pixel
+    /// format conversion + GPU upload). Zero when unknown.
+    pub convert_us: u32,
     /// Microseconds spent encoding (host side). Zero when unknown.
     pub encode_us: u32,
 }
@@ -101,6 +104,7 @@ mod tests {
             pts: 0,
             is_keyframe: true,
             capture_us: 0,
+            convert_us: 0,
             encode_us: 0,
         };
         assert_eq!(pkt.data.len(), 6);

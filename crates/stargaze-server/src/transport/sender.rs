@@ -225,6 +225,7 @@ pub(crate) async fn send_packets(
                 pts: pkt.pts,
                 is_keyframe: pkt.is_keyframe,
                 capture_us: pkt.capture_us,
+                convert_us: pkt.convert_us,
                 encode_us: pkt.encode_us,
             };
 

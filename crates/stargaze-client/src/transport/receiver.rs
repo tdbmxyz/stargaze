@@ -117,6 +117,8 @@ struct PendingFrame {
     stream_type: u8,
     /// Host-side capture→encode latency in microseconds.
     capture_us: u32,
+    /// Host-side frame preparation (convert + upload) in microseconds.
+    convert_us: u32,
     /// Host-side encode duration in microseconds.
     encode_us: u32,
 }
@@ -184,6 +186,7 @@ impl FrameAssembler {
             is_keyframe: header.is_keyframe,
             stream_type: header.stream_type,
             capture_us: header.capture_us,
+            convert_us: header.convert_us,
             encode_us: header.encode_us,
         });
 
@@ -232,6 +235,7 @@ impl FrameAssembler {
             is_keyframe: pending.is_keyframe,
             stream_type: pending.stream_type,
             capture_us: pending.capture_us,
+            convert_us: pending.convert_us,
             encode_us: pending.encode_us,
             received_at: Instant::now(),
         })
@@ -453,6 +457,7 @@ mod tests {
             pts,
             is_keyframe,
             capture_us: 0,
+            convert_us: 0,
             encode_us: 0,
         }
     }

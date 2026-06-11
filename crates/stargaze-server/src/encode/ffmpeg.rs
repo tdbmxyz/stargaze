@@ -342,8 +342,8 @@ pub(crate) fn run_encode_loop(
         if frame_counter == 0 {
             info!("First frame received from capture pipeline, uploading to encoder");
         }
-        let encode_start = std::time::Instant::now();
-        let capture_us = saturating_us(encode_start - captured.captured_at);
+        let prep_start = std::time::Instant::now();
+        let capture_us = saturating_us(prep_start - captured.captured_at);
         match upload_and_encode(encoder, &frame, frame_counter, force_idr) {
             Ok(()) => {}
             Err(e) => {
@@ -352,6 +352,8 @@ pub(crate) fn run_encode_loop(
                 continue;
             }
         }
+        // Frame preparation: pixel conversion + GPU upload + send_frame.
+        let convert_us = saturating_us(prep_start.elapsed());
 
         // Receive encoded packets.
         drain_packets(
@@ -361,7 +363,8 @@ pub(crate) fn run_encode_loop(
             frame_counter,
             &encoder.extradata,
             capture_us,
-            encode_start,
+            convert_us,
+            std::time::Instant::now(),
         );
 
         frame_counter += 1;
@@ -453,9 +456,12 @@ fn upload_and_encode(
     }
 }
 
-/// Copies CPU-accessible pixel data into an `FFmpeg` software frame, converts
-/// to NV12 via `sws_scale`, uploads to a CUDA hardware frame, and sends it
-/// to the encoder. Used by both `CpuMapped` and `DmaBuf` (mmap'd) paths.
+/// Converts CPU-accessible pixel data to NV12, uploads to a CUDA hardware
+/// frame, and sends it to the encoder. Used by both `CpuMapped` and
+/// `DmaBuf` (mmap'd) paths.
+///
+/// 8-bit RGB formats take the multithreaded direct converter; other
+/// formats (NV12 input, 10-bit) fall back to `sws_scale`.
 #[allow(clippy::too_many_arguments)]
 fn upload_cpu_data_and_encode(
     encoder: &mut FfmpegEncoder,
@@ -467,56 +473,50 @@ fn upload_cpu_data_and_encode(
     pts: u64,
     force_idr: bool,
 ) -> Result<(), EncodeError> {
-    let ffmpeg_fmt = capture_format_to_ffmpeg(format);
-    let bpp = bytes_per_pixel(format);
-
-    let mut sw_frame = ffmpeg_next::frame::Video::new(ffmpeg_fmt, width, height);
-
-    let dst_stride = sw_frame.stride(0);
-    if pts < 3 {
-        tracing::info!(
-            src_len = data.len(),
-            src_stride = stride,
-            dst_stride,
-            width,
-            height,
-            bpp,
-            expected_row = width as usize * bpp,
-            "upload_cpu_data row copy params"
-        );
-    }
-    let dst_data = sw_frame.data_mut(0);
-    for y in 0..height as usize {
-        let src_offset = y * stride as usize;
-        let dst_offset = y * dst_stride;
-        let copy_len = (width as usize * bpp).min(stride as usize).min(dst_stride);
-        if src_offset + copy_len <= data.len() && dst_offset + copy_len <= dst_data.len() {
-            dst_data[dst_offset..dst_offset + copy_len]
-                .copy_from_slice(&data[src_offset..src_offset + copy_len]);
-        }
-    }
-
-    let scaler = encoder.sw_scaler.get_or_insert_with(|| {
-        ffmpeg_next::software::scaling::Context::get(
-            ffmpeg_fmt,
-            width,
-            height,
-            ffmpeg_next::format::Pixel::NV12,
-            width,
-            height,
-            ffmpeg_next::software::scaling::Flags::BILINEAR,
-        )
-        .expect("failed to create capture→NV12 scaler")
-    });
-
+    let w = width as usize;
+    let h = height as usize;
     let mut nv12_frame =
         ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::NV12, width, height);
-    scaler
-        .run(&sw_frame, &mut nv12_frame)
-        .map_err(|e| EncodeError::EncodeFrameError {
-            frame: pts,
-            reason: format!("capture→NV12 scaling failed: {e}"),
-        })?;
+
+    // Fast path: direct parallel RGB→NV12 (BT.709, matching the encoder's
+    // advertised colorspace). The sws path is single-threaded and was the
+    // pipeline bottleneck at high resolutions.
+    let min_len = (h - 1) * stride as usize + w * bytes_per_pixel(format);
+    let direct = super::convert::channel_order(format).filter(|_| data.len() >= min_len);
+
+    if let Some(order) = direct {
+        let y_stride = nv12_frame.stride(0);
+        let uv_stride = nv12_frame.stride(1);
+        // Both planes are borrowed mutably at once; the raw slices are
+        // disjoint (separate plane allocations within the frame buffer).
+        unsafe {
+            let raw = nv12_frame.as_mut_ptr();
+            let y_plane = std::slice::from_raw_parts_mut((*raw).data[0], y_stride * h);
+            let uv_plane = std::slice::from_raw_parts_mut((*raw).data[1], uv_stride * (h / 2));
+            super::convert::convert_to_nv12(
+                data,
+                stride as usize,
+                w,
+                h,
+                order,
+                y_plane,
+                y_stride,
+                uv_plane,
+                uv_stride,
+            );
+        }
+    } else {
+        upload_via_sws(
+            encoder,
+            data,
+            width,
+            height,
+            stride,
+            format,
+            pts,
+            &mut nv12_frame,
+        )?;
+    }
 
     let mut hw_frame = ffmpeg_next::frame::Video::empty();
     let ret = unsafe {
@@ -554,6 +554,57 @@ fn upload_cpu_data_and_encode(
         })?;
 
     Ok(())
+}
+
+/// Legacy conversion path via `sws_scale` for formats the direct
+/// converter doesn't handle (NV12 input, 10-bit RGB).
+#[allow(clippy::too_many_arguments)]
+fn upload_via_sws(
+    encoder: &mut FfmpegEncoder,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: PixelFormat,
+    pts: u64,
+    nv12_frame: &mut ffmpeg_next::frame::Video,
+) -> Result<(), EncodeError> {
+    let ffmpeg_fmt = capture_format_to_ffmpeg(format);
+    let bpp = bytes_per_pixel(format);
+
+    let mut sw_frame = ffmpeg_next::frame::Video::new(ffmpeg_fmt, width, height);
+    let dst_stride = sw_frame.stride(0);
+    let dst_data = sw_frame.data_mut(0);
+    for y in 0..height as usize {
+        let src_offset = y * stride as usize;
+        let dst_offset = y * dst_stride;
+        let copy_len = (width as usize * bpp).min(stride as usize).min(dst_stride);
+        if src_offset + copy_len <= data.len() && dst_offset + copy_len <= dst_data.len() {
+            dst_data[dst_offset..dst_offset + copy_len]
+                .copy_from_slice(&data[src_offset..src_offset + copy_len]);
+        }
+    }
+
+    let scaler = encoder.sw_scaler.get_or_insert_with(|| {
+        ffmpeg_next::software::scaling::Context::get(
+            ffmpeg_fmt,
+            width,
+            height,
+            ffmpeg_next::format::Pixel::NV12,
+            width,
+            height,
+            ffmpeg_next::software::scaling::Flags::BILINEAR,
+        )
+        .expect("failed to create capture→NV12 scaler")
+    });
+
+    scaler
+        .run(&sw_frame, nv12_frame)
+        .map_err(|e| EncodeError::EncodeFrameError {
+            frame: pts,
+            reason: format!("capture→NV12 scaling failed: {e}"),
+        })
+        .map(|_| ())
 }
 
 fn upload_dmabuf_and_encode(
@@ -728,6 +779,7 @@ fn drain_packets(
     frame_counter: u64,
     extradata: &[u8],
     capture_us: u32,
+    convert_us: u32,
     encode_start: std::time::Instant,
 ) {
     loop {
@@ -761,6 +813,7 @@ fn drain_packets(
                     pts: packet.pts().unwrap_or(0).cast_unsigned(),
                     is_keyframe,
                     capture_us,
+                    convert_us,
                     encode_us: saturating_us(encode_start.elapsed()),
                 };
 
@@ -819,6 +872,7 @@ fn flush_encoder(
             pts: packet.pts().unwrap_or(0).cast_unsigned(),
             is_keyframe,
             capture_us: 0,
+            convert_us: 0,
             encode_us: 0,
         };
 

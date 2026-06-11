@@ -28,7 +28,7 @@ pub const IDR_RATE_LIMIT_MS: u64 = 100;
 /// on field values.  This constant is safe for any field combination and
 /// avoids the need to serialize a sample header just to measure its
 /// length.
-pub const HEADER_SIZE_UPPER_BOUND: usize = 32;
+pub const HEADER_SIZE_UPPER_BOUND: usize = 44;
 
 /// Initial QUIC MTU for LAN streaming (1500 Ethernet − 20 IP − 8 UDP − 20 headroom).
 pub const STREAMING_INITIAL_MTU: u16 = 1452;
@@ -59,6 +59,8 @@ pub struct DatagramHeader {
     pub is_keyframe: bool,
     /// Host-side capture→encode latency in microseconds (0 = unknown).
     pub capture_us: u32,
+    /// Host-side frame preparation (convert + upload) in microseconds.
+    pub convert_us: u32,
     /// Host-side encode duration in microseconds (0 = unknown).
     pub encode_us: u32,
 }
@@ -126,6 +128,8 @@ pub struct ReassembledFrame {
     pub stream_type: u8,
     /// Host-side capture→encode latency in microseconds (0 = unknown).
     pub capture_us: u32,
+    /// Host-side frame preparation (convert + upload) in microseconds.
+    pub convert_us: u32,
     /// Host-side encode duration in microseconds (0 = unknown).
     pub encode_us: u32,
     /// When the frame finished reassembling on the client.
@@ -224,6 +228,7 @@ mod tests {
             pts: 12345,
             is_keyframe: true,
             capture_us: 2_100,
+            convert_us: 1_500,
             encode_us: 3_400,
         };
         let bytes = serialize_header(&header).unwrap();
@@ -242,6 +247,7 @@ mod tests {
             pts: 0,
             is_keyframe: false,
             capture_us: 0,
+            convert_us: 0,
             encode_us: 0,
         };
         let header_bytes = serialize_header(&header).unwrap();
@@ -349,6 +355,7 @@ mod tests {
             is_keyframe: false,
             stream_type: STREAM_TYPE_VIDEO,
             capture_us: 0,
+            convert_us: 0,
             encode_us: 0,
             received_at: std::time::Instant::now(),
         };
