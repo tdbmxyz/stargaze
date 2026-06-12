@@ -129,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         video_frames,
         audio_frames,
         transport_input_tx,
+        decoder_idr_tx,
         rtt_probe,
         net_stats,
     ) = transport::connect(&cfg, session_request).await?;
@@ -187,8 +188,8 @@ async fn main() -> anyhow::Result<()> {
         decode::start_audio_decoder(audio_decoder_config, audio_frames)?;
 
     // Start the video decoder thread.
-    let (video_decoder_session, decoded_rx) =
-        decode::start_decoder(decoder_config.clone(), video_frames)?;
+    let (video_decoder_session, decoded_rx, zero_copy) =
+        decode::start_decoder(decoder_config.clone(), video_frames, decoder_idr_tx)?;
 
     let session_commands = render::SessionCommands {
         server: session_params.server_command.clone(),
@@ -209,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
             net_stats,
             cli.stats_file.clone(),
             &session_commands,
+            &zero_copy,
         )
     })?;
 

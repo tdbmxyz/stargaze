@@ -313,20 +313,44 @@ impl Default for FrameAssembler {
 /// # Errors
 ///
 /// Returns `TransportError` on fatal errors.
+/// Sends an `IdrRequest` on the control stream (best effort).
+async fn send_idr_request(control_send: &mut quinn::SendStream) -> Result<(), TransportError> {
+    let idr_msg = serialize_control_message(&ControlMessage::IdrRequest)?;
+    if let Err(e) = control_send.write_all(&idr_msg).await {
+        warn!("Failed to send IDR request: {e}");
+    }
+    Ok(())
+}
+
 pub(crate) async fn receive_loop(
     connection: quinn::Connection,
     mut control_send: quinn::SendStream,
     video_tx: mpsc::Sender<ReassembledFrame>,
     audio_tx: mpsc::Sender<ReassembledFrame>,
     mut input_rx: mpsc::Receiver<InputEvent>,
+    mut decoder_idr_rx: mpsc::Receiver<()>,
     net_stats: &super::NetStats,
 ) -> Result<(), TransportError> {
     use std::sync::atomic::Ordering;
     let mut assembler = FrameAssembler::new();
     let mut total_frames: u64 = 0;
+    let mut decoder_idr_open = true;
 
     loop {
         tokio::select! {
+            // Keyframe requests from the decoder (after decode failures);
+            // rate-limited like every other IDR request.
+            idr = decoder_idr_rx.recv(), if decoder_idr_open => {
+                match idr {
+                    Some(()) if assembler.should_request_idr() => {
+                        debug!("Requesting IDR keyframe (decoder recovery)");
+                        send_idr_request(&mut control_send).await?;
+                    }
+                    Some(()) => {}
+                    None => decoder_idr_open = false,
+                }
+            }
+
             datagram_result = connection.read_datagram() => {
                 let datagram = match datagram_result {
                     Ok(bytes) => bytes,
@@ -418,10 +442,7 @@ pub(crate) async fn receive_loop(
 
                 if need_idr {
                     debug!("Requesting IDR keyframe");
-                    let idr_msg = serialize_control_message(&ControlMessage::IdrRequest)?;
-                    if let Err(e) = control_send.write_all(&idr_msg).await {
-                        warn!("Failed to send IDR request: {e}");
-                    }
+                    send_idr_request(&mut control_send).await?;
                 }
             }
 

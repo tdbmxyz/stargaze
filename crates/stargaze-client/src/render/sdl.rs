@@ -1,16 +1,19 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::anyhow;
 use sdl2::audio::AudioQueue;
 use sdl2::controller::GameController;
-use stargaze_core::decode::{DecodedFrame, DecoderConfig, FramePixels};
+use stargaze_core::decode::{DecoderConfig, FramePixels};
 use stargaze_core::input::{GamepadAxis, GamepadButton, InputEvent, MouseButton};
 use tracing::{info, warn};
 
 use super::SessionCommands;
 use super::audio::create_audio_queue;
+use super::gl::GlRenderer;
 use super::input::{InputTracker, PadSlots, ShortcutAction, shortcut_action};
 use super::stats::{ReportMeta, StatsOverlay, StatsRecorder, draw_overlay};
+use crate::decode::VideoFrame;
 use crate::transport::NetStats;
 
 /// Window title shown while input is captured ("inside" mode).
@@ -91,10 +94,9 @@ impl Controllers {
 /// mouse act on the local desktop.
 fn apply_capture_mode(
     captured: bool,
-    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    window: &mut sdl2::video::Window,
     mouse: &sdl2::mouse::MouseUtil,
 ) {
-    let window = canvas.window_mut();
     window.set_keyboard_grab(captured);
     let title = if captured {
         TITLE_CAPTURED
@@ -118,8 +120,7 @@ fn apply_capture_mode(
 }
 
 /// Toggles the window between windowed and borderless fullscreen.
-fn toggle_fullscreen(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>) {
-    let window = canvas.window_mut();
+fn toggle_fullscreen(window: &mut sdl2::video::Window) {
     let target = if window.fullscreen_state() == sdl2::video::FullscreenType::Off {
         sdl2::video::FullscreenType::Desktop
     } else {
@@ -127,6 +128,182 @@ fn toggle_fullscreen(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>) {
     };
     if let Err(e) = window.set_fullscreen(target) {
         warn!("Failed to toggle fullscreen: {e}");
+    }
+}
+
+/// The SDL-canvas presentation path: streaming YUV textures uploaded from
+/// CPU frames. Used for software decode, and as the fallback when the GL
+/// renderer can't be created.
+struct CanvasBackend {
+    canvas: sdl2::render::Canvas<sdl2::video::Window>,
+    texture_creator: sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+    /// The streaming texture, created on the first decoded frame in the
+    /// decoder's native pixel layout (NV12 for hardware decode, IYUV for
+    /// software decode), and recreated if the layout changes mid-session.
+    texture: Option<(sdl2::pixels::PixelFormatEnum, sdl2::render::Texture)>,
+    width: u32,
+    height: u32,
+    dmabuf_warned: bool,
+}
+
+impl CanvasBackend {
+    fn new(
+        video: &sdl2::VideoSubsystem,
+        config: &DecoderConfig,
+        fullscreen: bool,
+    ) -> Result<Self, anyhow::Error> {
+        let mut window_builder = video.window("Stargaze", config.width, config.height);
+        window_builder.position_centered();
+        if fullscreen {
+            window_builder.fullscreen_desktop();
+        }
+        let window = window_builder
+            .build()
+            .map_err(|e| anyhow!("window creation failed: {e}"))?;
+
+        let canvas = window
+            .into_canvas()
+            .accelerated()
+            .build()
+            .map_err(|e| anyhow!("canvas creation failed: {e}"))?;
+        let texture_creator = canvas.texture_creator();
+
+        Ok(Self {
+            canvas,
+            texture_creator,
+            texture: None,
+            width: config.width,
+            height: config.height,
+            dmabuf_warned: false,
+        })
+    }
+
+    fn present(
+        &mut self,
+        frame: &VideoFrame,
+        overlay_text: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        let frame = match frame {
+            VideoFrame::Cpu(frame) => frame,
+            VideoFrame::DmaBuf(_) => {
+                // Only reachable for frames already in flight while the
+                // pipeline switches to CPU frames after a GL failure.
+                if !self.dmabuf_warned {
+                    warn!("Canvas renderer can't draw dma-buf frames, skipping");
+                    self.dmabuf_warned = true;
+                }
+                return Ok(());
+            }
+        };
+
+        let wanted_format = match &frame.pixels {
+            FramePixels::I420 { .. } => sdl2::pixels::PixelFormatEnum::IYUV,
+            FramePixels::Nv12 { .. } => sdl2::pixels::PixelFormatEnum::NV12,
+        };
+
+        static RENDER_DIAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let rn = RENDER_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if rn < 5 {
+            info!(
+                frame_n = rn,
+                frame_width = frame.width,
+                frame_height = frame.height,
+                texture_width = self.width,
+                texture_height = self.height,
+                texture_format = ?wanted_format,
+                "SDL render diagnostics"
+            );
+        }
+
+        let tex = match &mut self.texture {
+            Some((fmt, tex)) if *fmt == wanted_format => tex,
+            slot => {
+                let tex = self
+                    .texture_creator
+                    .create_texture_streaming(wanted_format, self.width, self.height)
+                    .map_err(|e| anyhow!("texture creation failed: {e}"))?;
+                info!(format = ?wanted_format, "Created streaming texture");
+                &mut slot.insert((wanted_format, tex)).1
+            }
+        };
+
+        let y_pitch = frame.width as usize;
+        match &frame.pixels {
+            FramePixels::I420 { y, u, v } => {
+                tex.update_yuv(None, y, y_pitch, u, y_pitch / 2, v, y_pitch / 2)
+                    .map_err(|e| anyhow!("texture update failed: {e}"))?;
+            }
+            FramePixels::Nv12 { y, uv } => {
+                // rust-sdl2 doesn't wrap SDL_UpdateNVTexture; call it
+                // directly. UV pitch equals the Y pitch for NV12.
+                let ret = unsafe {
+                    sdl2::sys::SDL_UpdateNVTexture(
+                        tex.raw(),
+                        std::ptr::null(),
+                        y.as_ptr(),
+                        i32::try_from(y_pitch).unwrap_or(i32::MAX),
+                        uv.as_ptr(),
+                        i32::try_from(y_pitch).unwrap_or(i32::MAX),
+                    )
+                };
+                if ret != 0 {
+                    return Err(anyhow!("SDL_UpdateNVTexture failed: {}", sdl2::get_error()));
+                }
+            }
+        }
+
+        self.canvas
+            .copy(tex, None, None)
+            .map_err(|e| anyhow!("canvas copy failed: {e}"))?;
+
+        if let Some(text) = overlay_text
+            && let Err(e) = draw_overlay(&mut self.canvas, text)
+        {
+            warn!("Stats overlay draw failed: {e}");
+        }
+
+        self.canvas.present();
+        Ok(())
+    }
+}
+
+/// The active presentation path.
+// One instance per session; the size difference doesn't matter.
+#[allow(clippy::large_enum_variant)]
+enum Backend {
+    Canvas(CanvasBackend),
+    Gl(GlRenderer),
+}
+
+impl Backend {
+    fn window_mut(&mut self) -> &mut sdl2::video::Window {
+        match self {
+            Self::Canvas(c) => c.canvas.window_mut(),
+            Self::Gl(g) => g.window_mut(),
+        }
+    }
+
+    fn present(
+        &mut self,
+        frame: &VideoFrame,
+        overlay_text: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        match self {
+            Self::Canvas(c) => c.present(frame, overlay_text),
+            Self::Gl(g) => g.present(frame, overlay_text),
+        }
+    }
+
+    /// Shows a black window until the first frame arrives.
+    fn clear_black(&mut self) {
+        match self {
+            Self::Canvas(c) => {
+                c.canvas.set_draw_color(sdl2::pixels::Color::BLACK);
+                c.canvas.clear();
+                c.canvas.present();
+            }
+            Self::Gl(g) => g.clear_black(),
+        }
     }
 }
 
@@ -139,7 +316,7 @@ fn toggle_fullscreen(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>) {
 pub(super) fn run_sdl_loop(
     sdl: &sdl2::Sdl,
     config: &DecoderConfig,
-    decoded_rx: std::sync::mpsc::Receiver<DecodedFrame>,
+    decoded_rx: std::sync::mpsc::Receiver<VideoFrame>,
     audio_pcm_rx: std::sync::mpsc::Receiver<Vec<f32>>,
     fullscreen: bool,
     input_tx: std::sync::mpsc::Sender<InputEvent>,
@@ -147,6 +324,7 @@ pub(super) fn run_sdl_loop(
     net_stats: &NetStats,
     stats_file: Option<&std::path::Path>,
     commands: &SessionCommands,
+    zero_copy: &AtomicBool,
 ) -> Result<(), anyhow::Error> {
     let audio_queue: AudioQueue<f32> = create_audio_queue(sdl)?;
 
@@ -167,26 +345,21 @@ pub(super) fn run_sdl_loop(
         .game_controller()
         .map_err(|e| anyhow!("SDL2 game controller init failed: {e}"))?;
 
-    let mut window_builder = video.window("Stargaze", config.width, config.height);
-    window_builder.position_centered();
-    if fullscreen {
-        window_builder.fullscreen_desktop();
-    }
-    let window = window_builder
-        .build()
-        .map_err(|e| anyhow!("window creation failed: {e}"))?;
-
-    let mut canvas = window
-        .into_canvas()
-        .accelerated()
-        .build()
-        .map_err(|e| anyhow!("canvas creation failed: {e}"))?;
-
-    let texture_creator = canvas.texture_creator();
-    // The streaming texture is created on the first decoded frame, in the
-    // decoder's native pixel layout (NV12 for hardware decode, IYUV for
-    // software decode), and recreated if the layout changes mid-session.
-    let mut texture: Option<(sdl2::pixels::PixelFormatEnum, sdl2::render::Texture<'_>)> = None;
+    // Hardware decode → GL renderer (it can import the decoder's dma-bufs
+    // directly); software decode → SDL canvas. If the GL renderer can't
+    // start, clear the zero-copy flag so the decoder ships CPU frames.
+    let mut backend = if zero_copy.load(Ordering::Relaxed) {
+        match GlRenderer::new(&video, config.width, config.height, fullscreen, false) {
+            Ok(gl) => Backend::Gl(gl),
+            Err(e) => {
+                warn!("GL renderer unavailable ({e}), using SDL canvas rendering");
+                zero_copy.store(false, Ordering::Relaxed);
+                Backend::Canvas(CanvasBackend::new(&video, config, fullscreen)?)
+            }
+        }
+    } else {
+        Backend::Canvas(CanvasBackend::new(&video, config, fullscreen)?)
+    };
 
     let mut event_pump = sdl
         .event_pump()
@@ -199,21 +372,21 @@ pub(super) fn run_sdl_loop(
     // Start captured ("inside" mode): all input goes to the remote session.
     let mut captured = true;
     let mut tracker = InputTracker::new();
-    apply_capture_mode(captured, &mut canvas, &sdl.mouse());
+    apply_capture_mode(captured, backend.window_mut(), &sdl.mouse());
 
     let mut overlay = StatsOverlay::new();
     let mut recorder = StatsRecorder::new();
     let video_desc = format!("{}x{}", config.width, config.height);
 
     info!(
-        "Renderer started: {}x{} (fullscreen: {})",
-        config.width, config.height, fullscreen
+        "Renderer started: {}x{} (fullscreen: {}, gl: {})",
+        config.width,
+        config.height,
+        fullscreen,
+        matches!(backend, Backend::Gl(_))
     );
 
-    // Show a black window until the first frame arrives.
-    canvas.set_draw_color(sdl2::pixels::Color::BLACK);
-    canvas.clear();
-    canvas.present();
+    backend.clear_black();
 
     'main: loop {
         // Coalesce mouse motion within one event batch: a 1000 Hz mouse
@@ -242,9 +415,11 @@ pub(super) fn run_sdl_loop(
                             ShortcutAction::Quit => break 'main,
                             ShortcutAction::ToggleCapture => {
                                 captured = !captured;
-                                apply_capture_mode(captured, &mut canvas, &sdl.mouse());
+                                apply_capture_mode(captured, backend.window_mut(), &sdl.mouse());
                             }
-                            ShortcutAction::ToggleFullscreen => toggle_fullscreen(&mut canvas),
+                            ShortcutAction::ToggleFullscreen => {
+                                toggle_fullscreen(backend.window_mut());
+                            }
                             ShortcutAction::ToggleStats => {
                                 overlay.visible = !overlay.visible;
                             }
@@ -367,10 +542,10 @@ pub(super) fn run_sdl_loop(
         // Wait briefly for a decoded frame so the loop doesn't busy-spin;
         // the short timeout keeps input polling responsive. Then drain any
         // queued frames, keeping only the latest.
-        let mut latest_frame: Option<DecodedFrame> =
+        let mut latest_frame: Option<VideoFrame> =
             match decoded_rx.recv_timeout(std::time::Duration::from_millis(2)) {
                 Ok(frame) => {
-                    recorder.record(frame.stats);
+                    recorder.record(frame.stats());
                     Some(frame)
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
@@ -380,7 +555,7 @@ pub(super) fn run_sdl_loop(
                 }
             };
         while let Ok(frame) = decoded_rx.try_recv() {
-            recorder.record(frame.stats);
+            recorder.record(frame.stats());
             if latest_frame.is_some() {
                 overlay.on_frames_dropped(1);
             }
@@ -400,76 +575,24 @@ pub(super) fn run_sdl_loop(
             continue;
         };
 
-        let wanted_format = match &frame.pixels {
-            FramePixels::I420 { .. } => sdl2::pixels::PixelFormatEnum::IYUV,
-            FramePixels::Nv12 { .. } => sdl2::pixels::PixelFormatEnum::NV12,
-        };
-
-        static RENDER_DIAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let rn = RENDER_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if rn < 5 {
-            info!(
-                frame_n = rn,
-                frame_width = frame.width,
-                frame_height = frame.height,
-                texture_width = config.width,
-                texture_height = config.height,
-                texture_format = ?wanted_format,
-                "SDL render diagnostics"
-            );
-        }
-
-        let tex = match &mut texture {
-            Some((fmt, tex)) if *fmt == wanted_format => tex,
-            slot => {
-                let tex = texture_creator
-                    .create_texture_streaming(wanted_format, config.width, config.height)
-                    .map_err(|e| anyhow!("texture creation failed: {e}"))?;
-                info!(format = ?wanted_format, "Created streaming texture");
-                &mut slot.insert((wanted_format, tex)).1
-            }
-        };
-
-        let y_pitch = frame.width as usize;
-        match &frame.pixels {
-            FramePixels::I420 { y, u, v } => {
-                tex.update_yuv(None, y, y_pitch, u, y_pitch / 2, v, y_pitch / 2)
-                    .map_err(|e| anyhow!("texture update failed: {e}"))?;
-            }
-            FramePixels::Nv12 { y, uv } => {
-                // rust-sdl2 doesn't wrap SDL_UpdateNVTexture; call it
-                // directly. UV pitch equals the Y pitch for NV12.
-                let ret = unsafe {
-                    sdl2::sys::SDL_UpdateNVTexture(
-                        tex.raw(),
-                        std::ptr::null(),
-                        y.as_ptr(),
-                        i32::try_from(y_pitch).unwrap_or(i32::MAX),
-                        uv.as_ptr(),
-                        i32::try_from(y_pitch).unwrap_or(i32::MAX),
-                    )
-                };
-                if ret != 0 {
-                    return Err(anyhow!("SDL_UpdateNVTexture failed: {}", sdl2::get_error()));
-                }
-            }
-        }
-
-        canvas
-            .copy(tex, None, None)
-            .map_err(|e| anyhow!("canvas copy failed: {e}"))?;
-
-        overlay.on_frame_rendered(frame.stats);
-        if overlay.visible {
-            let text = overlay
+        overlay.on_frame_rendered(frame.stats());
+        let overlay_text = overlay.visible.then(|| {
+            overlay
                 .text(rtt_probe(), &video_desc, net_stats)
-                .to_string();
-            if let Err(e) = draw_overlay(&mut canvas, &text) {
-                warn!("Stats overlay draw failed: {e}");
+                .to_string()
+        });
+
+        if let Err(e) = backend.present(&frame, overlay_text.as_deref()) {
+            if matches!(frame, VideoFrame::DmaBuf(_)) {
+                // Tell the decoder to ship CPU frames from now on; frames
+                // already in flight fail the same way and are skipped.
+                if zero_copy.swap(false, Ordering::Relaxed) {
+                    warn!("Zero-copy rendering failed ({e}), switching to CPU frames");
+                }
+            } else {
+                return Err(e);
             }
         }
-
-        canvas.present();
     }
 
     // Release any keys/buttons still held so the remote session isn't left
@@ -483,7 +606,7 @@ pub(super) fn run_sdl_loop(
     // Tearing the window down with relative mode active makes SDL issue a
     // pointer warp against a surface the compositor is already destroying,
     // which crashes Hyprland (SEGV in wp_pointer_warp_v1, seen on 0.55).
-    apply_capture_mode(false, &mut canvas, &sdl.mouse());
+    apply_capture_mode(false, backend.window_mut(), &sdl.mouse());
     event_pump.pump_events();
 
     if let Some(path) = stats_file {
@@ -559,6 +682,13 @@ mod tests {
     ///
     /// Catches platform/SDL regressions in NV12 rendering (colorspace,
     /// UV interleave, plane upload) that unit tests can't see.
+    ///
+    /// Run with a live compositor (`--test-threads=1` — SDL can only be
+    /// initialized by one test at a time per process):
+    /// ```bash
+    /// WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000 \
+    ///   nix develop -c cargo test -p stargaze-client -- --ignored --test-threads=1 nv12_and_iyuv
+    /// ```
     #[test]
     #[ignore = "requires a display (Wayland/X11) and a GPU renderer"]
     #[allow(clippy::similar_names)] // y/u/v/uv are the domain names

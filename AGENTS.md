@@ -107,6 +107,7 @@ Hard-won, non-obvious constraints. Check this list before "simplifying" anything
 - **SDL2 must be initialized and pumped on the main thread.** The render loop doubles as the input event pump; don't move it to a worker.
 - **No vsync, but no busy-spin either.** The render loop deliberately avoids `present_vsync()` (adds up to a frame of input latency) and instead blocks on the decoded-frame channel with a ~2 ms timeout. Don't reintroduce either extreme.
 - **NVIDIA GL driver can't bind linear DMA-BUF EGL images to `GL_TEXTURE_2D`** — use `GL_TEXTURE_EXTERNAL_OES` (see `encode/egl_cuda.rs`).
+- **nvidia-vaapi-driver cannot export decode surfaces as dma-bufs.** `vaExportSurfaceHandle` "succeeds" but the exported planes read as zeros, and the export poisons the decoder — every later `vaBeginPicture` fails with `MAX_NUM_EXCEEDED` until the decoder is re-created (verified on 595.71.05). The client blocklists it for zero-copy rendering (`decode/mod.rs::zero_copy_allowed`); local zero-copy testing on the NVIDIA box needs `STARGAZE_FORCE_ZERO_COPY=1` and exercises only the failure/recovery path.
 - **PipeWire MemFd buffers must be mmap'd manually**; `MAP_BUFFERS` cannot be relied on (commit `c9c8764`).
 - **Keyframes are self-contained on the wire**: the encoder prepends `extradata` (VPS/SPS/PPS) to every keyframe so a client can join or recover mid-stream. Keep it that way.
 - **10-bit compositor formats** (`xBGR2101010` etc.) reach the portal on some setups; see `docs/roadmap.md` for workarounds.

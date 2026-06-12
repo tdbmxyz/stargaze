@@ -1960,6 +1960,8 @@ dependencies = [
  "ffmpeg-next",
  "ffmpeg-sys-next",
  "font8x8",
+ "gl",
+ "khronos-egl",
  "libc",
  "opus",
  "quinn",

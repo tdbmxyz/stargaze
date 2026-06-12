@@ -1,10 +1,13 @@
 mod audio;
+mod gl;
 mod input;
 mod sdl;
 mod stats;
 
-use stargaze_core::decode::{DecodedFrame, DecoderConfig};
+use stargaze_core::decode::DecoderConfig;
 use stargaze_core::input::InputEvent;
+
+use crate::decode::VideoFrame;
 
 /// Callback returning the current network round-trip time estimate,
 /// used by the stats overlay.
@@ -25,7 +28,7 @@ pub struct SessionCommands {
 pub fn start_renderer(
     sdl: &sdl2::Sdl,
     config: &DecoderConfig,
-    decoded_rx: std::sync::mpsc::Receiver<DecodedFrame>,
+    decoded_rx: std::sync::mpsc::Receiver<VideoFrame>,
     audio_pcm_rx: std::sync::mpsc::Receiver<Vec<f32>>,
     fullscreen: bool,
     input_tx: std::sync::mpsc::Sender<InputEvent>,
@@ -33,6 +36,7 @@ pub fn start_renderer(
     net_stats: std::sync::Arc<crate::transport::NetStats>,
     stats_file: Option<std::path::PathBuf>,
     commands: &SessionCommands,
+    zero_copy: &std::sync::atomic::AtomicBool,
 ) -> Result<(), anyhow::Error> {
     sdl::run_sdl_loop(
         sdl,
@@ -45,5 +49,6 @@ pub fn start_renderer(
         &net_stats,
         stats_file.as_deref(),
         commands,
+        zero_copy,
     )
 }

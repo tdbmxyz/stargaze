@@ -16,10 +16,12 @@ rustls = { version = "0.23.37", default-features = false, features = ["ring", "s
 bytes = "1.11.1"
 ffmpeg-next = "7"
 ffmpeg-sys-next = "7"
-sdl2 = "0.37"
+sdl2 = { version = "0.37", features = ["unsafe_textures"] }
 opus = "0.3"
 libc = "0.2"
 font8x8 = "0.3"
+khronos-egl = { version = "6", features = ["dynamic"] }
+gl = "0.14"
 
 [dev-dependencies]
 rcgen = "0.14.7"

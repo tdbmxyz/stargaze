@@ -404,6 +404,50 @@ impl StatsRecorder {
     }
 }
 
+/// Rasterizes overlay text into a tightly packed RGBA8 image with the
+/// translucent background baked in — the GL renderer uploads this as a
+/// texture. Returns `(pixels, width, height)`.
+#[allow(clippy::cast_possible_truncation)]
+pub(super) fn rasterize_overlay(text: &str) -> (Vec<u8>, u32, u32) {
+    const BG: [u8; 4] = [0, 0, 0, 160];
+    const FG: [u8; 4] = [220, 220, 220, 255];
+
+    let scale = FONT_SCALE as usize;
+    let glyph = 8 * scale;
+    let line_height = glyph + 2;
+    let pad = PADDING.unsigned_abs() as usize;
+    let lines: Vec<&str> = text.lines().collect();
+    let widest = lines.iter().map(|l| l.len()).max().unwrap_or(0);
+    let width = widest * glyph + 2 * pad;
+    let height = lines.len() * line_height + 2 * pad;
+
+    let mut pixels = vec![0u8; width * height * 4];
+    for px in pixels.chunks_exact_mut(4) {
+        px.copy_from_slice(&BG);
+    }
+    for (row, line) in lines.iter().enumerate() {
+        let y0 = pad + row * line_height;
+        for (col, ch) in line.chars().enumerate() {
+            let bitmap = BASIC_LEGACY.get(ch as usize).unwrap_or(&BASIC_LEGACY[0]);
+            let x0 = pad + col * glyph;
+            for (py, bits) in bitmap.iter().enumerate() {
+                for px in 0..8usize {
+                    if bits & (1 << px) != 0 {
+                        for sy in 0..scale {
+                            let y = y0 + py * scale + sy;
+                            let off = (y * width + x0 + px * scale) * 4;
+                            for sx in 0..scale {
+                                pixels[off + sx * 4..off + sx * 4 + 4].copy_from_slice(&FG);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (pixels, width as u32, height as u32)
+}
+
 /// Draws multi-line text in the top-left corner with a translucent
 /// background, using the embedded 8x8 font scaled by [`FONT_SCALE`].
 // Geometry casts are bounded by line length and the 8x8 glyph grid.
@@ -598,6 +642,20 @@ mod tests {
 
         let s = summarize(&buckets, false).unwrap();
         assert!(s.max <= 31.0, "max fps must stay sane, got {}", s.max);
+    }
+
+    #[test]
+    fn rasterize_overlay_produces_background_and_glyph_pixels() {
+        let (pixels, w, h) = rasterize_overlay("AB\nlonger line");
+        assert_eq!(pixels.len(), (w * h * 4) as usize);
+        assert!(w > 0 && h > 0);
+        // Corner is background (translucent black).
+        assert_eq!(&pixels[0..4], &[0, 0, 0, 160]);
+        // Some glyph pixels exist (opaque light gray).
+        assert!(
+            pixels.chunks_exact(4).any(|px| px == [220, 220, 220, 255]),
+            "no foreground pixels rasterized"
+        );
     }
 
     #[test]

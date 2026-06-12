@@ -2,8 +2,9 @@
 //!
 //! Attempts VAAPI hardware decoding first, falls back to multi-threaded
 //! software decode if VAAPI is unavailable.  Hardware-decoded frames are
-//! transferred from GPU to CPU (NV12/YUV420P) before being sent to the
-//! renderer.
+//! exported as DRM PRIME dma-bufs for zero-copy rendering when possible,
+//! otherwise transferred from GPU to CPU (NV12/YUV420P) before being sent
+//! to the renderer.
 
 use std::ptr;
 use std::sync::Arc;
@@ -14,6 +15,8 @@ use stargaze_core::decode::{DecodeError, DecodedFrame, DecoderConfig, FrameStats
 use stargaze_core::transport::ReassembledFrame;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+use super::VideoFrame;
 
 /// Opaque handle to initialized `FFmpeg` decoder state.
 ///
@@ -27,8 +30,19 @@ pub(crate) struct FfmpegDecoder {
     /// on drop.
     hw_device_ctx: *mut ffmpeg_sys_next::AVBufferRef,
     /// Whether the decoder is using hardware acceleration.
-    hw_accel: bool,
+    pub(crate) hw_accel: bool,
+    /// Decode-failure score: +2 per `receive_frame` error, -1 per decoded
+    /// frame. A healthy stream with sporadic errors decays back to zero; a
+    /// stream failing every picture climbs even when each failure is
+    /// interleaved with a delivered frame (nvidia-vaapi-driver's export
+    /// breakage looks exactly like that).
+    error_score: u32,
 }
+
+/// Decode-failure score at which the zero-copy path is assumed to be
+/// poisoning the decoder and is permanently disabled (~0.5 s of
+/// every-frame failures at 85 fps).
+const MAX_ZERO_COPY_ERROR_SCORE: u32 = 40;
 
 /// A decoded frame in CPU memory, shipped from the decode thread to the
 /// extraction thread so plane extraction overlaps the next decode.
@@ -43,6 +57,65 @@ pub(crate) struct RawDecodedFrame {
 // Safety: the frame owns CPU-side refcounted buffers and is accessed by
 // one thread at a time (moved through the channel).
 unsafe impl Send for RawDecodedFrame {}
+
+/// A decoded frame still resident in GPU memory, exported as DRM PRIME
+/// dma-buf file descriptors (the zero-copy render path).
+///
+/// Holds a mapped `DRM_PRIME` `AVFrame` whose buffer references keep the
+/// underlying VAAPI surface alive; dropping it closes the fds and releases
+/// the surface back to the decoder's pool.
+pub struct DmaBufFrame {
+    /// The `AV_PIX_FMT_DRM_PRIME` frame owning the descriptor and fds.
+    frame: ffmpeg_next::frame::Video,
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+    /// Presentation timestamp.
+    pub pts: u64,
+    /// Per-frame pipeline timing, for the client stats overlay.
+    pub stats: FrameStats,
+}
+
+// Safety: the frame owns refcounted buffers and fds and is accessed by one
+// thread at a time (moved through the channel to the renderer).
+unsafe impl Send for DmaBufFrame {}
+
+impl DmaBufFrame {
+    /// The DRM PRIME descriptor (objects, layers, planes) of this frame.
+    ///
+    /// Valid for as long as `self` is alive.
+    #[must_use]
+    // data[0] is allocated by ffmpeg as an AVDRMFrameDescriptor, so it is
+    // properly aligned despite the u8 pointer type.
+    #[allow(clippy::cast_ptr_alignment)]
+    pub fn descriptor(&self) -> &ffmpeg_sys_next::AVDRMFrameDescriptor {
+        // A DRM_PRIME frame stores the descriptor pointer in data[0].
+        unsafe {
+            &*(*self.frame.as_ptr()).data[0]
+                .cast_const()
+                .cast::<ffmpeg_sys_next::AVDRMFrameDescriptor>()
+        }
+    }
+}
+
+/// Output of the decode thread, shipped to the extraction thread.
+pub(crate) enum DecodeOutput {
+    /// A CPU frame that still needs plane extraction.
+    Raw(RawDecodedFrame),
+    /// A frame already in its final form, passed through unchanged.
+    Ready(VideoFrame),
+}
+
+/// Why [`run_decode_loop`] returned.
+pub(crate) enum LoopExit {
+    /// Shutdown was signaled or the input channel closed.
+    Finished,
+    /// The decoder is persistently failing and must be re-created
+    /// (zero-copy exports can poison nvidia-vaapi-driver's decode state
+    /// beyond recovery).
+    Reinit,
+}
 
 // Safety: FfmpegDecoder is only used on the dedicated decoder thread.
 unsafe impl Send for FfmpegDecoder {}
@@ -202,6 +275,15 @@ fn init_vaapi_decoder(_config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeEr
         // Output frames as soon as they decode instead of waiting for the
         // stream's nominal reorder depth (we encode without B-frames).
         (*raw_ctx).flags |= ffmpeg_sys_next::AV_CODEC_FLAG_LOW_DELAY.cast_signed();
+        // The zero-copy render path keeps surfaces alive outside the
+        // decoder (in the render channel and on screen), so the surface
+        // pool needs headroom beyond the codec's own reference needs.
+        // Kept small: nvidia-vaapi-driver fails vaBeginPicture with
+        // MAX_NUM_EXCEEDED when the pool exceeds what NVDEC can map.
+        (*raw_ctx).extra_hw_frames = std::env::var("STARGAZE_EXTRA_HW_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
     }
 
     let decoder = context.decoder().video().map_err(|e| {
@@ -213,6 +295,7 @@ fn init_vaapi_decoder(_config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeEr
         decoder,
         hw_device_ctx,
         hw_accel: true,
+        error_score: 0,
     })
 }
 
@@ -252,6 +335,7 @@ fn init_software_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, Decode
         decoder,
         hw_device_ctx: ptr::null_mut(),
         hw_accel: false,
+        error_score: 0,
     })
 }
 
@@ -269,9 +353,11 @@ fn init_software_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, Decode
 pub(crate) fn run_decode_loop(
     decoder: &mut FfmpegDecoder,
     frames_rx: &mut mpsc::Receiver<ReassembledFrame>,
-    raw_tx: &std::sync::mpsc::SyncSender<RawDecodedFrame>,
+    raw_tx: &std::sync::mpsc::SyncSender<DecodeOutput>,
     shutdown: &Arc<AtomicBool>,
-) -> Result<(), DecodeError> {
+    zero_copy: &AtomicBool,
+    idr_tx: &mpsc::Sender<()>,
+) -> Result<LoopExit, DecodeError> {
     let mut packet_counter: u64 = 0;
 
     loop {
@@ -318,10 +404,29 @@ pub(crate) fn run_decode_loop(
 
         if let Err(e) = decoder.decoder.send_packet(&packet) {
             warn!(pts = frame.pts, "Skipping corrupt packet: {e}");
+            // A rejected packet breaks decoder references; ask for a
+            // keyframe (rate-limited by the transport) to recover.
+            let _ = idr_tx.try_send(());
             continue;
         }
 
-        drain_decoded_frames(decoder, raw_tx, stats, decode_start);
+        drain_decoded_frames(decoder, raw_tx, stats, decode_start, zero_copy, idr_tx);
+
+        // A decoder that errors on every packet while zero-copy is active
+        // is being poisoned by the surface exports (seen with
+        // nvidia-vaapi-driver): turn the exports off for good and have
+        // the decoder re-created — the driver's decode state doesn't
+        // recover even after the exports stop.
+        if decoder.error_score >= MAX_ZERO_COPY_ERROR_SCORE
+            && zero_copy.swap(false, Ordering::Relaxed)
+        {
+            warn!(
+                "Persistent decode failures with zero-copy active, \
+                 switching to CPU frames"
+            );
+            let _ = idr_tx.try_send(());
+            return Ok(LoopExit::Reinit);
+        }
     }
 
     // Flush: send EOF and drain remaining frames.
@@ -333,11 +438,13 @@ pub(crate) fn run_decode_loop(
             raw_tx,
             FrameStats::default(),
             std::time::Instant::now(),
+            zero_copy,
+            idr_tx,
         );
     }
 
     info!("Decoder loop finished");
-    Ok(())
+    Ok(LoopExit::Finished)
 }
 
 /// Runs the plane-extraction loop on its own thread: receives raw CPU
@@ -347,12 +454,23 @@ pub(crate) fn run_decode_loop(
 /// Running extraction separately overlaps the (expensive) VAAPI GPU→CPU
 /// transfer of the next frame with the plane copies of the current one.
 pub(crate) fn run_extract_loop(
-    raw_rx: &std::sync::mpsc::Receiver<RawDecodedFrame>,
-    decoded_tx: &std::sync::mpsc::Sender<DecodedFrame>,
+    raw_rx: &std::sync::mpsc::Receiver<DecodeOutput>,
+    decoded_tx: &std::sync::mpsc::Sender<VideoFrame>,
 ) {
     let mut scaler: Option<ffmpeg_next::software::scaling::Context> = None;
 
-    while let Ok(raw) = raw_rx.recv() {
+    while let Ok(output) = raw_rx.recv() {
+        let raw = match output {
+            DecodeOutput::Raw(raw) => raw,
+            // Zero-copy frames need no extraction; forward in order.
+            DecodeOutput::Ready(frame) => {
+                if decoded_tx.send(frame).is_err() {
+                    info!("Decoded frame receiver dropped, stopping extraction");
+                    return;
+                }
+                continue;
+            }
+        };
         let frame = &raw.frame;
         let (width, height, format) = (frame.width(), frame.height(), frame.format());
 
@@ -373,7 +491,7 @@ pub(crate) fn run_extract_loop(
 
         output.stats = raw.stats;
 
-        if decoded_tx.send(output).is_err() {
+        if decoded_tx.send(VideoFrame::Cpu(output)).is_err() {
             info!("Decoded frame receiver dropped, stopping extraction");
             return;
         }
@@ -386,25 +504,53 @@ fn saturating_us(d: std::time::Duration) -> u32 {
     u32::try_from(d.as_micros()).unwrap_or(u32::MAX)
 }
 
-/// Drains all available decoded frames from the codec, transfers hardware
-/// frames to CPU, and ships them to the extraction thread.
+/// Maps a VAAPI hardware frame to a `DRM_PRIME` frame (dma-buf export).
+///
+/// The returned frame references the source surface, keeping it alive
+/// until the renderer is done with it.
+fn map_to_drm_prime(src: &ffmpeg_next::frame::Video) -> Result<ffmpeg_next::frame::Video, String> {
+    let mut mapped = ffmpeg_next::frame::Video::empty();
+    unsafe {
+        (*mapped.as_mut_ptr()).format = ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+        let ret = ffmpeg_sys_next::av_hwframe_map(
+            mapped.as_mut_ptr(),
+            src.as_ptr(),
+            ffmpeg_sys_next::AV_HWFRAME_MAP_READ as libc::c_int,
+        );
+        if ret < 0 {
+            return Err(format!("av_hwframe_map to DRM_PRIME failed (error {ret})"));
+        }
+    }
+    Ok(mapped)
+}
+
+/// Drains all available decoded frames from the codec and ships them to
+/// the extraction thread: hardware frames are exported as dma-bufs when
+/// `zero_copy` is set (clearing it on failure), otherwise transferred to
+/// CPU memory.
 fn drain_decoded_frames(
     decoder: &mut FfmpegDecoder,
-    raw_tx: &std::sync::mpsc::SyncSender<RawDecodedFrame>,
+    raw_tx: &std::sync::mpsc::SyncSender<DecodeOutput>,
     stats: FrameStats,
     decode_start: std::time::Instant,
+    zero_copy: &AtomicBool,
+    idr_tx: &mpsc::Sender<()>,
 ) {
     loop {
         // A fresh frame each iteration: ownership moves to the extraction
         // thread. receive_frame fills it from the decoder's buffer pool.
         let mut decoded_frame = ffmpeg_next::frame::Video::empty();
         match decoder.decoder.receive_frame(&mut decoded_frame) {
-            Ok(()) => {}
+            Ok(()) => decoder.error_score = decoder.error_score.saturating_sub(1),
             Err(ffmpeg_next::Error::Other {
                 errno: libc::EAGAIN,
             }) => break,
             Err(e) => {
                 warn!("receive_frame error: {e}");
+                decoder.error_score += 2;
+                // The failed picture corrupts every frame that references
+                // it; ask for a keyframe (rate-limited by the transport).
+                let _ = idr_tx.try_send(());
                 break;
             }
         }
@@ -412,6 +558,36 @@ fn drain_decoded_frames(
         // If this is a hardware frame (VAAPI surface), transfer to CPU.
         let is_vaapi =
             decoder.hw_accel && decoded_frame.format() == ffmpeg_next::format::Pixel::VAAPI;
+
+        if is_vaapi && zero_copy.load(Ordering::Relaxed) {
+            match map_to_drm_prime(&decoded_frame) {
+                Ok(mapped) => {
+                    let frame = DmaBufFrame {
+                        width: decoded_frame.width(),
+                        height: decoded_frame.height(),
+                        pts: decoded_frame.pts().map_or(0, i64::cast_unsigned),
+                        stats: FrameStats {
+                            decode_us: saturating_us(decode_start.elapsed()),
+                            ..stats
+                        },
+                        frame: mapped,
+                    };
+                    if raw_tx
+                        .send(DecodeOutput::Ready(VideoFrame::DmaBuf(frame)))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    // The renderer switches to CPU frames as soon as the
+                    // flag clears; fall through to the transfer path.
+                    warn!("Zero-copy dma-buf export failed ({e}), using CPU transfer");
+                    zero_copy.store(false, Ordering::Relaxed);
+                }
+            }
+        }
 
         let cpu_frame = if is_vaapi {
             let mut sw_frame = ffmpeg_next::frame::Video::empty();
@@ -458,7 +634,7 @@ fn drain_decoded_frames(
             },
         };
 
-        if raw_tx.send(raw).is_err() {
+        if raw_tx.send(DecodeOutput::Raw(raw)).is_err() {
             return;
         }
     }

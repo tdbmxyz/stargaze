@@ -16,6 +16,19 @@ Follow-up tasks after the MVP implementation. Ordered roughly by priority.
 
 ## Known Issues & Workarounds
 
+### Zero-copy rendering and nvidia-vaapi-driver
+
+The client's zero-copy path (VAAPI decode → DRM PRIME dma-buf export → EGL
+import → GL render) is enabled automatically for hardware decoding on
+Mesa drivers (AMD/Intel). On NVIDIA's VAAPI shim (nvidia-vaapi-driver) it
+is blocklisted: exporting a surface poisons the decoder (every subsequent
+`vaBeginPicture` fails with `MAX_NUM_EXCEEDED`) and the exported planes
+read as zeros (verified on driver 595.71.05). `STARGAZE_FORCE_ZERO_COPY=1`
+re-enables it for testing newer drivers; `STARGAZE_NO_ZERO_COPY=1` forces
+the CPU path anywhere. If the path misbehaves at runtime, the client
+detects the failure, recreates the decoder, requests an IDR, and continues
+with CPU frames.
+
 ### 10-bit Display Formats
 
 Systems running 10-bit color depth (e.g. Hyprland with `misc:screen_bit_depth = 10`) expose 10-bit DRM formats (`xBGR2101010`, `ABGR2101010`) through the portal. Stargaze accepts these formats and converts to 8-bit in the encode pipeline.
@@ -44,7 +57,7 @@ If capture still fails with `no more input formats`, check your compositor:
 
 ## 6. Future Features (Post-MVP)
 
-- [ ] **VAAPI decode**: Hardware-accelerated decoding on AMD/Intel clients.
+- [x] **VAAPI decode**: Hardware-accelerated decoding on AMD/Intel clients (with zero-copy dma-buf rendering; see Known Issues for the NVIDIA shim caveat).
 - [ ] **AV1 encoding**: Alternative to H.265 for better quality-per-bit.
 - [ ] **Adaptive bitrate**: Dynamically adjust encoding bitrate based on network conditions.
 - [ ] **Multi-monitor**: Support capturing and streaming individual monitors or regions.

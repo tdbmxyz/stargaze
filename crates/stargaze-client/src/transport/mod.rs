@@ -81,6 +81,7 @@ pub async fn connect(
         mpsc::Receiver<ReassembledFrame>,
         mpsc::Receiver<ReassembledFrame>,
         mpsc::Sender<InputEvent>,
+        mpsc::Sender<()>,
         RttProbe,
         std::sync::Arc<NetStats>,
     ),
@@ -115,6 +116,8 @@ pub async fn connect(
     let (video_tx, video_rx) = mpsc::channel::<ReassembledFrame>(2);
     let (audio_tx, audio_rx) = mpsc::channel::<ReassembledFrame>(16);
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>(64);
+    // Decoder → transport keyframe requests (sent after decode failures).
+    let (idr_tx, idr_rx) = mpsc::channel::<()>(4);
 
     // Cloneable handle for RTT queries from the stats overlay.
     let rtt_conn = connection.clone();
@@ -130,6 +133,7 @@ pub async fn connect(
             video_tx,
             audio_tx,
             input_rx,
+            idr_rx,
             &net_stats_clone,
         )
         .await
@@ -144,6 +148,7 @@ pub async fn connect(
         video_rx,
         audio_rx,
         input_tx,
+        idr_tx,
         rtt_probe,
         net_stats,
     ))
