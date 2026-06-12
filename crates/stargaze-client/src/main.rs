@@ -10,6 +10,9 @@ use tracing_subscriber::EnvFilter;
 use stargaze_client::{decode, render, transport};
 
 /// Stargaze streaming client — connects to a server, decodes video/audio, and forwards input.
+// Doc comments here are clap help text rendered verbatim; list items align
+// continuation lines for terminal readability, not rustdoc conventions.
+#[allow(clippy::doc_overindented_list_items)]
 #[derive(Parser, Debug)]
 #[command(name = "stargaze-client", version, about)]
 struct Cli {
@@ -17,15 +20,23 @@ struct Cli {
     #[arg(long)]
     server: Option<String>,
 
-    /// Port to connect on.
+    /// Port to connect on [default: 9000].
     #[arg(long)]
     port: Option<u16>,
 
-    /// Whether to run in fullscreen mode.
-    #[arg(long)]
+    /// Whether to run in fullscreen mode [default: true].
+    ///
+    /// - true:  borderless fullscreen on the client display.
+    /// - false: resizable window — handy alongside other work, or when
+    ///          the stream resolution differs from the local display.
+    #[arg(long, verbatim_doc_comment)]
     fullscreen: Option<bool>,
 
     /// Enable microphone forwarding via rsonance.
+    ///
+    /// Spawns `rsonance transmitter` next to the client so the local
+    /// microphone is forwarded to a virtual `PulseAudio` source on the
+    /// server. Requires the rsonance binary on both ends.
     #[arg(long)]
     mic_forward: bool,
 
@@ -45,8 +56,12 @@ struct Cli {
     #[arg(long)]
     config: Option<String>,
 
-    /// Write a session stats report (avg/min/max/std/worst 5% per pipeline
-    /// stage) to this file on exit.
+    /// Write a session stats report to this file on exit.
+    ///
+    /// The report covers the whole session: frame counts, average
+    /// bitrate, per-stage timings (capture/convert/encode/queue/decode)
+    /// with avg/min/max/std/worst-5%, and the sanitized server and
+    /// client command lines.
     #[arg(long)]
     stats_file: Option<std::path::PathBuf>,
 }

@@ -15,42 +15,100 @@ mod transport;
 use capture::CaptureConfig;
 
 /// Stargaze streaming server — captures screen and audio, encodes, and streams to clients.
+// Doc comments here are clap help text rendered verbatim; list items align
+// continuation lines for terminal readability, not rustdoc conventions.
+#[allow(clippy::doc_overindented_list_items)]
 #[derive(Parser, Debug)]
 #[command(name = "stargaze-server", version, about)]
 struct Cli {
-    /// Address to bind the server to.
+    /// Address to bind the server to [default: 0.0.0.0].
     #[arg(long)]
     bind: Option<String>,
 
-    /// Port to listen on.
+    /// Port to listen on [default: 9000].
     #[arg(long)]
     port: Option<u16>,
 
-    /// Video resolution as `WIDTHxHEIGHT` (e.g. 1920x1080).
+    /// Video resolution as `WIDTHxHEIGHT` (e.g. 1920x1080) [default: 1920x1080].
+    ///
+    /// The capture and stream resolution. Set it to the captured
+    /// monitor's native resolution: the stream is not rescaled, and a
+    /// mismatch costs quality (and can letterbox) for no speedup.
     #[arg(long)]
     resolution: Option<Resolution>,
 
-    /// Target framerate.
+    /// Target framerate [default: 60].
+    ///
+    /// Upper bound on the capture rate. `PipeWire` only delivers frames
+    /// when screen content changes, so the actual rate follows the
+    /// content up to this cap. Set it to the captured monitor's refresh
+    /// rate; there is no point going higher.
     #[arg(long)]
     framerate: Option<u32>,
 
-    /// Target bitrate in Mbps.
+    /// Target bitrate in Mbps [default: 20].
+    ///
+    /// Constant-bitrate target for the encoder. 20 suits 1080p; for
+    /// 1440p-class high-motion streaming on a LAN, 40–80 keeps text and
+    /// edges crisp. When quality is lacking, raise this before reaching
+    /// for a slower preset — extra bits help more than extra encoder
+    /// effort, and they cost no encode time.
     #[arg(long)]
     bitrate: Option<u32>,
 
-    /// Video codec (h265, av1).
-    #[arg(long)]
+    /// Video codec [default: h265].
+    ///
+    /// - h265: H.265/HEVC via NVENC — the implemented, tested path.
+    /// - av1:  accepted but not implemented yet; the server still
+    ///         encodes H.265. Reserved for future hardware AV1 support.
+    #[arg(long, verbatim_doc_comment)]
     codec: Option<Codec>,
 
-    /// NVENC preset: p1 (fastest) … p7 (best quality).
-    #[arg(long)]
+    /// NVENC preset: p1 (fastest) … p7 (best quality) [default: p1].
+    ///
+    /// How much GPU time NVENC spends per frame: quality per bit rises
+    /// and throughput falls from p1 to p7. Measured at 3440x1440 on an
+    /// RTX 3090:
+    ///
+    /// - p1:    ~165 fps sustained. At streaming bitrates the quality
+    ///          loss is hard to notice — the right choice for
+    ///          high-refresh streaming, and the default.
+    /// - p2-p3: marginally better quality per bit, slightly slower.
+    ///          Worth trying only with fps headroom to spare.
+    /// - p4:    ~85 fps. NVENC's balanced middle ground; reasonable for
+    ///          a 60 fps target on a constrained bitrate.
+    /// - p5-p7: diminishing quality gains at rapidly growing encode
+    ///          times. Avoid for interactive streaming; they exist for
+    ///          quality-first offline encoding.
+    ///
+    /// The encode cost shows up in the client stats report: a slow
+    /// preset inflates the `convert ms` row (the converter blocks on
+    /// NVENC backpressure) and caps `fps`.
+    #[arg(long, verbatim_doc_comment)]
     preset: Option<String>,
 
-    /// NVENC multipass mode: disabled, qres, or fullres.
-    #[arg(long)]
+    /// NVENC multipass mode [default: disabled].
+    ///
+    /// Whether NVENC runs a rate-control analysis pass before encoding
+    /// each frame:
+    ///
+    /// - disabled: single pass, fastest. The default — at high
+    ///             framerates the analysis pass costs more than it
+    ///             returns.
+    /// - qres:     first pass at quarter resolution. Better bit
+    ///             placement in high-motion scenes; moderate cost. Pair
+    ///             with p4+ for quality-first streaming at ~60 fps.
+    /// - fullres:  first pass at full resolution. Most accurate rate
+    ///             control, highest cost; only for low-framerate,
+    ///             quality-first streams.
+    #[arg(long, verbatim_doc_comment)]
     multipass: Option<String>,
 
     /// Enable microphone forwarding via rsonance.
+    ///
+    /// Spawns `rsonance receiver` next to the server so the client's
+    /// microphone appears as a virtual `PulseAudio` source on this
+    /// machine. Requires the rsonance binary on both ends.
     #[arg(long)]
     mic_forward: bool,
 
@@ -59,7 +117,11 @@ struct Cli {
     mic_forward_port: Option<u16>,
 
     /// Show the cursor in the captured stream.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    ///
+    /// - true:  the compositor embeds the cursor into captured frames.
+    /// - false: frames carry no cursor — useful when the client draws
+    ///          its own, at the cost of remote cursor feedback.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, verbatim_doc_comment)]
     show_cursor: bool,
 
     /// Periodically log pipeline progress (captured/encoded frame counts).
