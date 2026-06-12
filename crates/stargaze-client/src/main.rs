@@ -33,6 +33,14 @@ struct Cli {
     #[arg(long)]
     mic_forward_port: Option<u16>,
 
+    /// Periodically log pipeline progress (received frame counts).
+    ///
+    /// Off by default: a healthy session would otherwise log a progress
+    /// line every few seconds. One-shot lifecycle logs (connect, first
+    /// frame, keyframes, decoder events) are always emitted at info level.
+    #[arg(long)]
+    log_progress: bool,
+
     /// Path to config file (default: ~/.config/stargaze/client.toml).
     #[arg(long)]
     config: Option<String>,
@@ -103,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let cfg = build_config(&cli)?;
+    stargaze_core::logging::set_progress_logging(cli.log_progress);
 
     info!(
         "Connecting to {}:{} (fullscreen: {})",

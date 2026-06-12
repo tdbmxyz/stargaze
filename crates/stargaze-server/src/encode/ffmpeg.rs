@@ -407,7 +407,9 @@ pub(crate) fn run_encode_loop(
         );
 
         frame_counter += 1;
-        if frame_counter == 1 || frame_counter.is_multiple_of(300) {
+        if frame_counter == 1
+            || (stargaze_core::logging::progress_logging() && frame_counter.is_multiple_of(300))
+        {
             info!(frame = frame_counter, "Encode progress");
         }
     }

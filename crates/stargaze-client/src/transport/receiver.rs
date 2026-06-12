@@ -382,7 +382,10 @@ pub(crate) async fn receive_loop(
 
                 for frame in completed_frames {
                     total_frames += 1;
-                    if frame.is_keyframe || total_frames % 300 == 1 {
+                    if frame.is_keyframe
+                        || total_frames == 1
+                        || (stargaze_core::logging::progress_logging() && total_frames % 300 == 1)
+                    {
                         info!(
                             frame = total_frames,
                             pts = frame.pts,

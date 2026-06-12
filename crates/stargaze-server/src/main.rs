@@ -62,6 +62,14 @@ struct Cli {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     show_cursor: bool,
 
+    /// Periodically log pipeline progress (captured/encoded frame counts).
+    ///
+    /// Off by default: a healthy session would otherwise log a progress
+    /// line every few seconds. One-shot lifecycle logs (startup, first
+    /// frame, client connect/disconnect) are always emitted at info level.
+    #[arg(long)]
+    log_progress: bool,
+
     /// Path to config file (default: ~/.config/stargaze/server.toml).
     #[arg(long)]
     config: Option<String>,
@@ -144,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let cfg = build_config(&cli)?;
+    stargaze_core::logging::set_progress_logging(cli.log_progress);
 
     info!(
         "Starting stargaze server on {}:{} ({}@{}fps, {} Mbps, {}, cursor: {})",

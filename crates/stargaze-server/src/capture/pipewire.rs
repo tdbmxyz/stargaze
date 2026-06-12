@@ -719,7 +719,10 @@ pub fn run_capture_stream(
 
             // Send frame to the consumer. If the receiver is dropped, stop.
             data.frame_count += 1;
-            if data.frame_count == 1 || data.frame_count.is_multiple_of(300) {
+            if data.frame_count == 1
+                || (stargaze_core::logging::progress_logging()
+                    && data.frame_count.is_multiple_of(300))
+            {
                 info!(
                     frame = data.frame_count,
                     data_type = ?data_type,
