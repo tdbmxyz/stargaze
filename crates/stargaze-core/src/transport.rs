@@ -98,6 +98,9 @@ pub enum ControlMessage {
         max_datagram_size: u16,
         /// Whether the cursor is embedded in video frames.
         cursor_embedded: bool,
+        /// Server command line, sanitized of addresses and ports
+        /// (for the client's session diagnostics).
+        server_command: String,
     },
     /// Client -> Server: request an IDR keyframe (after packet loss).
     IdrRequest,
@@ -285,6 +288,7 @@ mod tests {
             codec: Codec::Av1,
             max_datagram_size: 1200,
             cursor_embedded: true,
+            server_command: "stargaze-server --bitrate 50".to_string(),
         };
         let bytes = serialize_control_message(&msg).unwrap();
         let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
@@ -311,6 +315,7 @@ mod tests {
             codec: Codec::H265,
             max_datagram_size: 1200,
             cursor_embedded: false,
+            server_command: String::new(),
         };
         let bytes = serialize_control_message(&msg).unwrap();
         let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;

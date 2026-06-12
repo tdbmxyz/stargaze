@@ -85,6 +85,7 @@ pub(crate) async fn handle_session_handshake(
         codec: config.codec,
         max_datagram_size: max_datagram_size_u16,
         cursor_embedded: config.cursor.show_cursor,
+        server_command: stargaze_core::config::sanitized_command_line(),
     };
 
     let response_bytes = serialize_control_message(&response)?;

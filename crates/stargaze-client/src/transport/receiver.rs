@@ -30,6 +30,8 @@ pub struct SessionParams {
     pub bitrate_mbps: u32,
     /// Maximum datagram payload size for the connection.
     pub max_datagram_size: u16,
+    /// Server command line, sanitized of addresses and ports.
+    pub server_command: String,
 }
 
 /// Performs the session handshake with the server.
@@ -88,12 +90,14 @@ pub(crate) async fn perform_handshake(
             codec: _,
             max_datagram_size,
             cursor_embedded: _,
+            server_command,
         } => Ok(SessionParams {
             width,
             height,
             framerate,
             bitrate_mbps,
             max_datagram_size,
+            server_command,
         }),
         other => Err(TransportError::SessionError(format!(
             "expected SessionResponse, got {other:?}"

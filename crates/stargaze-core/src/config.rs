@@ -294,6 +294,45 @@ where
     })
 }
 
+/// Returns this process's command line with network-identifying arguments
+/// (`--bind`, `--server`, `--port`, `--mic-forward-port` and their values)
+/// removed and the binary path reduced to its file name.
+///
+/// Used to annotate session diagnostics (stats reports) without leaking
+/// addresses or ports.
+#[must_use]
+pub fn sanitized_command_line() -> String {
+    sanitize_command_line(std::env::args())
+}
+
+fn sanitize_command_line(args: impl Iterator<Item = String>) -> String {
+    const OMITTED: &[&str] = &["--bind", "--server", "--port", "--mic-forward-port"];
+
+    let mut out: Vec<String> = Vec::new();
+    let mut skip_value = false;
+    for (i, arg) in args.enumerate() {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if i == 0 {
+            let name = std::path::Path::new(&arg)
+                .file_name()
+                .map_or_else(|| arg.clone(), |n| n.to_string_lossy().into_owned());
+            out.push(name);
+            continue;
+        }
+        // Match both `--flag value` and `--flag=value` forms.
+        let flag = arg.split('=').next().unwrap_or(&arg);
+        if OMITTED.contains(&flag) {
+            skip_value = !arg.contains('=');
+            continue;
+        }
+        out.push(arg);
+    }
+    out.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +580,40 @@ mod tests {
         "#;
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert!(config.cursor.show_cursor);
+    }
+
+    #[test]
+    fn sanitize_command_line_strips_addresses_and_ports() {
+        let args = [
+            "/nix/store/abc/bin/stargaze-server",
+            "--bind",
+            "0.0.0.0",
+            "--port",
+            "60003",
+            "--resolution",
+            "3440x1440",
+            "--bitrate",
+            "60",
+            "--preset",
+            "p1",
+        ];
+        let line = sanitize_command_line(args.iter().map(ToString::to_string));
+        assert_eq!(
+            line,
+            "stargaze-server --resolution 3440x1440 --bitrate 60 --preset p1"
+        );
+    }
+
+    #[test]
+    fn sanitize_command_line_strips_equals_form_and_trailing_flag() {
+        let args = [
+            "stargaze-client",
+            "--server=192.168.1.10",
+            "--fullscreen",
+            "true",
+            "--port",
+        ];
+        let line = sanitize_command_line(args.iter().map(ToString::to_string));
+        assert_eq!(line, "stargaze-client --fullscreen true");
     }
 }

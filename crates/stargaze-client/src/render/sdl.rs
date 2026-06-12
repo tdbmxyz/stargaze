@@ -7,9 +7,10 @@ use stargaze_core::decode::{DecodedFrame, DecoderConfig, FramePixels};
 use stargaze_core::input::{GamepadAxis, GamepadButton, InputEvent, MouseButton};
 use tracing::{info, warn};
 
+use super::SessionCommands;
 use super::audio::create_audio_queue;
 use super::input::{InputTracker, PadSlots, ShortcutAction, shortcut_action};
-use super::stats::{StatsOverlay, StatsRecorder, draw_overlay};
+use super::stats::{ReportMeta, StatsOverlay, StatsRecorder, draw_overlay};
 use crate::transport::NetStats;
 
 /// Window title shown while input is captured ("inside" mode).
@@ -145,6 +146,7 @@ pub(super) fn run_sdl_loop(
     rtt_probe: super::RttProbe,
     net_stats: &NetStats,
     stats_file: Option<&std::path::Path>,
+    commands: &SessionCommands,
 ) -> Result<(), anyhow::Error> {
     let audio_queue: AudioQueue<f32> = create_audio_queue(sdl)?;
 
@@ -485,9 +487,14 @@ pub(super) fn run_sdl_loop(
     event_pump.pump_events();
 
     if let Some(path) = stats_file {
+        let meta = ReportMeta {
+            video: &video_desc,
+            server_command: &commands.server,
+            client_command: &commands.client,
+        };
         match recorder.write_report(
             path,
-            &video_desc,
+            &meta,
             overlay.rendered(),
             overlay.superseded(),
             net_stats,

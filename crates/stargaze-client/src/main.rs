@@ -190,6 +190,11 @@ async fn main() -> anyhow::Result<()> {
     let (video_decoder_session, decoded_rx) =
         decode::start_decoder(decoder_config.clone(), video_frames)?;
 
+    let session_commands = render::SessionCommands {
+        server: session_params.server_command.clone(),
+        client: config::sanitized_command_line(),
+    };
+
     // SDL2 event loop must run on the main OS thread.
     // Audio PCM is queued to the SDL2 AudioQueue inside the event loop.
     tokio::task::block_in_place(|| {
@@ -203,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
             rtt_probe,
             net_stats,
             cli.stats_file.clone(),
+            &session_commands,
         )
     })?;
 

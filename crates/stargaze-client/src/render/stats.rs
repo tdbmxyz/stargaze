@@ -237,6 +237,16 @@ fn summarize(values: &[f64], worst_is_high: bool) -> Option<Summary> {
     })
 }
 
+/// Session-identifying metadata printed at the top of the report.
+pub(super) struct ReportMeta<'a> {
+    /// Session geometry string (e.g. "3440x1440").
+    pub(super) video: &'a str,
+    /// Server command line, sanitized of addresses and ports.
+    pub(super) server_command: &'a str,
+    /// Client command line, sanitized of addresses and ports.
+    pub(super) client_command: &'a str,
+}
+
 /// Records every decoded frame for the whole session and produces a
 /// text report for offline analysis (`--stats-file`).
 pub(super) struct StatsRecorder {
@@ -273,17 +283,23 @@ impl StatsRecorder {
     pub(super) fn write_report(
         &self,
         path: &Path,
-        video: &str,
+        meta: &ReportMeta<'_>,
         rendered: u64,
         superseded: u64,
         net: &NetStats,
     ) -> std::io::Result<()> {
-        let text = self.report_text(video, rendered, superseded, net);
+        let text = self.report_text(meta, rendered, superseded, net);
         std::fs::write(path, text)
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn report_text(&self, video: &str, rendered: u64, superseded: u64, net: &NetStats) -> String {
+    fn report_text(
+        &self,
+        meta: &ReportMeta<'_>,
+        rendered: u64,
+        superseded: u64,
+        net: &NetStats,
+    ) -> String {
         let duration = self.started.elapsed().as_secs_f64();
         let decoded = self.samples.len();
         let net_bytes = net.video_bytes.load(Ordering::Relaxed);
@@ -293,7 +309,9 @@ impl StatsRecorder {
         let mut out = String::new();
         let _ = writeln!(out, "Stargaze client session report");
         let _ = writeln!(out, "==============================");
-        let _ = writeln!(out, "video:             {video}");
+        let _ = writeln!(out, "video:             {}", meta.video);
+        let _ = writeln!(out, "server command:    {}", meta.server_command);
+        let _ = writeln!(out, "client command:    {}", meta.client_command);
         let _ = writeln!(out, "duration:          {duration:.1} s");
         if duration > 0.0 {
             let _ = writeln!(
@@ -529,10 +547,17 @@ mod tests {
             recorder.record(stats(2_000 + i, 3_000, 1_000, 4_000));
         }
         let n = net(10_000_000, 60, 5);
-        let report = recorder.report_text("3440x1440", 45, 5, &n);
+        let meta = ReportMeta {
+            video: "3440x1440",
+            server_command: "stargaze-server --preset p1",
+            client_command: "stargaze-client --fullscreen true",
+        };
+        let report = recorder.report_text(&meta, 45, 5, &n);
 
         assert!(report.contains("Stargaze client session report"));
         assert!(report.contains("video:             3440x1440"));
+        assert!(report.contains("server command:    stargaze-server --preset p1"));
+        assert!(report.contains("client command:    stargaze-client --fullscreen true"));
         assert!(report.contains("frames received:   60"));
         assert!(report.contains("frames decoded:    50"));
         assert!(report.contains("frames rendered:   45"));
@@ -584,7 +609,12 @@ mod tests {
         let dir = std::env::temp_dir().join("stargaze-stats-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("report.txt");
-        recorder.write_report(&path, "1x1", 1, 0, &n).unwrap();
+        let meta = ReportMeta {
+            video: "1x1",
+            server_command: "stargaze-server",
+            client_command: "stargaze-client",
+        };
+        recorder.write_report(&path, &meta, 1, 0, &n).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("session report"));
