@@ -562,12 +562,24 @@ pub(super) fn run_sdl_loop(
             latest_frame = Some(frame);
         }
 
-        // Drain decoded audio PCM and queue for playback.
+        // Drain decoded audio PCM and queue for playback, dropping any
+        // backlog above the cap so playback stays in sync with the video.
+        let mut dropped_audio_bytes: u64 = 0;
         while let Ok(pcm) = audio_pcm_rx.try_recv() {
+            if audio_queue.size() > super::audio::MAX_QUEUED_AUDIO_BYTES {
+                dropped_audio_bytes += u64::from(audio_queue.size());
+                audio_queue.clear();
+            }
             if let Err(e) = audio_queue.queue_audio(&pcm) {
                 warn!("Failed to queue audio: {e}");
                 break;
             }
+        }
+        if dropped_audio_bytes > 0 {
+            info!(
+                dropped_ms = dropped_audio_bytes / u64::from(super::audio::AUDIO_BYTES_PER_MS),
+                "Dropped audio backlog to resync with video"
+            );
         }
 
         // Nothing new to display — keep polling events without re-presenting.
