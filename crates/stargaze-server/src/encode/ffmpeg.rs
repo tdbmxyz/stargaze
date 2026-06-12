@@ -246,11 +246,12 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
 
     // Step 6: Open encoder with NVENC-specific options.
     //
-    // Preset and multipass come from config (defaults p4/qres): the
-    // quality difference over p1 is dramatic at streaming bitrates.
-    // Spatial AQ distributes bits where the eye notices (text edges,
-    // flat gradients) — without it the picture has the typical
-    // "screen share" mosquito noise.
+    // Preset and multipass come from config (defaults p1/disabled —
+    // chosen for throughput; higher presets halve the sustainable
+    // framerate at 1440p-class resolutions for a quality gain that LAN
+    // bitrates make hard to notice). Spatial AQ distributes bits where
+    // the eye notices (text edges, flat gradients) — without it the
+    // picture has the typical "screen share" mosquito noise.
     let mut opts = ffmpeg_next::Dictionary::new();
     opts.set("preset", &config.tuning.preset);
     opts.set("tune", "ull");

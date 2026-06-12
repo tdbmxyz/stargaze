@@ -150,10 +150,11 @@ impl Default for MicForwardConfig {
 
 /// NVENC encoder tuning knobs.
 ///
-/// The defaults balance quality and speed for 1440p-class streaming; drop
-/// the preset (e.g. `p3`) or set `multipass = "disabled"` if the encoder
-/// becomes the pipeline bottleneck (visible as high `encode` time in the
-/// client stats overlay).
+/// The defaults (`p1`, `disabled`) favor encode throughput: at 1440p-class
+/// resolutions they roughly double the sustainable framerate compared to
+/// `p4` + `qres`, with a quality loss that streaming bitrates make hard to
+/// notice. Raise the preset (e.g. `p4`) and enable multipass if you target
+/// a modest framerate and want more quality per bit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EncoderTuning {
@@ -166,8 +167,8 @@ pub struct EncoderTuning {
 impl Default for EncoderTuning {
     fn default() -> Self {
         Self {
-            preset: "p4".to_string(),
-            multipass: "qres".to_string(),
+            preset: "p1".to_string(),
+            multipass: "disabled".to_string(),
         }
     }
 }
@@ -356,8 +357,8 @@ mod tests {
         assert_eq!(config.mic_forward.port, 9001);
         assert_eq!(config.mic_forward.rsonance_binary, "rsonance");
         assert!(config.cursor.show_cursor);
-        assert_eq!(config.encoder.preset, "p4");
-        assert_eq!(config.encoder.multipass, "qres");
+        assert_eq!(config.encoder.preset, "p1");
+        assert_eq!(config.encoder.multipass, "disabled");
     }
 
     #[test]
@@ -379,8 +380,8 @@ mod tests {
         let toml = "port = 1234";
         let config: ServerConfig = toml::from_str(toml).expect("parse");
         assert_eq!(config.port, 1234);
-        assert_eq!(config.encoder.preset, "p4");
-        assert_eq!(config.encoder.multipass, "qres");
+        assert_eq!(config.encoder.preset, "p1");
+        assert_eq!(config.encoder.multipass, "disabled");
     }
 
     #[test]
