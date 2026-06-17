@@ -123,7 +123,17 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
     // to create a CUDA device context.  FFmpeg's av_hwdevice_ctx_create can
     // segfault if the CUDA driver is missing or broken rather than returning
     // an error code.  Calling cuInit(0) first surfaces the problem cleanly.
-    match std::panic::catch_unwind(cudarc::driver::result::init) {
+    //
+    // cudarc panics (rather than returning Err) when libcuda.so cannot be
+    // dynamically loaded.  Rust's default panic hook always prints a backtrace
+    // to stderr before catch_unwind can intercept — temporarily replace it
+    // with a no-op so the caller gets a clean error return instead of a scary
+    // panic dump.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let cuda_init_result = std::panic::catch_unwind(cudarc::driver::result::init);
+    std::panic::set_hook(prev_hook);
+    match cuda_init_result {
         Ok(Ok(())) => debug!("CUDA pre-check passed (cuInit succeeded)"),
         Ok(Err(e)) => {
             return Err(EncodeError::InitError(format!(
