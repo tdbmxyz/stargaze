@@ -161,6 +161,12 @@ cargo add --dev package-name
 
 ## Git Workflow
 
+The repository follows **Git flow** with semver releases (since v1.0.0):
+
+- `main` holds finalized releases only. Every release is a merge from `develop` plus a `vX.Y.Z` tag (semver). Do not commit day-to-day work on `main`.
+- `develop` is the integration branch: feature/fix branches start from it and merge back with `--no-ff`.
+- Releasing: bump `[workspace.package].version` in `Cargo.toml` **and** the `version` in `flake.nix` (they must match the tag), run `cargo update --workspace` for `Cargo.lock`, merge `develop` into `main`, tag `vX.Y.Z`, and push the tag — the `release` GitHub Actions workflow then builds the client AppImage and creates the GitHub Release.
+
 - Use feature branches for new work, e.g. `feature/wayland-capture`, `fix/audio-sync-drift`
 - **Commit every change at an atomic level** — each commit should represent a single logical change that compiles and (where applicable) passes tests
 - Use **conventional commits** with scope:
