@@ -157,6 +157,30 @@ impl SharedGamepads {
         self.generation.load(Ordering::Acquire)
     }
 
+    /// Registers a device claimed outside the evdev scanner (HID-level
+    /// pass-through) so the SDL loop skips emulating it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the slot table lock is poisoned.
+    pub fn mark_claimed(&self, vendor: u16, product: u16) {
+        let mut state = self.state.lock().unwrap();
+        state.grabbed.insert((vendor, product));
+        state.lost.remove(&(vendor, product));
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Clears an external claim registered via [`Self::mark_claimed`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the slot table lock is poisoned.
+    pub fn unmark_claimed(&self, vendor: u16, product: u16) {
+        let mut state = self.state.lock().unwrap();
+        state.grabbed.remove(&(vendor, product));
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
     fn find(state: &SharedState, key: &PadKey) -> Option<u8> {
         state
             .slots
@@ -328,11 +352,12 @@ fn claim_device(
     if descriptor.vendor == VALVE_VENDOR_ID {
         // A server-side evdev clone of a Valve controller is invisible
         // to games (no SDL mapping; hosts drive these via Steam/hidraw),
-        // and grabbing it races hid-steam's node removal. See module docs.
-        info!(
+        // and grabbing it races hid-steam's node removal. These devices
+        // are forwarded at the HID level instead (see crate::hidpass);
+        // if that fails, SDL's Xbox 360 emulation picks them up.
+        debug!(
             name = %descriptor.name,
-            "Valve controller: skipping evdev pass-through (hosts only \
-             support these via Steam/hidraw); using Xbox 360 emulation"
+            "Valve controller: leaving evdev node to the HID pass-through path"
         );
         shared.mark_ignored(path);
         return;

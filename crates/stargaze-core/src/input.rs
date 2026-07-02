@@ -99,6 +99,133 @@ pub enum InputEvent {
         /// Raw events; the server appends the terminating `SYN_REPORT`.
         events: Vec<RawGamepadEvent>,
     },
+    /// A HID device (e.g. a Steam Controller) is forwarded at the raw
+    /// HID level: the server rebuilds it via `/dev/uhid`, so the host
+    /// kernel attaches the real driver (hid-steam) and Steam Input sees
+    /// a genuine device. Used for controllers hosts only support through
+    /// their hidraw stack, where an evdev-level clone is invisible.
+    HidPassthroughConnected {
+        /// Client-chosen slot (0..[`MAX_HID_PASSTHROUGH`]), unique per
+        /// forwarded hidraw node.
+        hid: u8,
+        /// Identity and HID report descriptor of the device.
+        descriptor: HidDeviceDescriptor,
+    },
+    /// A forwarded HID device disappeared on the client; the server
+    /// destroys the matching uhid device.
+    HidPassthroughDisconnected {
+        /// HID slot being torn down.
+        hid: u8,
+    },
+    /// One raw input report read from the client's hidraw node,
+    /// forwarded verbatim (leading report-id byte included exactly when
+    /// the device uses numbered reports, matching uhid expectations).
+    HidPassthroughReport {
+        /// HID slot the report belongs to.
+        hid: u8,
+        /// Raw report bytes.
+        data: Vec<u8>,
+    },
+    /// Reply to a server-initiated [`HidHostRequest::GetReport`] or
+    /// [`HidHostRequest::SetReport`]: the client executed the request
+    /// against the real device and reports the outcome.
+    HidPassthroughReply {
+        /// HID slot the reply belongs to.
+        hid: u8,
+        /// Kernel request id echoed from the host request.
+        request: u32,
+        /// Which request kind this answers.
+        kind: HidReplyKind,
+        /// Whether the request failed on the real device.
+        err: bool,
+        /// Report bytes for `GetReport` replies (empty for `SetReport`).
+        data: Vec<u8>,
+    },
+}
+
+/// Maximum number of simultaneously forwarded HID devices.
+pub const MAX_HID_PASSTHROUGH: u8 = 8;
+
+/// Identity of a HID device forwarded at the raw report level, read
+/// from the client's hidraw node and replayed into `/dev/uhid` on the
+/// server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HidDeviceDescriptor {
+    /// Device name (`HID_NAME`, e.g. "Wireless Steam Controller").
+    pub name: String,
+    /// Physical location string (`HID_PHYS`).
+    pub phys: String,
+    /// Unique id / serial (`HID_UNIQ`); Steam uses this for pairing
+    /// identity, so it is forwarded verbatim.
+    pub uniq: String,
+    /// Bus type (`BUS_USB`, `BUS_BLUETOOTH`, ...).
+    pub bus_type: u32,
+    /// Vendor id.
+    pub vendor: u16,
+    /// Product id.
+    pub product: u16,
+    /// Raw HID report descriptor bytes.
+    pub report_descriptor: Vec<u8>,
+}
+
+/// Which request a [`InputEvent::HidPassthroughReply`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HidReplyKind {
+    /// Reply to a `GetReport` (carries report bytes).
+    GetReport,
+    /// Reply to a `SetReport` (status only).
+    SetReport,
+}
+
+/// HID report class, mirroring the kernel's `uhid_report_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HidReportType {
+    /// Feature report (configuration; what hid-steam mostly uses).
+    Feature,
+    /// Output report (host → device, e.g. rumble).
+    Output,
+    /// Input report (device → host).
+    Input,
+}
+
+/// A request the server's uhid device received from the host kernel or
+/// driver, forwarded to the client for execution on the real device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HidHostRequest {
+    /// Write an output report to the device (fire-and-forget).
+    Output {
+        /// HID slot.
+        hid: u8,
+        /// Raw report bytes, forwarded verbatim to a hidraw `write()`.
+        data: Vec<u8>,
+    },
+    /// Read a report from the device; the client answers with
+    /// [`InputEvent::HidPassthroughReply`] carrying the same `request`.
+    GetReport {
+        /// HID slot.
+        hid: u8,
+        /// Kernel request id, opaque to the client.
+        request: u32,
+        /// Report number (0 for unnumbered devices).
+        report_number: u8,
+        /// Report class to read.
+        report_type: HidReportType,
+    },
+    /// Write a report to the device; the client answers with
+    /// [`InputEvent::HidPassthroughReply`] carrying the same `request`.
+    SetReport {
+        /// HID slot.
+        hid: u8,
+        /// Kernel request id, opaque to the client.
+        request: u32,
+        /// Report number (0 for unnumbered devices).
+        report_number: u8,
+        /// Report class to write.
+        report_type: HidReportType,
+        /// Raw report bytes (leading report-number byte included, as
+        /// hid-core provides them).
+        data: Vec<u8>,
+    },
 }
 
 /// Identity and capability descriptor of a physical gamepad, read from

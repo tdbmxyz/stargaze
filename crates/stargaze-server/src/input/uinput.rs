@@ -8,11 +8,14 @@ use evdev::{
     KeyCode, RelativeAxisCode, UinputAbsSetup,
 };
 use stargaze_core::input::{
-    GamepadAxis, GamepadButton, GamepadDescriptor, InputEvent, MAX_GAMEPADS, MouseButton,
-    RawGamepadEvent,
+    GamepadAxis, GamepadButton, GamepadDescriptor, HidReplyKind, InputEvent, MAX_GAMEPADS,
+    MAX_HID_PASSTHROUGH, MouseButton, RawGamepadEvent,
 };
+use stargaze_core::transport::ControlMessage;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+use super::uhid::UhidDevice;
 
 #[derive(Debug)]
 pub enum InputError {
@@ -52,6 +55,11 @@ pub(crate) struct VirtualDevices {
     /// Virtual gamepads keyed by pad slot, created on demand when the
     /// client connects a controller and removed when it disconnects.
     gamepads: HashMap<u8, VirtualDevice>,
+    /// uhid devices keyed by HID slot, mirroring client controllers
+    /// forwarded at the raw HID level (e.g. Steam Controllers).
+    hids: HashMap<u8, UhidDevice>,
+    /// Outbound path for host-side HID requests toward the client.
+    hid_out_tx: mpsc::Sender<ControlMessage>,
 }
 
 impl VirtualDevices {
@@ -75,13 +83,17 @@ impl VirtualDevices {
     }
 }
 
-pub(crate) fn create_virtual_devices() -> Result<VirtualDevices, InputError> {
+pub(crate) fn create_virtual_devices(
+    hid_out_tx: mpsc::Sender<ControlMessage>,
+) -> Result<VirtualDevices, InputError> {
     let keyboard = create_virtual_keyboard()?;
     let mouse = create_virtual_mouse()?;
     Ok(VirtualDevices {
         keyboard,
         mouse,
         gamepads: HashMap::new(),
+        hids: HashMap::new(),
+        hid_out_tx,
     })
 }
 
@@ -362,6 +374,57 @@ fn inject_event(devices: &mut VirtualDevices, event: &InputEvent) -> Result<(), 
             if !evs.is_empty() {
                 evs.push(syn);
                 devices.gamepad(*pad)?.emit(&evs)?;
+            }
+        }
+        InputEvent::HidPassthroughConnected { hid, descriptor } => {
+            if *hid >= MAX_HID_PASSTHROUGH {
+                warn!(hid = *hid, "HID slot exceeds maximum, ignoring device");
+                return Ok(());
+            }
+            match UhidDevice::create(*hid, descriptor, devices.hid_out_tx.clone()) {
+                Ok(device) => {
+                    info!(
+                        hid = *hid,
+                        name = %descriptor.name,
+                        vendor = format!("{:04x}", descriptor.vendor),
+                        product = format!("{:04x}", descriptor.product),
+                        "Created uhid device (HID pass-through)"
+                    );
+                    // Replacing an entry drops (and destroys) any stale
+                    // device left over from a previous session.
+                    devices.hids.insert(*hid, device);
+                }
+                Err(e) => warn!(
+                    hid = *hid,
+                    name = %descriptor.name,
+                    "Failed to create uhid device ({e}); is /dev/uhid \
+                     accessible? The forwarded controller will be dead \
+                     until this is fixed"
+                ),
+            }
+        }
+        InputEvent::HidPassthroughDisconnected { hid } => {
+            if devices.hids.remove(hid).is_some() {
+                info!(hid = *hid, "Removed uhid device");
+            }
+        }
+        InputEvent::HidPassthroughReport { hid, data } => {
+            if let Some(device) = devices.hids.get_mut(hid) {
+                device.input(data)?;
+            }
+        }
+        InputEvent::HidPassthroughReply {
+            hid,
+            request,
+            kind,
+            err,
+            data,
+        } => {
+            if let Some(device) = devices.hids.get_mut(hid) {
+                match kind {
+                    HidReplyKind::GetReport => device.get_report_reply(*request, *err, data)?,
+                    HidReplyKind::SetReport => device.set_report_reply(*request, *err)?,
+                }
             }
         }
     }

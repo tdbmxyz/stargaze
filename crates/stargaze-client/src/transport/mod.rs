@@ -84,6 +84,7 @@ pub async fn connect(
         mpsc::Sender<()>,
         RttProbe,
         std::sync::Arc<NetStats>,
+        mpsc::Receiver<stargaze_core::input::HidHostRequest>,
     ),
     TransportError,
 > {
@@ -118,6 +119,16 @@ pub async fn connect(
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>(64);
     // Decoder → transport keyframe requests (sent after decode failures).
     let (idr_tx, idr_rx) = mpsc::channel::<()>(4);
+    // Server → client HID requests (uhid output/get/set report), routed
+    // to the HID pass-through handler. The read task owns the control
+    // stream's receive half for the rest of the session.
+    let (hid_request_tx, hid_request_rx) =
+        mpsc::channel::<stargaze_core::input::HidHostRequest>(16);
+    tokio::spawn(async move {
+        if let Err(e) = receiver::control_read_loop(recv_stream, hid_request_tx).await {
+            error!("Control read loop error: {e}");
+        }
+    });
 
     // Cloneable handle for RTT queries from the stats overlay.
     let rtt_conn = connection.clone();
@@ -151,5 +162,6 @@ pub async fn connect(
         idr_tx,
         rtt_probe,
         net_stats,
+        hid_request_rx,
     ))
 }

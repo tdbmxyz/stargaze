@@ -1,3 +1,4 @@
+pub(crate) mod uhid;
 pub(crate) mod uinput;
 
 use std::sync::Arc;
@@ -49,8 +50,13 @@ impl Drop for InputSession {
 ///
 /// Returns `InputError` if the injection thread cannot be spawned or
 /// virtual device initialization fails.
+///
+/// `hid_out_tx` carries host-side HID requests (output reports, get/set
+/// report) from forwarded uhid devices back to the client's control
+/// stream.
 pub fn start_input_injection(
     input_rx: mpsc::Receiver<InputEvent>,
+    hid_out_tx: mpsc::Sender<stargaze_core::transport::ControlMessage>,
 ) -> Result<InputSession, InputError> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
@@ -60,7 +66,7 @@ pub fn start_input_injection(
     let thread_handle = thread::Builder::new()
         .name("stargaze-input".to_string())
         .spawn(move || {
-            match uinput::create_virtual_devices() {
+            match uinput::create_virtual_devices(hid_out_tx) {
                 Ok(devices) => {
                     let _ = init_tx.send(Ok(()));
                     if let Err(e) = uinput::run_injection_loop(devices, input_rx, &shutdown_clone) {

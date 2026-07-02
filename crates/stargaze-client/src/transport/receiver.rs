@@ -334,6 +334,49 @@ async fn send_idr_request(control_send: &mut quinn::SendStream) -> Result<(), Tr
     Ok(())
 }
 
+/// Reads server-initiated control messages for the whole session.
+///
+/// The server only sends [`ControlMessage::HidRequest`] after the
+/// handshake; requests are routed to the HID pass-through handler.
+/// Returns cleanly when the stream or connection closes.
+///
+/// # Errors
+///
+/// Returns [`TransportError::ControlError`] on malformed framing.
+pub(crate) async fn control_read_loop(
+    mut recv_stream: quinn::RecvStream,
+    hid_request_tx: mpsc::Sender<stargaze_core::input::HidHostRequest>,
+) -> Result<(), TransportError> {
+    loop {
+        let mut len_buf = [0u8; 4];
+        if recv_stream.read_exact(&mut len_buf).await.is_err() {
+            // Stream finished or connection closed — session over.
+            return Ok(());
+        }
+        let msg_len = u32::from_le_bytes(len_buf) as usize;
+        if msg_len > 65536 {
+            return Err(TransportError::ControlError(
+                "control message too large".to_string(),
+            ));
+        }
+        let mut body = vec![0u8; msg_len];
+        recv_stream
+            .read_exact(&mut body)
+            .await
+            .map_err(|e| TransportError::ControlError(format!("read body: {e}")))?;
+
+        match stargaze_core::transport::deserialize_control_message(&body) {
+            Ok(ControlMessage::HidRequest(request)) => {
+                if hid_request_tx.send(request).await.is_err() {
+                    debug!("HID request handler gone, dropping request");
+                }
+            }
+            Ok(other) => debug!("Ignoring server control message: {other:?}"),
+            Err(e) => warn!("Failed to decode server control message: {e}"),
+        }
+    }
+}
+
 pub(crate) async fn receive_loop(
     connection: quinn::Connection,
     mut control_send: quinn::SendStream,

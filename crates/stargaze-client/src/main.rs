@@ -7,7 +7,7 @@ use stargaze_core::mic_forward;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use stargaze_client::{decode, gamepad, render, transport};
+use stargaze_client::{decode, gamepad, hidpass, render, transport};
 
 /// Stargaze streaming client — connects to a server, decodes video/audio, and forwards input.
 // Doc comments here are clap help text rendered verbatim; list items align
@@ -44,12 +44,13 @@ struct Cli {
     #[arg(long)]
     mic_forward_port: Option<u16>,
 
-    /// Forward physical gamepads at the evdev level [default: true].
+    /// Forward physical gamepads to the server [default: true].
     ///
-    /// - true:  the server clones the real controller (name, vendor/
-    ///          product ids, button/axis layout), so the host sees e.g.
-    ///          an actual Steam Controller. Devices that cannot be
-    ///          opened or grabbed fall back to emulation automatically.
+    /// - true:  Valve controllers (Steam Controller, Steam Deck) are
+    ///          forwarded at the HID level — the host rebuilds the real
+    ///          device via uhid and Steam Input drives it natively.
+    ///          Other pads are cloned at the evdev level. Devices that
+    ///          cannot be claimed fall back to Xbox 360 emulation.
     /// - false: every controller is emulated as an Xbox 360 pad.
     #[arg(long, verbatim_doc_comment)]
     gamepad_passthrough: Option<bool>,
@@ -173,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
         decoder_idr_tx,
         rtt_probe,
         net_stats,
+        hid_request_rx,
     ) = transport::connect(&cfg, session_request).await?;
 
     // Use the server-confirmed resolution for decoding and rendering.
@@ -208,9 +210,6 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // SDL2 must be initialized on the main thread.
-    let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
-
     // Bridge: SDL event loop (std::sync::mpsc) → tokio channel → transport.
     // A plain detached OS thread, not spawn_blocking: it blocks in recv()
     // with senders held by long-lived gamepad scanner/reader threads, so
@@ -231,16 +230,33 @@ async fn main() -> anyhow::Result<()> {
         bail!("Failed to spawn input bridge thread: {e}");
     }
 
-    // Gamepads: evdev pass-through (server clones the real device) with
-    // automatic per-device fallback to SDL → Xbox 360 emulation. Started
-    // before the SDL loop so devices present at startup are grabbed
-    // before SDL delivers their hotplug events.
+    // Gamepads, started before SDL init so devices present at startup
+    // are claimed before SDL enumerates them:
+    // - Valve controllers are forwarded at the HID level (server rebuilds
+    //   them via uhid so Steam Input sees the real device);
+    // - other pads are passed through at the evdev level;
+    // - anything unclaimed falls back to SDL → Xbox 360 emulation.
     let gamepads = gamepad::SharedGamepads::new();
     if cfg.gamepad_passthrough {
+        let hid_claimed = hidpass::start(gamepads.clone(), sdl_input_tx.clone(), hid_request_rx);
+        if hid_claimed {
+            // Keep SDL's HIDAPI drivers off the forwarded devices: they
+            // would fight over the hidraw node (mode switches, lizard
+            // handling) while we forward its reports.
+            if !sdl2::hint::set("SDL_HIDAPI_IGNORE_DEVICES", "0x28de/0x0000") {
+                tracing::warn!(
+                    "Could not set SDL_HIDAPI_IGNORE_DEVICES; SDL may \
+                     interfere with HID pass-through"
+                );
+            }
+        }
         gamepad::start_passthrough(gamepads.clone(), sdl_input_tx.clone());
     } else {
         info!("Gamepad pass-through disabled; using Xbox 360 emulation");
     }
+
+    // SDL2 must be initialized on the main thread.
+    let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
 
     // Start the audio decoder thread — sends decoded PCM to a channel.
     let (audio_decoder_session, audio_pcm_rx) =

@@ -284,9 +284,13 @@ async fn main() -> anyhow::Result<()> {
         encode::start_audio_encoder(audio_encoder_config, audio_frames)?;
     info!("Audio encoder started");
 
-    // Start input injection pipeline.
+    // Start input injection pipeline. The hid_out channel carries
+    // host-side HID requests (uhid output/get/set report) back to the
+    // client via the control stream.
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<stargaze_core::input::InputEvent>(64);
-    let input_session = input::start_input_injection(input_rx)?;
+    let (hid_out_tx, hid_out_rx) =
+        tokio::sync::mpsc::channel::<stargaze_core::transport::ControlMessage>(64);
+    let input_session = input::start_input_injection(input_rx, hid_out_tx)?;
     info!("Input injection started");
 
     // Optionally start rsonance receiver for mic forwarding.
@@ -316,6 +320,7 @@ async fn main() -> anyhow::Result<()> {
         audio_packets,
         idr_tx,
         input_tx,
+        hid_out_rx,
     )?;
     info!(
         "Transport started on {}, waiting for client connection...",

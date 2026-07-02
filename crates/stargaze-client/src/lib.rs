@@ -4,5 +4,6 @@
 
 pub mod decode;
 pub mod gamepad;
+pub mod hidpass;
 pub mod render;
 pub mod transport;

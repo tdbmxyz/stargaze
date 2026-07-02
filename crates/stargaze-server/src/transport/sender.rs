@@ -168,6 +168,34 @@ pub(crate) async fn handle_control_messages(
     }
 }
 
+/// Forwards host-side HID requests (from uhid devices) to the client
+/// over the control stream.
+///
+/// Runs for the whole session. If the request channel closes (input
+/// subsystem gone), this pends forever instead of returning, so it
+/// never ends an otherwise healthy session from inside the `select!`.
+///
+/// # Errors
+///
+/// Returns [`TransportError::ControlError`] if writing to the control
+/// stream fails.
+pub(crate) async fn forward_hid_requests(
+    send_stream: &mut quinn::SendStream,
+    hid_out_rx: &mut mpsc::Receiver<stargaze_core::transport::ControlMessage>,
+) -> Result<(), TransportError> {
+    loop {
+        let Some(msg) = hid_out_rx.recv().await else {
+            std::future::pending::<()>().await;
+            unreachable!();
+        };
+        let bytes = stargaze_core::transport::serialize_control_message(&msg)?;
+        send_stream
+            .write_all(&bytes)
+            .await
+            .map_err(|e| TransportError::ControlError(format!("send HID request: {e}")))?;
+    }
+}
+
 /// Sends encoded packets as fragmented `QUIC` datagrams.
 ///
 /// Runs until the packet channel closes.

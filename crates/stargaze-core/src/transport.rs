@@ -116,6 +116,10 @@ pub enum ControlMessage {
     },
     /// Client -> Server: input event from keyboard, mouse, or gamepad.
     Input(InputEvent),
+    /// Server -> Client: a request from the host kernel/driver for a
+    /// HID device forwarded via uhid (output report, get/set report).
+    /// The client executes it on the real device via hidraw.
+    HidRequest(crate::input::HidHostRequest),
 }
 
 /// A fully reassembled frame ready for decoding.
@@ -435,6 +439,73 @@ mod tests {
         let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
         let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn control_message_hid_passthrough_round_trip() {
+        use crate::input::{HidDeviceDescriptor, HidReplyKind, InputEvent};
+        let msgs = [
+            ControlMessage::Input(InputEvent::HidPassthroughConnected {
+                hid: 0,
+                descriptor: HidDeviceDescriptor {
+                    name: "Wireless Steam Controller".to_string(),
+                    phys: "usb-0000:00:14.0-2/input1".to_string(),
+                    uniq: "12345ABC".to_string(),
+                    bus_type: 0x03,
+                    vendor: 0x28de,
+                    product: 0x1142,
+                    report_descriptor: vec![0x06, 0x00, 0xff, 0x09, 0x01],
+                },
+            }),
+            ControlMessage::Input(InputEvent::HidPassthroughReport {
+                hid: 0,
+                data: vec![1, 2, 3, 4],
+            }),
+            ControlMessage::Input(InputEvent::HidPassthroughReply {
+                hid: 0,
+                request: 7,
+                kind: HidReplyKind::GetReport,
+                err: false,
+                data: vec![0, 0xaa],
+            }),
+            ControlMessage::Input(InputEvent::HidPassthroughDisconnected { hid: 0 }),
+        ];
+        for msg in msgs {
+            let bytes = serialize_control_message(&msg).unwrap();
+            let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+            let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();
+            assert_eq!(decoded, msg);
+        }
+    }
+
+    #[test]
+    fn control_message_hid_request_round_trip() {
+        use crate::input::{HidHostRequest, HidReportType};
+        let msgs = [
+            ControlMessage::HidRequest(HidHostRequest::Output {
+                hid: 1,
+                data: vec![0, 5, 6],
+            }),
+            ControlMessage::HidRequest(HidHostRequest::GetReport {
+                hid: 1,
+                request: 42,
+                report_number: 0,
+                report_type: HidReportType::Feature,
+            }),
+            ControlMessage::HidRequest(HidHostRequest::SetReport {
+                hid: 1,
+                request: 43,
+                report_number: 0,
+                report_type: HidReportType::Feature,
+                data: vec![0, 0x87, 0x03],
+            }),
+        ];
+        for msg in msgs {
+            let bytes = serialize_control_message(&msg).unwrap();
+            let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+            let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();
+            assert_eq!(decoded, msg);
+        }
     }
 
     #[test]

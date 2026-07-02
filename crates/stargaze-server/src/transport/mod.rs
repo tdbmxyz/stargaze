@@ -59,6 +59,7 @@ impl ServerTransport {
 /// * `audio_packets` — Receiver for encoded audio packets from the audio encoder
 /// * `idr_tx` — Sender to signal the video encoder to produce IDR keyframes
 /// * `input_tx` — Sender to forward client input events to the input injection pipeline
+/// * `hid_out_rx` — Receiver of host-side HID requests to forward to the client
 ///
 /// # Errors
 ///
@@ -69,6 +70,7 @@ pub fn start_server_transport(
     audio_packets: mpsc::Receiver<EncodedPacket>,
     idr_tx: watch::Sender<u64>,
     input_tx: mpsc::Sender<InputEvent>,
+    hid_out_rx: mpsc::Receiver<stargaze_core::transport::ControlMessage>,
 ) -> Result<ServerTransport, TransportError> {
     let bind_addr: std::net::SocketAddr = format!("{}:{}", config.bind_address, config.port)
         .parse()
@@ -89,6 +91,7 @@ pub fn start_server_transport(
             audio_packets,
             idr_tx,
             input_tx,
+            hid_out_rx,
         )
         .await
         {
@@ -105,6 +108,7 @@ pub fn start_server_transport(
 /// Main server loop: accepts clients one at a time, runs a streaming
 /// session for each, and goes back to accepting when the client
 /// disconnects — so a new client can reconnect to the running session.
+#[allow(clippy::too_many_arguments)]
 async fn run_server_loop(
     endpoint: quinn::Endpoint,
     config: ServerConfig,
@@ -112,6 +116,7 @@ async fn run_server_loop(
     mut audio_packets: mpsc::Receiver<EncodedPacket>,
     idr_tx: watch::Sender<u64>,
     input_tx: mpsc::Sender<InputEvent>,
+    mut hid_out_rx: mpsc::Receiver<stargaze_core::transport::ControlMessage>,
 ) -> Result<(), TransportError> {
     loop {
         let Some(incoming) = endpoint.accept().await else {
@@ -139,6 +144,7 @@ async fn run_server_loop(
             &mut audio_packets,
             &idr_tx,
             &input_tx,
+            &mut hid_out_rx,
         )
         .await
         {
@@ -153,6 +159,7 @@ async fn run_server_loop(
 /// Runs one streaming session on an established connection: handshake,
 /// then concurrent video/audio sending and control-message handling
 /// until the connection closes.
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     config: &ServerConfig,
     connection: &quinn::Connection,
@@ -160,6 +167,7 @@ async fn run_session(
     audio_packets: &mut mpsc::Receiver<EncodedPacket>,
     idr_tx: &watch::Sender<u64>,
     input_tx: &mpsc::Sender<InputEvent>,
+    hid_out_rx: &mut mpsc::Receiver<stargaze_core::transport::ControlMessage>,
 ) -> Result<(), TransportError> {
     let (mut send_stream, mut recv_stream) = connection.accept_bi().await.map_err(|e| {
         TransportError::ConnectionError(format!("failed to accept control stream: {e}"))
@@ -199,6 +207,11 @@ async fn run_session(
         result = sender::send_packets(connection, audio_packets, STREAM_TYPE_AUDIO) => {
             if let Err(e) = result {
                 warn!("Audio send error: {e}");
+            }
+        }
+        result = sender::forward_hid_requests(&mut send_stream, hid_out_rx) => {
+            if let Err(e) = result {
+                warn!("HID request send error: {e}");
             }
         }
     }
@@ -326,9 +339,12 @@ mod tests {
         let (_audio_tx, audio_rx) = mpsc::channel::<EncodedPacket>(4);
         let (idr_tx, idr_rx) = tokio::sync::watch::channel(0u64);
         let (input_tx, _input_rx) = mpsc::channel::<InputEvent>(8);
+        let (_hid_out_tx, hid_out_rx) =
+            mpsc::channel::<stargaze_core::transport::ControlMessage>(8);
 
-        let transport = start_server_transport(&config, video_rx, audio_rx, idr_tx, input_tx)
-            .expect("transport should start");
+        let transport =
+            start_server_transport(&config, video_rx, audio_rx, idr_tx, input_tx, hid_out_rx)
+                .expect("transport should start");
         let addr = transport.local_addr();
 
         let run = async {
