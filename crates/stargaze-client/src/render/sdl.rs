@@ -86,6 +86,15 @@ impl Controllers {
             );
             return;
         };
+        if shared.passthrough_was_lost(vendor, product) {
+            warn!(
+                name = controller.name(),
+                pad,
+                "Pass-through for this controller was interrupted (its \
+                 evdev node vanished, typically because another process \
+                 opened it via hidraw); downgrading to Xbox 360 emulation"
+            );
+        }
         info!(
             name = controller.name(),
             pad, "Game controller connected (Xbox 360 emulation)"
