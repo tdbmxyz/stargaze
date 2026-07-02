@@ -1,0 +1,30 @@
+# CI: format, lint, and test on every push/PR to the long-lived
+# branches (Git flow: develop = integration, main = releases).
+#
+# Hardware-dependent tests (NVENC, uinput, live compositor) are
+# #[ignore]d and do not run here — a green suite is not hardware
+# verification (see AGENTS.md).
+name: ci
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: cargo fmt
+        run: nix develop -c cargo fmt --check
+
+      - name: cargo clippy
+        run: nix develop -c cargo clippy --workspace --all-targets -- -W clippy::pedantic
+
+      - name: cargo test
+        run: nix develop -c cargo test --workspace

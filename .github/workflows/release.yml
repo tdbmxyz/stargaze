@@ -1,0 +1,74 @@
+# Release build: runs when a semver tag (v*) is pushed, builds the
+# portable client AppImage with Nix, and attaches it to a GitHub
+# Release.
+#
+# Only the client is published as a prebuilt binary: it is the piece
+# that runs on non-Nix machines (e.g. a Steam Deck).  The server
+# hard-requires CUDA/NVENC and is consumed through the Nix flake
+# (`nix build .#stargaze-server`) on the host instead.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Check tag matches workspace version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          flake_version="$(sed -n 's/.*version = "\(.*\)";/\1/p' flake.nix | head -1)"
+          echo "tag=$tag cargo=$cargo_version flake=$flake_version"
+          test "$tag" = "$cargo_version"
+          test "$tag" = "$flake_version"
+
+      - name: Build client AppImage
+        run: |
+          nix bundle --bundler github:ralismark/nix-appimage \
+            .#stargaze-client-portable -o client-bundle
+          version="${GITHUB_REF_NAME#v}"
+          artifact="stargaze-client-${version}-x86_64.AppImage"
+          cp -L client-bundle "$artifact"
+          chmod +x "$artifact"
+          sha256sum "$artifact" > "$artifact.sha256"
+          echo "ARTIFACT=$artifact" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ${{ env.ARTIFACT }}
+            ${{ env.ARTIFACT }}.sha256
+          body: |
+            ## Prebuilt client
+
+            `stargaze-client` is attached as a self-contained x86_64 Linux
+            AppImage (all libraries bundled — FFmpeg, SDL2, Mesa). Make it
+            executable and run it; no installation needed. Works on any
+            recent x86_64 Linux with FUSE, including the Steam Deck:
+
+            ```bash
+            chmod +x stargaze-client-*.AppImage
+            ./stargaze-client-*.AppImage --server <host-ip>
+            ```
+
+            ## Server
+
+            The server requires an NVIDIA GPU (NVENC/CUDA) and is built
+            from the Nix flake instead of a prebuilt binary:
+
+            ```bash
+            nix build github:tdbmxyz/stargaze/${{ github.ref_name }}#stargaze-server
+            ```
