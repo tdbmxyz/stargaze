@@ -134,6 +134,8 @@ Logging uses `tracing` with `RUST_LOG` (default `info`). The first few frames of
 RUST_LOG=debug stargaze-client --server 192.168.1.10
 ```
 
+FFmpeg's own diagnostics are routed through `tracing` under the `ffmpeg` target (filter with e.g. `RUST_LOG=info,ffmpeg=off`). Decoder warnings like `Could not find ref with POC N` are expected after network loss: a frame was dropped, the picture shows artifacts, and the client has already requested an IDR keyframe that clears them — the receiver logs the loss and the recovery alongside.
+
 ## Project status
 
 All MVP milestones (capture, encode, transport, decode, render, audio, input, mic forwarding, cursor) are implemented. See [`docs/roadmap.md`](docs/roadmap.md) for follow-up work and known issues, and [`AGENTS.md`](AGENTS.md) for architecture invariants and development conventions.

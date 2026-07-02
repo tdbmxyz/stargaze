@@ -70,6 +70,10 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    // Route FFmpeg's own diagnostics (e.g. HEVC reference errors during
+    // loss recovery) through tracing instead of raw stderr.
+    stargaze_core::avlog::install_ffmpeg_log_bridge();
 }
 
 /// Builds the final [`ClientConfig`] by loading from file and applying CLI overrides.
