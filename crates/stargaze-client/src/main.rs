@@ -208,34 +208,28 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // SDL's HIDAPI joystick drivers open controllers via hidraw. For
-    // hid-steam devices (Steam Controller, Steam Deck) the kernel then
-    // unregisters the evdev node — the very node the pass-through path
-    // has grabbed — silently degrading the controller to Xbox 360
-    // emulation. Force SDL onto its evdev backend, which respects the
-    // grab; the emulation fallback works the same either way.
-    if cfg.gamepad_passthrough && !sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "0") {
-        tracing::warn!(
-            "Could not disable SDL HIDAPI joysticks; \
-             pass-through may lose Steam controllers to SDL"
-        );
-    }
-
     // SDL2 must be initialized on the main thread.
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
 
     // Bridge: SDL event loop (std::sync::mpsc) → tokio channel → transport.
-    // The std receiver blocks, so this must run on a blocking thread rather
-    // than a tokio worker.
+    // A plain detached OS thread, not spawn_blocking: it blocks in recv()
+    // with senders held by long-lived gamepad scanner/reader threads, so
+    // it only wakes on the next input event — a tokio blocking task would
+    // stall runtime shutdown until then (client hung on quit).
     let (sdl_input_tx, sdl_input_rx) =
         std::sync::mpsc::channel::<stargaze_core::input::InputEvent>();
-    let bridge_handle = tokio::task::spawn_blocking(move || {
-        while let Ok(event) = sdl_input_rx.recv() {
-            if transport_input_tx.blocking_send(event).is_err() {
-                break;
+    if let Err(e) = std::thread::Builder::new()
+        .name("stargaze-input-bridge".into())
+        .spawn(move || {
+            while let Ok(event) = sdl_input_rx.recv() {
+                if transport_input_tx.blocking_send(event).is_err() {
+                    break;
+                }
             }
-        }
-    });
+        })
+    {
+        bail!("Failed to spawn input bridge thread: {e}");
+    }
 
     // Gamepads: evdev pass-through (server clones the real device) with
     // automatic per-device fallback to SDL → Xbox 360 emulation. Started
@@ -281,7 +275,6 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     info!("Renderer closed, shutting down");
-    bridge_handle.abort();
     if let Some(ref mut child) = rsonance_child {
         mic_forward::stop_rsonance(child).await;
     }
