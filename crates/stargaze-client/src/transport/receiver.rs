@@ -278,6 +278,18 @@ impl FrameAssembler {
             if lost {
                 // Drop the incomplete frame if it exists.
                 self.pending.remove(&key);
+                if stream_type == STREAM_TYPE_VIDEO {
+                    // Downstream consequence: the decoder is now missing a
+                    // reference frame and will log `ffmpeg` warnings such
+                    // as "Could not find ref with POC N" (with visible
+                    // artifacts) until the requested IDR keyframe arrives.
+                    warn!(
+                        frame_index = next,
+                        "Video frame lost on the network; skipping it and \
+                         requesting an IDR (expect decoder reference warnings \
+                         until the keyframe arrives)"
+                    );
+                }
                 next = next.wrapping_add(1);
                 skipped_gap = true;
                 continue;
