@@ -37,6 +37,7 @@ pub fn start_renderer(
     stats_file: Option<std::path::PathBuf>,
     commands: &SessionCommands,
     zero_copy: &std::sync::atomic::AtomicBool,
+    gamepads: &crate::gamepad::SharedGamepads,
 ) -> Result<(), anyhow::Error> {
     sdl::run_sdl_loop(
         sdl,
@@ -50,5 +51,6 @@ pub fn start_renderer(
         stats_file.as_deref(),
         commands,
         zero_copy,
+        gamepads,
     )
 }
