@@ -7,7 +7,10 @@ use evdev::{
     AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, InputEvent as EvdevInputEvent, InputId,
     KeyCode, RelativeAxisCode, UinputAbsSetup,
 };
-use stargaze_core::input::{GamepadAxis, GamepadButton, InputEvent, MAX_GAMEPADS, MouseButton};
+use stargaze_core::input::{
+    GamepadAxis, GamepadButton, GamepadDescriptor, InputEvent, MAX_GAMEPADS, MouseButton,
+    RawGamepadEvent,
+};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -172,6 +175,64 @@ fn create_virtual_gamepad() -> Result<VirtualDevice, InputError> {
     Ok(device)
 }
 
+/// Maximum uinput device name length (`UINPUT_MAX_NAME_SIZE`, minus the
+/// NUL terminator).
+const MAX_DEVICE_NAME: usize = 79;
+
+/// Creates a virtual gamepad cloning a physical device passed through
+/// from the client: same name, bus/vendor/product/version, buttons, and
+/// absolute axes (with the original ranges), so the host identifies it
+/// as the real controller (e.g. "Steam Controller", "Steam Deck").
+fn create_passthrough_gamepad(desc: &GamepadDescriptor) -> Result<VirtualDevice, InputError> {
+    let mut keys = AttributeSet::<KeyCode>::new();
+    for code in &desc.keys {
+        keys.insert(KeyCode::new(*code));
+    }
+
+    let mut name = desc.name.clone();
+    if name.len() > MAX_DEVICE_NAME {
+        name.truncate(MAX_DEVICE_NAME);
+    }
+
+    let mut builder = VirtualDevice::builder()?
+        .name(name.as_str())
+        .input_id(InputId::new(
+            BusType(desc.bus_type),
+            desc.vendor,
+            desc.product,
+            desc.version,
+        ))
+        .with_keys(&keys)?;
+
+    for axis in &desc.abs_axes {
+        let info = AbsInfo::new(
+            axis.value,
+            axis.minimum,
+            axis.maximum,
+            axis.fuzz,
+            axis.flat,
+            axis.resolution,
+        );
+        builder =
+            builder.with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisCode(axis.code), info))?;
+    }
+
+    Ok(builder.build()?)
+}
+
+/// Converts a raw pass-through batch into evdev events, dropping event
+/// types a virtual gamepad must not replay (only `EV_KEY` and `EV_ABS`
+/// are meaningful; anything else is client-side noise).
+fn passthrough_batch(events: &[RawGamepadEvent]) -> Vec<EvdevInputEvent> {
+    events
+        .iter()
+        .filter(|e| {
+            e.event_type == evdev::EventType::KEY.0 || e.event_type == evdev::EventType::ABSOLUTE.0
+        })
+        .map(|e| EvdevInputEvent::new(e.event_type, e.code, e.value))
+        .collect()
+}
+
 pub(crate) fn run_injection_loop(
     mut devices: VirtualDevices,
     mut input_rx: mpsc::Receiver<InputEvent>,
@@ -263,6 +324,44 @@ fn inject_event(devices: &mut VirtualDevices, event: &InputEvent) -> Result<(), 
         InputEvent::GamepadDisconnected { pad } => {
             if devices.gamepads.remove(pad).is_some() {
                 info!(pad, "Removed virtual gamepad");
+            }
+        }
+        InputEvent::GamepadPassthroughConnected { pad, descriptor } => {
+            if *pad >= MAX_GAMEPADS {
+                return Err(InputError::SpawnFailed(format!(
+                    "gamepad slot {pad} exceeds maximum of {MAX_GAMEPADS}"
+                )));
+            }
+            match create_passthrough_gamepad(descriptor) {
+                Ok(device) => {
+                    info!(
+                        pad = *pad,
+                        name = %descriptor.name,
+                        vendor = format!("{:04x}", descriptor.vendor),
+                        product = format!("{:04x}", descriptor.product),
+                        "Created virtual gamepad (pass-through clone)"
+                    );
+                    devices.gamepads.insert(*pad, device);
+                }
+                Err(e) => {
+                    // Keep the slot usable: raw events land on an Xbox 360
+                    // layout instead. Codes usually line up for xpad-style
+                    // pads; exotic devices may misbehave until reconnect.
+                    warn!(
+                        pad = *pad,
+                        name = %descriptor.name,
+                        "Failed to clone pass-through gamepad ({e}); \
+                         falling back to Xbox 360 layout"
+                    );
+                    devices.gamepad(*pad)?;
+                }
+            }
+        }
+        InputEvent::GamepadPassthroughEvents { pad, events } => {
+            let mut evs = passthrough_batch(events);
+            if !evs.is_empty() {
+                evs.push(syn);
+                devices.gamepad(*pad)?.emit(&evs)?;
             }
         }
     }
@@ -500,5 +599,68 @@ mod tests {
     fn virtual_gamepad_creation() {
         let device = create_virtual_gamepad();
         assert!(device.is_ok(), "Virtual gamepad should be created");
+    }
+
+    #[test]
+    fn passthrough_batch_keeps_key_and_abs_only() {
+        let events = [
+            RawGamepadEvent {
+                event_type: evdev::EventType::KEY.0,
+                code: 0x130,
+                value: 1,
+            },
+            RawGamepadEvent {
+                event_type: evdev::EventType::SYNCHRONIZATION.0,
+                code: 0,
+                value: 0,
+            },
+            RawGamepadEvent {
+                event_type: evdev::EventType::ABSOLUTE.0,
+                code: 0,
+                value: -512,
+            },
+            RawGamepadEvent {
+                event_type: evdev::EventType::MISC.0,
+                code: 4,
+                value: 0x9000,
+            },
+        ];
+        let out = passthrough_batch(&events);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].event_type(), evdev::EventType::KEY);
+        assert_eq!(out[0].code(), 0x130);
+        assert_eq!(out[0].value(), 1);
+        assert_eq!(out[1].event_type(), evdev::EventType::ABSOLUTE);
+        assert_eq!(out[1].value(), -512);
+    }
+
+    /// Run manually: `cargo test -p stargaze-server -- --ignored passthrough_clone`
+    #[test]
+    #[ignore = "requires /dev/uinput access"]
+    fn passthrough_clone_creation() {
+        let descriptor = GamepadDescriptor {
+            name: "Steam Controller".to_string(),
+            bus_type: 0x03, // BUS_USB
+            vendor: 0x28de,
+            product: 0x1102,
+            version: 0x111,
+            keys: vec![
+                KeyCode::BTN_SOUTH.code(),
+                KeyCode::BTN_EAST.code(),
+                KeyCode::BTN_NORTH.code(),
+                KeyCode::BTN_WEST.code(),
+            ],
+            abs_axes: vec![stargaze_core::input::AbsAxisSpec {
+                code: AbsoluteAxisCode::ABS_X.0,
+                value: 0,
+                minimum: -32768,
+                maximum: 32767,
+                fuzz: 16,
+                flat: 128,
+                resolution: 0,
+            }],
+        };
+        let device = create_passthrough_gamepad(&descriptor);
+        assert!(device.is_ok(), "Pass-through clone should be created");
     }
 }

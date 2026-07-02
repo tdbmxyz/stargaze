@@ -1957,6 +1957,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "evdev",
  "ffmpeg-next",
  "ffmpeg-sys-next",
  "font8x8",
@@ -1980,6 +1981,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "directories",
+ "ffmpeg-sys-next",
  "libc",
  "postcard",
  "serde",
