@@ -227,6 +227,11 @@ pub struct ClientConfig {
     pub port: u16,
     /// Whether to start in fullscreen mode.
     pub fullscreen: bool,
+    /// Forward physical gamepads at the evdev level so the server clones
+    /// the real device (identity + capabilities) instead of emulating an
+    /// Xbox 360 pad. Devices that cannot be opened or grabbed fall back
+    /// to the emulated path automatically.
+    pub gamepad_passthrough: bool,
     /// Mic forwarding configuration.
     pub mic_forward: MicForwardConfig,
 }
@@ -237,6 +242,7 @@ impl Default for ClientConfig {
             server_address: String::new(),
             port: DEFAULT_PORT,
             fullscreen: true,
+            gamepad_passthrough: true,
             mic_forward: MicForwardConfig::default(),
         }
     }

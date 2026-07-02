@@ -1,0 +1,431 @@
+//! Gamepad pass-through: forwards physical controllers at the evdev
+//! level so the server clones the real device instead of emulating an
+//! Xbox 360 pad.
+//!
+//! A background scanner enumerates `/dev/input/event*`, and for every
+//! gamepad-capable node it can open it reads the device's identity
+//! (name, bus/vendor/product/version) and capabilities (buttons, axes
+//! with ranges), grabs the node exclusively (`EVIOCGRAB`), and streams
+//! raw events to the server. The server rebuilds an identical uinput
+//! device, so the host sees e.g. a real "Steam Controller" or
+//! "Steam Deck" instead of "Microsoft X-Box 360 pad".
+//!
+//! Fallback: any device that cannot be opened or grabbed (permissions,
+//! exotic nodes) is left untouched — SDL still sees it, and the
+//! existing SDL → Xbox-360-emulation path picks it up. The SDL loop
+//! consults [`SharedGamepads::is_grabbed`] to skip devices this module
+//! already owns, and both paths allocate pad slots from the same table
+//! so the server never sees two controllers on one slot.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use evdev::{Device, KeyCode};
+use stargaze_core::input::{
+    AbsAxisSpec, GamepadDescriptor, InputEvent, MAX_GAMEPADS, RawGamepadEvent,
+};
+use tracing::{debug, info, warn};
+
+/// How often the scanner looks for newly connected controllers.
+const SCAN_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Identifies who owns a pad slot: the SDL emulation path (keyed by SDL
+/// joystick instance id) or the evdev pass-through path (keyed by the
+/// device node path).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PadKey {
+    /// SDL joystick instance id (emulated Xbox 360 path).
+    Sdl(u32),
+    /// Evdev device node (pass-through path).
+    Evdev(PathBuf),
+}
+
+struct SharedState {
+    /// `slots[i]` holds the key occupying slot `i`.
+    slots: [Option<PadKey>; MAX_GAMEPADS as usize],
+    /// (vendor, product) pairs of devices currently grabbed by the
+    /// pass-through path; the SDL loop skips these.
+    grabbed: HashSet<(u16, u16)>,
+    /// Device nodes currently owned by a pass-through reader thread.
+    active_nodes: HashSet<PathBuf>,
+}
+
+/// Pad slot table and grab registry shared between the SDL event loop
+/// and the pass-through scanner/reader threads.
+pub struct SharedGamepads {
+    state: Mutex<SharedState>,
+    /// Bumped whenever the grabbed set changes, so the SDL loop can
+    /// cheaply detect that a device it emulates was taken over.
+    generation: AtomicU64,
+}
+
+impl SharedGamepads {
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(SharedState {
+                slots: [const { None }; MAX_GAMEPADS as usize],
+                grabbed: HashSet::new(),
+                active_nodes: HashSet::new(),
+            }),
+            generation: AtomicU64::new(0),
+        })
+    }
+
+    /// Assigns the lowest free slot to `key` and returns it.
+    ///
+    /// Returns the existing slot if the key is already registered, or
+    /// `None` if all slots are taken.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the slot table lock is poisoned.
+    pub fn allocate(&self, key: &PadKey) -> Option<u8> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(slot) = Self::find(&state, key) {
+            return Some(slot);
+        }
+        let free = state.slots.iter().position(Option::is_none)?;
+        state.slots[free] = Some(key.clone());
+        u8::try_from(free).ok()
+    }
+
+    /// Frees the slot held by `key`, returning it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the slot table lock is poisoned.
+    pub fn release(&self, key: &PadKey) -> Option<u8> {
+        let mut state = self.state.lock().unwrap();
+        let slot = Self::find(&state, key)?;
+        state.slots[slot as usize] = None;
+        Some(slot)
+    }
+
+    /// Returns the slot held by `key`, if any.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the slot table lock is poisoned.
+    pub fn get(&self, key: &PadKey) -> Option<u8> {
+        Self::find(&self.state.lock().unwrap(), key)
+    }
+
+    /// Whether a device with this (vendor, product) is grabbed by the
+    /// pass-through path. The SDL loop must not emulate such devices.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the slot table lock is poisoned.
+    pub fn is_grabbed(&self, vendor: u16, product: u16) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .grabbed
+            .contains(&(vendor, product))
+    }
+
+    /// Monotonic counter, bumped whenever the grabbed set changes.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn find(state: &SharedState, key: &PadKey) -> Option<u8> {
+        state
+            .slots
+            .iter()
+            .position(|s| s.as_ref() == Some(key))
+            .and_then(|i| u8::try_from(i).ok())
+    }
+
+    fn mark_grabbed(&self, node: PathBuf, vendor: u16, product: u16) {
+        let mut state = self.state.lock().unwrap();
+        state.grabbed.insert((vendor, product));
+        state.active_nodes.insert(node);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    fn unmark_grabbed(&self, node: &PathBuf, vendor: u16, product: u16) {
+        let mut state = self.state.lock().unwrap();
+        state.grabbed.remove(&(vendor, product));
+        state.active_nodes.remove(node);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    fn is_active_node(&self, node: &PathBuf) -> bool {
+        self.state.lock().unwrap().active_nodes.contains(node)
+    }
+}
+
+/// Extracts (vendor, product) from an SDL joystick GUID.
+///
+/// SDL encodes the USB ids little-endian at fixed offsets: bytes 4-5
+/// hold the vendor id and bytes 8-9 the product id.
+#[must_use]
+pub fn guid_vendor_product(guid: &[u8; 16]) -> (u16, u16) {
+    let vendor = u16::from_le_bytes([guid[4], guid[5]]);
+    let product = u16::from_le_bytes([guid[8], guid[9]]);
+    (vendor, product)
+}
+
+/// Whether an evdev key set describes a gamepad.
+///
+/// The kernel convention (Documentation/input/gamepad.rst) is that
+/// gamepads report `BTN_GAMEPAD` (= `BTN_SOUTH`).
+fn is_gamepad(keys: &evdev::AttributeSetRef<KeyCode>) -> bool {
+    keys.contains(KeyCode::BTN_SOUTH)
+}
+
+/// Builds the wire descriptor from an opened evdev device.
+fn build_descriptor(device: &Device) -> GamepadDescriptor {
+    let id = device.input_id();
+    let keys = device
+        .supported_keys()
+        .map(|set| set.iter().map(KeyCode::code).collect())
+        .unwrap_or_default();
+    let abs_axes = device
+        .get_absinfo()
+        .map(|iter| {
+            iter.map(|(code, info)| AbsAxisSpec {
+                code: code.0,
+                value: info.value(),
+                minimum: info.minimum(),
+                maximum: info.maximum(),
+                fuzz: info.fuzz(),
+                flat: info.flat(),
+                resolution: info.resolution(),
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+
+    GamepadDescriptor {
+        name: device.name().unwrap_or("Unknown Gamepad").to_string(),
+        bus_type: id.bus_type().0,
+        vendor: id.vendor(),
+        product: id.product(),
+        version: id.version(),
+        keys,
+        abs_axes,
+    }
+}
+
+/// Starts the pass-through scanner thread.
+///
+/// The initial scan runs synchronously before this returns, so devices
+/// present at startup are already grabbed by the time the SDL event
+/// loop starts delivering `ControllerDeviceAdded` events.
+pub fn start_passthrough(
+    shared: Arc<SharedGamepads>,
+    input_tx: std::sync::mpsc::Sender<InputEvent>,
+) {
+    scan_once(&shared, &input_tx);
+    let spawned = std::thread::Builder::new()
+        .name("stargaze-gamepad-scan".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(SCAN_INTERVAL);
+                scan_once(&shared, &input_tx);
+            }
+        });
+    if let Err(e) = spawned {
+        warn!("Failed to spawn gamepad scanner thread: {e}");
+    }
+}
+
+/// One enumeration pass: claim every new gamepad node we can grab.
+fn scan_once(shared: &Arc<SharedGamepads>, input_tx: &std::sync::mpsc::Sender<InputEvent>) {
+    for (path, device) in evdev::enumerate() {
+        if shared.is_active_node(&path) {
+            continue;
+        }
+        let Some(keys) = device.supported_keys() else {
+            continue;
+        };
+        if !is_gamepad(keys) {
+            continue;
+        }
+        claim_device(shared, input_tx, path, device);
+    }
+}
+
+/// Grabs a gamepad node, announces it to the server, and spawns its
+/// reader thread. On any failure the device is left to the SDL
+/// emulation path.
+fn claim_device(
+    shared: &Arc<SharedGamepads>,
+    input_tx: &std::sync::mpsc::Sender<InputEvent>,
+    path: PathBuf,
+    mut device: Device,
+) {
+    let descriptor = build_descriptor(&device);
+
+    if let Err(e) = device.grab() {
+        // Something else holds the device (or we lack permissions).
+        // SDL will emulate it instead.
+        info!(
+            name = %descriptor.name,
+            path = %path.display(),
+            "Cannot grab gamepad for pass-through ({e}); \
+             falling back to Xbox 360 emulation"
+        );
+        return;
+    }
+
+    let key = PadKey::Evdev(path.clone());
+    let Some(pad) = shared.allocate(&key) else {
+        warn!(
+            name = %descriptor.name,
+            "All gamepad slots taken, ignoring controller"
+        );
+        let _ = device.ungrab();
+        return;
+    };
+
+    info!(
+        name = %descriptor.name,
+        pad,
+        vendor = format!("{:04x}", descriptor.vendor),
+        product = format!("{:04x}", descriptor.product),
+        "Gamepad pass-through active (device cloned on the server)"
+    );
+    shared.mark_grabbed(path.clone(), descriptor.vendor, descriptor.product);
+
+    let announce = InputEvent::GamepadPassthroughConnected {
+        pad,
+        descriptor: descriptor.clone(),
+    };
+    if input_tx.send(announce).is_err() {
+        return; // Transport gone; the session is ending.
+    }
+
+    let shared = Arc::clone(shared);
+    let input_tx = input_tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("stargaze-pad{pad}"))
+        .spawn(move || read_loop(&shared, &input_tx, &path, device, pad, &descriptor));
+    if let Err(e) = spawned {
+        warn!("Failed to spawn gamepad reader thread: {e}");
+    }
+}
+
+/// Blocking per-device reader: forwards raw events until the device
+/// disappears or the transport closes.
+fn read_loop(
+    shared: &Arc<SharedGamepads>,
+    input_tx: &std::sync::mpsc::Sender<InputEvent>,
+    path: &PathBuf,
+    mut device: Device,
+    pad: u8,
+    descriptor: &GamepadDescriptor,
+) {
+    loop {
+        match device.fetch_events() {
+            Ok(events) => {
+                let batch: Vec<RawGamepadEvent> = events
+                    .filter(|ev| {
+                        matches!(
+                            ev.event_type(),
+                            evdev::EventType::KEY | evdev::EventType::ABSOLUTE
+                        )
+                    })
+                    .map(|ev| RawGamepadEvent {
+                        event_type: ev.event_type().0,
+                        code: ev.code(),
+                        value: ev.value(),
+                    })
+                    .collect();
+                if batch.is_empty() {
+                    continue;
+                }
+                if input_tx
+                    .send(InputEvent::GamepadPassthroughEvents { pad, events: batch })
+                    .is_err()
+                {
+                    debug!(pad, "Input channel closed, stopping gamepad reader");
+                    break;
+                }
+            }
+            Err(e) => {
+                info!(
+                    pad,
+                    name = %descriptor.name,
+                    "Gamepad disconnected ({e})"
+                );
+                let _ = input_tx.send(InputEvent::GamepadDisconnected { pad });
+                break;
+            }
+        }
+    }
+    shared.release(&PadKey::Evdev(path.clone()));
+    shared.unmark_grabbed(path, descriptor.vendor, descriptor.product);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slots_allocate_lowest_free_and_reuse() {
+        let shared = SharedGamepads::new();
+        let a = PadKey::Sdl(100);
+        let b = PadKey::Evdev(PathBuf::from("/dev/input/event7"));
+        let c = PadKey::Sdl(300);
+
+        assert_eq!(shared.allocate(&a), Some(0));
+        assert_eq!(shared.allocate(&b), Some(1));
+        assert_eq!(shared.allocate(&c), Some(2));
+
+        // Re-allocating an existing key returns its slot.
+        assert_eq!(shared.allocate(&b), Some(1));
+
+        // Releasing frees the slot for the next controller.
+        assert_eq!(shared.release(&b), Some(1));
+        assert_eq!(shared.get(&b), None);
+        assert_eq!(shared.allocate(&PadKey::Sdl(400)), Some(1));
+    }
+
+    #[test]
+    fn slots_full_returns_none() {
+        let shared = SharedGamepads::new();
+        for id in 0..u32::from(MAX_GAMEPADS) {
+            assert!(shared.allocate(&PadKey::Sdl(id)).is_some());
+        }
+        assert_eq!(shared.allocate(&PadKey::Sdl(99)), None);
+    }
+
+    #[test]
+    fn release_unknown_returns_none() {
+        let shared = SharedGamepads::new();
+        assert_eq!(shared.release(&PadKey::Sdl(42)), None);
+    }
+
+    #[test]
+    fn grab_registry_tracks_generation() {
+        let shared = SharedGamepads::new();
+        assert!(!shared.is_grabbed(0x28de, 0x1102));
+        let gen0 = shared.generation();
+
+        shared.mark_grabbed(PathBuf::from("/dev/input/event9"), 0x28de, 0x1102);
+        assert!(shared.is_grabbed(0x28de, 0x1102));
+        assert!(shared.generation() > gen0);
+
+        shared.unmark_grabbed(&PathBuf::from("/dev/input/event9"), 0x28de, 0x1102);
+        assert!(!shared.is_grabbed(0x28de, 0x1102));
+    }
+
+    #[test]
+    fn guid_extracts_vendor_product() {
+        // SDL GUID layout: bus(0-1) crc(2-3) vendor(4-5) 0(6-7)
+        // product(8-9) 0(10-11) version(12-13) driver-specific(14-15).
+        let mut guid = [0u8; 16];
+        guid[4] = 0xde;
+        guid[5] = 0x28; // 0x28de little-endian (Valve)
+        guid[8] = 0x02;
+        guid[9] = 0x11; // 0x1102 little-endian (Steam Controller)
+        assert_eq!(guid_vendor_product(&guid), (0x28de, 0x1102));
+    }
+}

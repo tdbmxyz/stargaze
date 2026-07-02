@@ -11,9 +11,10 @@ use tracing::{info, warn};
 use super::SessionCommands;
 use super::audio::create_audio_queue;
 use super::gl::GlRenderer;
-use super::input::{InputTracker, PadSlots, ShortcutAction, shortcut_action};
+use super::input::{InputTracker, ShortcutAction, shortcut_action};
 use super::stats::{ReportMeta, StatsOverlay, StatsRecorder, draw_overlay};
 use crate::decode::VideoFrame;
+use crate::gamepad::{PadKey, SharedGamepads, guid_vendor_product};
 use crate::transport::NetStats;
 
 /// Window title shown while input is captured ("inside" mode).
@@ -21,29 +22,49 @@ const TITLE_CAPTURED: &str = "Stargaze";
 /// Window title shown while input is released ("outside" mode).
 const TITLE_RELEASED: &str = "Stargaze — input released (Ctrl+Alt+Shift+Z to capture)";
 
-/// Connected game controllers: slot bookkeeping plus the open SDL handles
-/// (dropping a handle closes the controller, so they must stay alive).
+/// Connected game controllers on the SDL emulation path: the open SDL
+/// handles (dropping a handle closes the controller, so they must stay
+/// alive) plus each device's (vendor, product) for pass-through
+/// coordination. Pad slots live in [`SharedGamepads`], shared with the
+/// evdev pass-through threads.
 struct Controllers {
-    slots: PadSlots,
-    handles: HashMap<u32, GameController>,
+    handles: HashMap<u32, (GameController, (u16, u16))>,
 }
 
 impl Controllers {
     fn new() -> Self {
         Self {
-            slots: PadSlots::new(),
             handles: HashMap::new(),
         }
     }
 
     /// Opens the controller at `joystick_index` and assigns it a pad slot.
     /// Notifies the server so it creates the matching virtual device.
+    ///
+    /// Devices already grabbed by the evdev pass-through are skipped:
+    /// they are forwarded raw and must not be emulated a second time.
     fn add(
         &mut self,
         subsystem: &sdl2::GameControllerSubsystem,
+        joystick_subsystem: &sdl2::JoystickSubsystem,
         joystick_index: u32,
+        shared: &SharedGamepads,
         input_tx: &std::sync::mpsc::Sender<InputEvent>,
     ) {
+        let (vendor, product) = joystick_subsystem
+            .device_guid(joystick_index)
+            .map(|guid| guid_vendor_product(&guid.raw().data))
+            .unwrap_or_default();
+        if shared.is_grabbed(vendor, product) {
+            info!(
+                index = joystick_index,
+                vendor = format!("{vendor:04x}"),
+                product = format!("{product:04x}"),
+                "Controller handled by evdev pass-through, skipping SDL emulation"
+            );
+            return;
+        }
+
         let controller = match subsystem.open(joystick_index) {
             Ok(c) => c,
             Err(e) => {
@@ -58,31 +79,60 @@ impl Controllers {
         if self.handles.contains_key(&instance_id) {
             return; // Already open (duplicate hotplug event).
         }
-        let Some(pad) = self.slots.allocate(instance_id) else {
+        let Some(pad) = shared.allocate(&PadKey::Sdl(instance_id)) else {
             warn!(
                 name = controller.name(),
                 "All gamepad slots taken, ignoring controller"
             );
             return;
         };
-        info!(name = controller.name(), pad, "Game controller connected");
-        self.handles.insert(instance_id, controller);
+        info!(
+            name = controller.name(),
+            pad, "Game controller connected (Xbox 360 emulation)"
+        );
+        self.handles
+            .insert(instance_id, (controller, (vendor, product)));
         let _ = input_tx.send(InputEvent::GamepadConnected { pad });
     }
 
     /// Closes the controller with `instance_id` and frees its pad slot.
     /// Notifies the server so it removes the matching virtual device.
-    fn remove(&mut self, instance_id: u32, input_tx: &std::sync::mpsc::Sender<InputEvent>) {
+    fn remove(
+        &mut self,
+        instance_id: u32,
+        shared: &SharedGamepads,
+        input_tx: &std::sync::mpsc::Sender<InputEvent>,
+    ) {
         self.handles.remove(&instance_id);
-        if let Some(pad) = self.slots.release(instance_id) {
+        if let Some(pad) = shared.release(&PadKey::Sdl(instance_id)) {
             info!(pad, "Game controller disconnected");
             let _ = input_tx.send(InputEvent::GamepadDisconnected { pad });
         }
     }
 
-    fn pad_of(&self, instance_id: u32) -> Option<u8> {
-        self.slots.get(instance_id)
+    /// Drops emulated controllers whose device was since grabbed by the
+    /// evdev pass-through (hotplug race: SDL saw the device first).
+    fn drop_grabbed(
+        &mut self,
+        shared: &SharedGamepads,
+        input_tx: &std::sync::mpsc::Sender<InputEvent>,
+    ) {
+        let taken: Vec<u32> = self
+            .handles
+            .iter()
+            .filter(|(_, (_, (v, p)))| shared.is_grabbed(*v, *p))
+            .map(|(id, _)| *id)
+            .collect();
+        for instance_id in taken {
+            info!(instance_id, "Controller taken over by evdev pass-through");
+            self.remove(instance_id, shared, input_tx);
+        }
     }
+}
+
+/// Slot of an SDL-emulated controller, if it holds one.
+fn pad_of(shared: &SharedGamepads, instance_id: u32) -> Option<u8> {
+    shared.get(&PadKey::Sdl(instance_id))
 }
 
 /// Applies the input capture mode to the window.
@@ -325,6 +375,7 @@ pub(super) fn run_sdl_loop(
     stats_file: Option<&std::path::Path>,
     commands: &SessionCommands,
     zero_copy: &AtomicBool,
+    gamepads: &SharedGamepads,
 ) -> Result<(), anyhow::Error> {
     let audio_queue: AudioQueue<f32> = create_audio_queue(sdl)?;
 
@@ -344,6 +395,12 @@ pub(super) fn run_sdl_loop(
     let game_controller_subsystem = sdl
         .game_controller()
         .map_err(|e| anyhow!("SDL2 game controller init failed: {e}"))?;
+
+    // Needed for device GUIDs (vendor/product ids) so controllers grabbed
+    // by the evdev pass-through are not emulated a second time.
+    let joystick_subsystem = sdl
+        .joystick()
+        .map_err(|e| anyhow!("SDL2 joystick init failed: {e}"))?;
 
     // Hardware decode → GL renderer (it can import the decoder's dma-bufs
     // directly); software decode → SDL canvas. If the GL renderer can't
@@ -368,6 +425,7 @@ pub(super) fn run_sdl_loop(
     // Controllers present at startup arrive as ControllerDeviceAdded events
     // on the first event pump iterations, so no manual scan is needed.
     let mut controllers = Controllers::new();
+    let mut pad_generation = gamepads.generation();
 
     // Start captured ("inside" mode): all input goes to the remote session.
     let mut captured = true;
@@ -389,6 +447,14 @@ pub(super) fn run_sdl_loop(
     backend.clear_black();
 
     'main: loop {
+        // A pass-through thread grabbed (or released) a device: drop any
+        // SDL emulation for controllers now owned by pass-through.
+        let generation = gamepads.generation();
+        if generation != pad_generation {
+            pad_generation = generation;
+            controllers.drop_grabbed(gamepads, &input_tx);
+        }
+
         // Coalesce mouse motion within one event batch: a 1000 Hz mouse
         // delivers ~16 motion events per frame, and sending each as its own
         // control-stream message adds per-event overhead end to end.
@@ -481,7 +547,7 @@ pub(super) fn run_sdl_loop(
                 sdl2::event::Event::ControllerAxisMotion {
                     which, axis, value, ..
                 } => {
-                    if let Some(pad) = controllers.pad_of(which) {
+                    if let Some(pad) = pad_of(gamepads, which) {
                         let ga = map_gamepad_axis(axis);
                         let _ = input_tx.send(InputEvent::GamepadAxis {
                             pad,
@@ -493,7 +559,7 @@ pub(super) fn run_sdl_loop(
 
                 sdl2::event::Event::ControllerButtonDown { which, button, .. } => {
                     if let (Some(pad), Some(gb)) =
-                        (controllers.pad_of(which), map_gamepad_button(button))
+                        (pad_of(gamepads, which), map_gamepad_button(button))
                     {
                         let _ = input_tx.send(InputEvent::GamepadButton {
                             pad,
@@ -505,7 +571,7 @@ pub(super) fn run_sdl_loop(
 
                 sdl2::event::Event::ControllerButtonUp { which, button, .. } => {
                     if let (Some(pad), Some(gb)) =
-                        (controllers.pad_of(which), map_gamepad_button(button))
+                        (pad_of(gamepads, which), map_gamepad_button(button))
                     {
                         let _ = input_tx.send(InputEvent::GamepadButton {
                             pad,
@@ -519,13 +585,19 @@ pub(super) fn run_sdl_loop(
                     which: joystick_index,
                     ..
                 } if game_controller_subsystem.is_game_controller(joystick_index) => {
-                    controllers.add(&game_controller_subsystem, joystick_index, &input_tx);
+                    controllers.add(
+                        &game_controller_subsystem,
+                        &joystick_subsystem,
+                        joystick_index,
+                        gamepads,
+                        &input_tx,
+                    );
                 }
 
                 sdl2::event::Event::ControllerDeviceRemoved {
                     which: instance_id, ..
                 } => {
-                    controllers.remove(instance_id, &input_tx);
+                    controllers.remove(instance_id, gamepads, &input_tx);
                 }
 
                 _ => {}

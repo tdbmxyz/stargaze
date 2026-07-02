@@ -1,12 +1,14 @@
 //! Pure input-handling logic for the SDL render loop.
 //!
-//! Keeps the testable pieces — shortcut detection, gamepad slot allocation,
-//! and pressed-input tracking — out of the SDL event loop.
+//! Keeps the testable pieces — shortcut detection and pressed-input
+//! tracking — out of the SDL event loop. Gamepad slot allocation lives
+//! in [`crate::gamepad::SharedGamepads`], shared with the evdev
+//! pass-through threads.
 
 use std::collections::HashSet;
 
 use sdl2::keyboard::{Mod, Scancode};
-use stargaze_core::input::{InputEvent, MAX_GAMEPADS, MouseButton};
+use stargaze_core::input::{InputEvent, MouseButton};
 
 /// Client-side action triggered by a Ctrl+Alt+Shift shortcut.
 ///
@@ -40,52 +42,6 @@ pub(super) fn shortcut_action(keymod: Mod, scancode: Scancode) -> Option<Shortcu
         Scancode::X => Some(ShortcutAction::ToggleFullscreen),
         Scancode::S => Some(ShortcutAction::ToggleStats),
         _ => None,
-    }
-}
-
-/// Maps SDL joystick instance ids to stable gamepad slots (0..[`MAX_GAMEPADS`]).
-///
-/// Slots are what the server sees: each slot corresponds to one virtual
-/// gamepad device. The lowest free slot is reused when a controller
-/// disconnects and another connects.
-pub(super) struct PadSlots {
-    /// `slots[i]` holds the SDL joystick instance id occupying slot `i`.
-    slots: [Option<u32>; MAX_GAMEPADS as usize],
-}
-
-impl PadSlots {
-    pub(super) fn new() -> Self {
-        Self {
-            slots: [None; MAX_GAMEPADS as usize],
-        }
-    }
-
-    /// Assigns the lowest free slot to `instance_id` and returns it.
-    ///
-    /// Returns the existing slot if the instance is already registered,
-    /// or `None` if all slots are taken.
-    pub(super) fn allocate(&mut self, instance_id: u32) -> Option<u8> {
-        if let Some(slot) = self.get(instance_id) {
-            return Some(slot);
-        }
-        let free = self.slots.iter().position(Option::is_none)?;
-        self.slots[free] = Some(instance_id);
-        u8::try_from(free).ok()
-    }
-
-    /// Frees the slot held by `instance_id`, returning it.
-    pub(super) fn release(&mut self, instance_id: u32) -> Option<u8> {
-        let slot = self.get(instance_id)?;
-        self.slots[slot as usize] = None;
-        Some(slot)
-    }
-
-    /// Returns the slot held by `instance_id`, if any.
-    pub(super) fn get(&self, instance_id: u32) -> Option<u8> {
-        self.slots
-            .iter()
-            .position(|s| *s == Some(instance_id))
-            .and_then(|i| u8::try_from(i).ok())
     }
 }
 
@@ -193,37 +149,6 @@ mod tests {
     fn shortcut_ignores_other_keys() {
         assert_eq!(shortcut_action(CHORD, Scancode::A), None);
         assert_eq!(shortcut_action(CHORD, Scancode::Escape), None);
-    }
-
-    #[test]
-    fn pad_slots_allocate_lowest_free_and_reuse() {
-        let mut slots = PadSlots::new();
-        assert_eq!(slots.allocate(100), Some(0));
-        assert_eq!(slots.allocate(200), Some(1));
-        assert_eq!(slots.allocate(300), Some(2));
-
-        // Re-allocating an existing instance returns its slot.
-        assert_eq!(slots.allocate(200), Some(1));
-
-        // Releasing frees the slot for the next controller.
-        assert_eq!(slots.release(200), Some(1));
-        assert_eq!(slots.get(200), None);
-        assert_eq!(slots.allocate(400), Some(1));
-    }
-
-    #[test]
-    fn pad_slots_full_returns_none() {
-        let mut slots = PadSlots::new();
-        for id in 0..u32::from(MAX_GAMEPADS) {
-            assert!(slots.allocate(id).is_some());
-        }
-        assert_eq!(slots.allocate(99), None);
-    }
-
-    #[test]
-    fn pad_slots_release_unknown_returns_none() {
-        let mut slots = PadSlots::new();
-        assert_eq!(slots.release(42), None);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use stargaze_core::mic_forward;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use stargaze_client::{decode, render, transport};
+use stargaze_client::{decode, gamepad, render, transport};
 
 /// Stargaze streaming client — connects to a server, decodes video/audio, and forwards input.
 // Doc comments here are clap help text rendered verbatim; list items align
@@ -43,6 +43,16 @@ struct Cli {
     /// Port for rsonance mic forwarding [default: 9001].
     #[arg(long)]
     mic_forward_port: Option<u16>,
+
+    /// Forward physical gamepads at the evdev level [default: true].
+    ///
+    /// - true:  the server clones the real controller (name, vendor/
+    ///          product ids, button/axis layout), so the host sees e.g.
+    ///          an actual Steam Controller. Devices that cannot be
+    ///          opened or grabbed fall back to emulation automatically.
+    /// - false: every controller is emulated as an Xbox 360 pad.
+    #[arg(long, verbatim_doc_comment)]
+    gamepad_passthrough: Option<bool>,
 
     /// Periodically log pipeline progress (received frame counts).
     ///
@@ -110,6 +120,9 @@ fn build_config(cli: &Cli) -> anyhow::Result<ClientConfig> {
     }
     if let Some(port) = cli.mic_forward_port {
         cfg.mic_forward.port = port;
+    }
+    if let Some(passthrough) = cli.gamepad_passthrough {
+        cfg.gamepad_passthrough = passthrough;
     }
 
     if cfg.server_address.is_empty() {
@@ -211,6 +224,17 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Gamepads: evdev pass-through (server clones the real device) with
+    // automatic per-device fallback to SDL → Xbox 360 emulation. Started
+    // before the SDL loop so devices present at startup are grabbed
+    // before SDL delivers their hotplug events.
+    let gamepads = gamepad::SharedGamepads::new();
+    if cfg.gamepad_passthrough {
+        gamepad::start_passthrough(gamepads.clone(), sdl_input_tx.clone());
+    } else {
+        info!("Gamepad pass-through disabled; using Xbox 360 emulation");
+    }
+
     // Start the audio decoder thread — sends decoded PCM to a channel.
     let (audio_decoder_session, audio_pcm_rx) =
         decode::start_audio_decoder(audio_decoder_config, audio_frames)?;
@@ -239,6 +263,7 @@ async fn main() -> anyhow::Result<()> {
             cli.stats_file.clone(),
             &session_commands,
             &zero_copy,
+            &gamepads,
         )
     })?;
 
