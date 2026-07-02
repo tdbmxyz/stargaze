@@ -17,6 +17,7 @@ bytes = "1.11.1"
 ffmpeg-next = "7"
 ffmpeg-sys-next = "7"
 sdl2 = { version = "0.37", features = ["unsafe_textures"] }
+evdev = "0.13"
 opus = "0.3"
 libc = "0.2"
 font8x8 = "0.3"

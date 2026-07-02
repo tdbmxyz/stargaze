@@ -72,10 +72,84 @@ pub enum InputEvent {
     /// A gamepad was disconnected on the client.
     ///
     /// The server removes the virtual gamepad device for this slot.
+    /// Used by both the emulated (SDL) and pass-through (evdev) paths.
     GamepadDisconnected {
         /// Gamepad slot (0..[`MAX_GAMEPADS`]).
         pad: u8,
     },
+    /// A gamepad was connected on the client and is passed through at the
+    /// evdev level: the server clones the physical device (identity and
+    /// capabilities) instead of emulating an Xbox 360 pad, so the host
+    /// sees e.g. a real "Steam Controller" or "Steam Deck" device.
+    ///
+    /// Appended after the original variants so postcard-serialized
+    /// messages from older peers still decode.
+    GamepadPassthroughConnected {
+        /// Gamepad slot (0..[`MAX_GAMEPADS`]).
+        pad: u8,
+        /// Identity and capabilities of the physical device.
+        descriptor: GamepadDescriptor,
+    },
+    /// A batch of raw evdev events from a passed-through gamepad,
+    /// covering one kernel report (up to a `SYN_REPORT` boundary).
+    /// The server replays them verbatim on the cloned device.
+    GamepadPassthroughEvents {
+        /// Gamepad slot (0..[`MAX_GAMEPADS`]).
+        pad: u8,
+        /// Raw events; the server appends the terminating `SYN_REPORT`.
+        events: Vec<RawGamepadEvent>,
+    },
+}
+
+/// Identity and capability descriptor of a physical gamepad, read from
+/// its evdev node on the client and used by the server to build an
+/// identical uinput device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GamepadDescriptor {
+    /// Device name as reported by the kernel (e.g. "Steam Controller").
+    pub name: String,
+    /// Bus type (`BUS_USB`, `BUS_BLUETOOTH`, ...).
+    pub bus_type: u16,
+    /// USB/Bluetooth vendor id.
+    pub vendor: u16,
+    /// USB/Bluetooth product id.
+    pub product: u16,
+    /// Device version.
+    pub version: u16,
+    /// Supported `EV_KEY` codes (buttons).
+    pub keys: Vec<u16>,
+    /// Supported `EV_ABS` axes with their ranges.
+    pub abs_axes: Vec<AbsAxisSpec>,
+}
+
+/// One absolute axis of a passed-through gamepad (`struct input_absinfo`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbsAxisSpec {
+    /// `ABS_*` axis code.
+    pub code: u16,
+    /// Current value at descriptor capture time.
+    pub value: i32,
+    /// Minimum value.
+    pub minimum: i32,
+    /// Maximum value.
+    pub maximum: i32,
+    /// Noise filter value.
+    pub fuzz: i32,
+    /// Dead-zone size around the neutral value.
+    pub flat: i32,
+    /// Resolution (units per millimeter, or units per radian for sticks).
+    pub resolution: i32,
+}
+
+/// A raw evdev event forwarded verbatim from a passed-through gamepad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawGamepadEvent {
+    /// `EV_*` event type (`EV_KEY` or `EV_ABS`).
+    pub event_type: u16,
+    /// Event code (`BTN_*` / `ABS_*`).
+    pub code: u16,
+    /// Event value.
+    pub value: i32,
 }
 
 /// Mouse button identifiers.
@@ -471,12 +545,57 @@ mod tests {
             },
             InputEvent::GamepadConnected { pad: 1 },
             InputEvent::GamepadDisconnected { pad: 1 },
+            InputEvent::GamepadPassthroughConnected {
+                pad: 0,
+                descriptor: GamepadDescriptor {
+                    name: "Steam Controller".to_string(),
+                    bus_type: 3, // BUS_USB
+                    vendor: 0x28de,
+                    product: 0x1102,
+                    version: 0x111,
+                    keys: vec![0x130, 0x131, 0x133, 0x134],
+                    abs_axes: vec![AbsAxisSpec {
+                        code: 0,
+                        value: 0,
+                        minimum: -32768,
+                        maximum: 32767,
+                        fuzz: 16,
+                        flat: 128,
+                        resolution: 0,
+                    }],
+                },
+            },
+            InputEvent::GamepadPassthroughEvents {
+                pad: 0,
+                events: vec![
+                    RawGamepadEvent {
+                        event_type: 1, // EV_KEY
+                        code: 0x130,
+                        value: 1,
+                    },
+                    RawGamepadEvent {
+                        event_type: 3, // EV_ABS
+                        code: 0,
+                        value: -1234,
+                    },
+                ],
+            },
         ];
         for event in events {
             let bytes = postcard::to_allocvec(&event).expect("serialize");
             let decoded: InputEvent = postcard::from_bytes(&bytes).expect("deserialize");
             assert_eq!(decoded, event);
         }
+    }
+
+    /// Wire compatibility: adding the pass-through variants must not shift
+    /// the postcard discriminants of the original variants.
+    #[test]
+    fn passthrough_variants_appended_without_breaking_layout() {
+        let bytes =
+            postcard::to_allocvec(&InputEvent::GamepadDisconnected { pad: 3 }).expect("serialize");
+        // Discriminant 7 (8th variant) followed by the pad byte.
+        assert_eq!(bytes, vec![7, 3]);
     }
 
     #[test]
