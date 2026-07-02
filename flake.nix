@@ -42,6 +42,10 @@
     # Matches ffmpeg-next = "7" / ffmpeg-sys-next = "7" in Cargo.toml.
     ffmpeg = pkgs.ffmpeg_7-full;
     ffmpegCuda = pkgsCuda.ffmpeg_7-full; # built with CUDA / NVENC support
+    # Slim variant for the portable client bundle: decoding needs only
+    # libavcodec/libavutil/libswscale (+ VAAPI), and ffmpeg-full drags a
+    # ~4 GiB closure (every codec, pango, libcaca, ...) into the AppImage.
+    ffmpegHeadless = pkgs.ffmpeg_7-headless;
 
     # ── Shared native dependencies ─────────────────────────────────
     # Common to both server and client (compile-time).
@@ -100,6 +104,7 @@
       nativeBuildInputs = [
         pkgs.pkg-config
         pkgs.makeWrapper
+        pkgs.removeReferencesTo
       ];
 
       buildInputs = commonBuildInputs;
@@ -113,6 +118,13 @@
 
       # build.rs in each crate calls pkg-config at build time.
       preBuild = bindgenShellHook;
+
+      # Panic-location strings in the binary embed rust-src store paths,
+      # dragging the whole nightly toolchain (~300 MiB) into the runtime
+      # closure.  Strip the references; they are display-only.
+      postFixup = ''
+        find $out/bin -type f -exec remove-references-to -t ${toolchain} {} +
+      '';
     };
 
     # Server-specific native deps (PipeWire, dbus for portals, evdev).
@@ -126,20 +138,75 @@
       pkgs.SDL2
     ];
 
+    # SDL2 without the heavy optional runtime deps, for the portable
+    # bundle: no PipeWire (audio goes through the PulseAudio API, which
+    # PipeWire serves on modern systems including the Steam Deck), no
+    # JACK/sndio, and a stub zenity (only used for error dialogs; the
+    # real one drags in GTK4 + GStreamer).
+    sdl2Slim = pkgs.sdl2-compat.override {
+      sdl3 = pkgs.sdl3.override {
+        pipewireSupport = false;
+        jackSupport = false;
+        sndioSupport = false;
+        zenity = pkgs.writeShellScriptBin "zenity" "exit 1";
+      };
+    };
+
+    # Client package, parameterized over the FFmpeg and SDL2 builds: the
+    # full ones for local/Nix use, slim ones for the portable AppImage.
+    # The client links only FFmpeg, SDL2, opus, and GL — no PipeWire or
+    # dbus — so its build inputs and wrapper library path stay minimal.
+    mkStargazeClient = {
+      ffmpegPkg,
+      sdl2Pkg,
+      extraWrapFlags ? [],
+    }: let
+      clientLibs = [
+        ffmpegPkg
+        sdl2Pkg
+        pkgs.libopus
+        pkgs.libglvnd
+        pkgs.mesa
+      ];
+    in
+      wrapBin {
+        binName = "stargaze-client";
+        libs = clientLibs;
+        inherit extraWrapFlags;
+        drv = rustPlatform.buildRustPackage (commonPackageAttrs
+          // {
+            pname = "stargaze-client";
+            cargoBuildFlags = ["--bin" "stargaze-client"];
+
+            buildInputs =
+              clientLibs
+              ++ [
+                pkgs.libclang
+                pkgs.llvmPackages.libclang
+              ];
+
+            meta = {
+              description = "Stargaze streaming client — decode, render, input forwarding";
+              mainProgram = "stargaze-client";
+            };
+          });
+      };
+
     # Helper: wrap a binary so it finds .so files at runtime.
     wrapBin = {
       drv,
       binName,
-      extraLibs ? [],
+      libs,
+      extraWrapFlags ? [],
     }: let
-      libPath = pkgs.lib.makeLibraryPath (commonBuildInputs ++ extraLibs);
+      libPath = pkgs.lib.makeLibraryPath libs;
     in
       drv.overrideAttrs (old: {
         postFixup =
           (old.postFixup or "")
           + ''
             wrapProgram $out/bin/${binName} \
-              --prefix LD_LIBRARY_PATH : "${libPath}"
+              --prefix LD_LIBRARY_PATH : "${libPath}" ${pkgs.lib.concatStringsSep " " extraWrapFlags}
           '';
       });
   in {
@@ -266,21 +333,26 @@
             '';
         });
 
-      stargaze-client = wrapBin {
-        binName = "stargaze-client";
-        extraLibs = clientBuildInputs;
-        drv = rustPlatform.buildRustPackage (commonPackageAttrs
-          // {
-            pname = "stargaze-client";
-            cargoBuildFlags = ["--bin" "stargaze-client"];
+      stargaze-client = mkStargazeClient {
+        ffmpegPkg = ffmpeg;
+        sdl2Pkg = pkgs.SDL2;
+      };
 
-            buildInputs = commonPackageAttrs.buildInputs ++ clientBuildInputs;
-
-            meta = {
-              description = "Stargaze streaming client — decode, render, input forwarding";
-              mainProgram = "stargaze-client";
-            };
-          });
+      # Same client built against headless FFmpeg and slim SDL2 with a
+      # minimal runtime library set.  Used by the release workflow to
+      # produce a reasonably sized self-contained AppImage (`nix bundle`)
+      # for non-Nix machines (e.g. a Steam Deck).  The --set-default
+      # wrapper flags point Mesa/libva at the bundled drivers on systems
+      # without /run/opengl-driver (any non-NixOS host); on NixOS or when
+      # the user already set them, they are left untouched.
+      stargaze-client-portable = mkStargazeClient {
+        ffmpegPkg = ffmpegHeadless;
+        sdl2Pkg = sdl2Slim;
+        extraWrapFlags = [
+          "--set-default LIBVA_DRIVERS_PATH ${pkgs.mesa}/lib/dri"
+          "--set-default LIBGL_DRIVERS_PATH ${pkgs.mesa}/lib/dri"
+          "--set-default __EGL_VENDOR_LIBRARY_DIRS ${pkgs.mesa}/share/glvnd/egl_vendor.d"
+        ];
       };
 
       default = self.packages.${system}.stargaze-server;
