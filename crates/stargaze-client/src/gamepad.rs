@@ -16,6 +16,12 @@
 //! consults [`SharedGamepads::is_grabbed`] to skip devices this module
 //! already owns, and both paths allocate pad slots from the same table
 //! so the server never sees two controllers on one slot.
+//!
+//! SDL must not touch controllers via hidraw while pass-through is on:
+//! the kernel's hid-steam driver unregisters its evdev node whenever
+//! userspace opens the matching hidraw device, which would destroy the
+//! node grabbed here. `main` therefore sets `SDL_JOYSTICK_HIDAPI=0`
+//! when pass-through is enabled, pinning SDL to its evdev backend.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -51,6 +57,11 @@ struct SharedState {
     grabbed: HashSet<(u16, u16)>,
     /// Device nodes currently owned by a pass-through reader thread.
     active_nodes: HashSet<PathBuf>,
+    /// (vendor, product) pairs whose pass-through ended because the
+    /// device node vanished. The SDL loop uses this to warn loudly when
+    /// such a device resurfaces on the emulation path instead of being
+    /// silently downgraded to an Xbox 360 pad.
+    lost: HashSet<(u16, u16)>,
 }
 
 /// Pad slot table and grab registry shared between the SDL event loop
@@ -70,6 +81,7 @@ impl SharedGamepads {
                 slots: [const { None }; MAX_GAMEPADS as usize],
                 grabbed: HashSet::new(),
                 active_nodes: HashSet::new(),
+                lost: HashSet::new(),
             }),
             generation: AtomicU64::new(0),
         })
@@ -141,11 +153,28 @@ impl SharedGamepads {
             .and_then(|i| u8::try_from(i).ok())
     }
 
+    /// Whether pass-through for this (vendor, product) previously ended
+    /// with the device node vanishing (e.g. another process opened the
+    /// controller's hidraw node and the kernel dropped the evdev one).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the slot table lock is poisoned.
+    pub fn passthrough_was_lost(&self, vendor: u16, product: u16) -> bool {
+        self.state.lock().unwrap().lost.contains(&(vendor, product))
+    }
+
     fn mark_grabbed(&self, node: PathBuf, vendor: u16, product: u16) {
         let mut state = self.state.lock().unwrap();
         state.grabbed.insert((vendor, product));
         state.active_nodes.insert(node);
+        // The device is passed through (again); clear any stale loss.
+        state.lost.remove(&(vendor, product));
         self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    fn mark_lost(&self, vendor: u16, product: u16) {
+        self.state.lock().unwrap().lost.insert((vendor, product));
     }
 
     fn unmark_grabbed(&self, node: &PathBuf, vendor: u16, product: u16) {
@@ -355,6 +384,7 @@ fn read_loop(
                     name = %descriptor.name,
                     "Gamepad disconnected ({e})"
                 );
+                shared.mark_lost(descriptor.vendor, descriptor.product);
                 let _ = input_tx.send(InputEvent::GamepadDisconnected { pad });
                 break;
             }
@@ -415,6 +445,19 @@ mod tests {
 
         shared.unmark_grabbed(&PathBuf::from("/dev/input/event9"), 0x28de, 0x1102);
         assert!(!shared.is_grabbed(0x28de, 0x1102));
+    }
+
+    #[test]
+    fn lost_passthrough_tracked_until_regrabbed() {
+        let shared = SharedGamepads::new();
+        assert!(!shared.passthrough_was_lost(0x28de, 0x1142));
+
+        shared.mark_lost(0x28de, 0x1142);
+        assert!(shared.passthrough_was_lost(0x28de, 0x1142));
+
+        // Re-establishing pass-through clears the loss record.
+        shared.mark_grabbed(PathBuf::from("/dev/input/event9"), 0x28de, 0x1142);
+        assert!(!shared.passthrough_was_lost(0x28de, 0x1142));
     }
 
     #[test]

@@ -208,6 +208,19 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // SDL's HIDAPI joystick drivers open controllers via hidraw. For
+    // hid-steam devices (Steam Controller, Steam Deck) the kernel then
+    // unregisters the evdev node — the very node the pass-through path
+    // has grabbed — silently degrading the controller to Xbox 360
+    // emulation. Force SDL onto its evdev backend, which respects the
+    // grab; the emulation fallback works the same either way.
+    if cfg.gamepad_passthrough && !sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "0") {
+        tracing::warn!(
+            "Could not disable SDL HIDAPI joysticks; \
+             pass-through may lose Steam controllers to SDL"
+        );
+    }
+
     // SDL2 must be initialized on the main thread.
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
 
