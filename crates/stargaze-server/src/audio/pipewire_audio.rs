@@ -148,10 +148,7 @@ fn core_roundtrip(mainloop: &MainLoopBox, core: &Core) -> Result<(), AudioError>
 ///
 /// Returns `AudioError::CaptureInit` if registry access or a server
 /// roundtrip fails.
-fn resolve_default_sink(
-    mainloop: &MainLoopBox,
-    core: &Core,
-) -> Result<Option<String>, AudioError> {
+fn resolve_default_sink(mainloop: &MainLoopBox, core: &Core) -> Result<Option<String>, AudioError> {
     use std::cell::RefCell;
     use std::rc::Rc;
 
