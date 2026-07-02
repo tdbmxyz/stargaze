@@ -145,6 +145,9 @@ fn init_tracing() {
 
     // Use try_init() so tests can call this multiple times safely.
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+
+    // Route FFmpeg's own diagnostics through tracing instead of raw stderr.
+    stargaze_core::avlog::install_ffmpeg_log_bridge();
 }
 
 /// Builds the final [`ServerConfig`] by loading from file and applying CLI overrides.
