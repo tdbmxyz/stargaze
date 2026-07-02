@@ -70,6 +70,17 @@ nix build .#stargaze-client
 
 A `.devcontainer/` (Debian Trixie + CUDA) is provided as an alternative to Nix.
 
+### Prebuilt client (AppImage)
+
+Each release on GitHub ships `stargaze-client` as a self-contained x86_64 Linux AppImage (FFmpeg, SDL2, and Mesa bundled) for machines without Nix — e.g. a Steam Deck:
+
+```bash
+chmod +x stargaze-client-*.AppImage
+./stargaze-client-*.AppImage --server 192.168.1.10
+```
+
+The server is not published as a prebuilt binary: it hard-requires NVIDIA CUDA/NVENC and is built from the flake on the host (`nix build .#stargaze-server`).
+
 ## Usage
 
 On the host machine:
