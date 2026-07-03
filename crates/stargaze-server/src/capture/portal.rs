@@ -60,9 +60,9 @@ async fn portal_dialog<T>(
             Err(_) if started.elapsed() >= PORTAL_DIALOG_TIMEOUT => {
                 return Err(CaptureError::PortalError(format!(
                     "{stage} timed out after {}s: most likely an approval dialog is \
-                     waiting on the server's display. Approve it once to mint a \
-                     restore token, or configure a headless picker (e.g. \
-                     xdg-desktop-portal-hyprland's screencopy:custom_picker_binary)",
+                     waiting on the server's display. On a headless host, configure \
+                     an auto-approving picker — see docs/headless-screencast.md \
+                     (xdg-desktop-portal-hyprland screencopy:custom_picker_binary)",
                     PORTAL_DIALOG_TIMEOUT.as_secs()
                 )));
             }
