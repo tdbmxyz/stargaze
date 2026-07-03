@@ -316,6 +316,35 @@ fn kernel_event_loop(
             }
             None => continue,
         };
+        match &request {
+            HidHostRequest::Output { data, .. } => {
+                debug!(hid, len = data.len(), "uhid output → client");
+            }
+            HidHostRequest::GetReport {
+                request: id,
+                report_number,
+                report_type,
+                ..
+            } => debug!(
+                hid,
+                id,
+                ?report_type,
+                report_number,
+                "uhid get-report → client"
+            ),
+            HidHostRequest::SetReport {
+                request: id,
+                report_type,
+                data,
+                ..
+            } => debug!(
+                hid,
+                id,
+                ?report_type,
+                len = data.len(),
+                "uhid set-report → client"
+            ),
+        }
         if hid_out_tx
             .blocking_send(ControlMessage::HidRequest(request))
             .is_err()

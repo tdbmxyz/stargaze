@@ -126,6 +126,19 @@ fn parse_uevent(content: &str) -> Option<HidIdentity> {
     })
 }
 
+/// Whether a report descriptor describes a vendor-defined interface
+/// (first usage page in `0xFF00`-`0xFFFF`).
+///
+/// Valve controllers expose boot keyboard/mouse interfaces alongside
+/// the proprietary ones ("lizard mode"). Only the vendor interfaces
+/// carry controller traffic; forwarding a boot interface rebuilds a
+/// live keyboard/mouse on the server that shadows the pad.
+fn is_vendor_interface(report_descriptor: &[u8]) -> bool {
+    // A descriptor opens with its usage page item: `05 pp` for one-byte
+    // pages (never vendor) or `06 lo hi` for two-byte pages.
+    report_descriptor.len() >= 3 && report_descriptor[0] == 0x06 && report_descriptor[2] == 0xFF
+}
+
 /// `struct hidraw_report_descriptor` (linux/hidraw.h).
 #[repr(C)]
 struct HidrawReportDescriptor {
@@ -246,6 +259,15 @@ impl HidPassthrough {
             }
         }
     }
+
+    /// Records a node the scanner should not touch again while present.
+    fn ignore(&self, node: &Path) {
+        self.state
+            .lock()
+            .unwrap()
+            .ignored
+            .insert(node.to_path_buf());
+    }
 }
 
 /// Starts HID pass-through: runs one synchronous scan (so devices
@@ -357,12 +379,7 @@ fn claim_device(
                 "Cannot open HID device for pass-through ({e}); check udev \
                  rules (steam-devices) grant hidraw access"
             );
-            registry
-                .state
-                .lock()
-                .unwrap()
-                .ignored
-                .insert(node.to_path_buf());
+            registry.ignore(node);
             return false;
         }
     };
@@ -371,15 +388,22 @@ fn claim_device(
         Ok(rd) => rd,
         Err(e) => {
             warn!(name = %identity.name, "Failed to read HID report descriptor: {e}");
-            registry
-                .state
-                .lock()
-                .unwrap()
-                .ignored
-                .insert(node.to_path_buf());
+            registry.ignore(node);
             return false;
         }
     };
+
+    if !is_vendor_interface(&report_descriptor) {
+        // Lizard-mode boot keyboard/mouse interface, not controller
+        // traffic — leave it local.
+        debug!(
+            name = %identity.name,
+            node = %node.display(),
+            "Skipping non-vendor HID interface (lizard keyboard/mouse)"
+        );
+        registry.ignore(node);
+        return false;
+    }
 
     let hid = {
         let mut state = registry.state.lock().unwrap();
@@ -495,6 +519,7 @@ fn request_loop(
     while let Some(request) = request_rx.blocking_recv() {
         match request {
             HidHostRequest::Output { hid, data } => {
+                debug!(hid, len = data.len(), "Host output report → device");
                 let state = registry.state.lock().unwrap();
                 if let Some(file) = state.files.get(&hid) {
                     write_output(file, &data);
@@ -512,6 +537,23 @@ fn request_loop(
                         get_report(file, report_type, report_number)
                     })
                 };
+                if err {
+                    warn!(
+                        hid,
+                        request,
+                        ?report_type,
+                        report_number,
+                        "get-report failed on device"
+                    );
+                } else {
+                    debug!(
+                        hid,
+                        request,
+                        ?report_type,
+                        len = data.len(),
+                        "get-report answered"
+                    );
+                }
                 let reply = InputEvent::HidPassthroughReply {
                     hid,
                     request,
@@ -530,6 +572,7 @@ fn request_loop(
                 report_type,
                 data,
             } => {
+                let len = data.len();
                 let err = {
                     let state = registry.state.lock().unwrap();
                     state
@@ -537,6 +580,17 @@ fn request_loop(
                         .get(&hid)
                         .is_none_or(|file| set_report(file, report_type, &data))
                 };
+                if err {
+                    warn!(
+                        hid,
+                        request,
+                        ?report_type,
+                        len,
+                        "set-report failed on device"
+                    );
+                } else {
+                    debug!(hid, request, ?report_type, len, "set-report applied");
+                }
                 let reply = InputEvent::HidPassthroughReply {
                     hid,
                     request,
@@ -590,6 +644,19 @@ mod tests {
     #[test]
     fn uevent_without_id_is_rejected() {
         assert!(parse_uevent("HID_NAME=Nameless\n").is_none());
+    }
+
+    #[test]
+    fn vendor_interface_detection() {
+        // Valve proprietary interface: Usage Page (Vendor 0xFF00).
+        assert!(is_vendor_interface(&[0x06, 0x00, 0xFF, 0x09, 0x01]));
+        // Lizard-mode boot keyboard: Usage Page (Generic Desktop).
+        assert!(!is_vendor_interface(&[0x05, 0x01, 0x09, 0x06]));
+        // Lizard-mode boot mouse.
+        assert!(!is_vendor_interface(&[0x05, 0x01, 0x09, 0x02]));
+        // Non-vendor two-byte page (e.g. 0x0C00 would be 06 00 0C).
+        assert!(!is_vendor_interface(&[0x06, 0x00, 0x0C, 0x09, 0x01]));
+        assert!(!is_vendor_interface(&[0x06]));
     }
 
     #[test]
