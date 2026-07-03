@@ -7,7 +7,7 @@ use stargaze_core::mic_forward;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use stargaze_client::{decode, gamepad, render, transport};
+use stargaze_client::{decode, gamepad, render, transport, usb};
 
 /// Stargaze streaming client — connects to a server, decodes video/audio, and forwards input.
 // Doc comments here are clap help text rendered verbatim; list items align
@@ -53,6 +53,17 @@ struct Cli {
     /// - false: every controller is emulated as an Xbox 360 pad.
     #[arg(long, verbatim_doc_comment)]
     gamepad_passthrough: Option<bool>,
+
+    /// Forward Valve USB controller hardware (e.g. the Steam Controller
+    /// dongle) to the server over USB/IP tunneled through the session
+    /// connection [default: true].
+    ///
+    /// The device disappears from this machine for the duration of the
+    /// session and the server sees the real USB hardware (required for
+    /// Steam to accept a Steam Controller). Needs the sysfs permissions
+    /// from the stargaze flake's nixosModules.usb-client.
+    #[arg(long, verbatim_doc_comment)]
+    usb_forward: Option<bool>,
 
     /// Periodically log pipeline progress (received frame counts).
     ///
@@ -124,6 +135,9 @@ fn build_config(cli: &Cli) -> anyhow::Result<ClientConfig> {
     if let Some(passthrough) = cli.gamepad_passthrough {
         cfg.gamepad_passthrough = passthrough;
     }
+    if let Some(usb_forward) = cli.usb_forward {
+        cfg.usb_forward = usb_forward;
+    }
 
     if cfg.server_address.is_empty() {
         bail!("Server address is required — pass --server <address> or set it in a config file");
@@ -173,7 +187,16 @@ async fn main() -> anyhow::Result<()> {
         decoder_idr_tx,
         rtt_probe,
         net_stats,
+        usb_connection,
     ) = transport::connect(&cfg, session_request).await?;
+
+    // USB forwarding: tunnel Valve controller hardware to the server
+    // over the session connection (Steam needs the real USB device).
+    if cfg.usb_forward {
+        usb::start(usb_connection);
+    } else {
+        drop(usb_connection);
+    }
 
     // Use the server-confirmed resolution for decoding and rendering.
     // The server may advertise a different resolution than what the client

@@ -11,6 +11,7 @@ mod capture;
 mod encode;
 mod input;
 mod transport;
+mod usb;
 
 use capture::CaptureConfig;
 

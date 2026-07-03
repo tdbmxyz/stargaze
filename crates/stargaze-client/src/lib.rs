@@ -6,3 +6,4 @@ pub mod decode;
 pub mod gamepad;
 pub mod render;
 pub mod transport;
+pub mod usb;

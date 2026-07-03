@@ -201,6 +201,9 @@ async fn run_session(
                 warn!("Audio send error: {e}");
             }
         }
+        // Accepts USB tunnel streams (never completes on its own; when
+        // another arm ends the session, dropping it detaches the ports).
+        () = crate::usb::serve_usb_tunnels(connection) => {}
     }
 
     Ok(())

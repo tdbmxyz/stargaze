@@ -118,6 +118,59 @@ pub enum ControlMessage {
     Input(InputEvent),
 }
 
+/// First bytes of a `QUIC` bidirectional stream carrying a tunneled USB
+/// device (USB/IP over the session connection), followed by a
+/// length-prefixed [`UsbTunnelHeader`].
+pub const USB_STREAM_MAGIC: [u8; 4] = *b"SGUB";
+
+/// Metadata for one tunneled USB device, sent by the client as the
+/// first frame of a dedicated `QUIC` bidirectional stream (after
+/// [`USB_STREAM_MAGIC`]). After this header, the stream carries the raw
+/// kernel-to-kernel USB/IP byte flow (`usbip-host` stub on the client,
+/// `vhci-hcd` on the server).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbTunnelHeader {
+    /// USB vendor id of the exported device.
+    pub vendor: u16,
+    /// USB product id of the exported device.
+    pub product: u16,
+    /// USB/IP device id: `busnum << 16 | devnum` on the client.
+    pub devid: u32,
+    /// Kernel `usb_device_speed` value (2 = full, 3 = high, 5 = super).
+    pub speed: u32,
+    /// Human-readable device name, for logs only.
+    pub name: String,
+}
+
+/// Serializes a USB tunnel stream preamble: magic, `u16` length, then
+/// the postcard-encoded header.
+///
+/// # Errors
+///
+/// Returns [`TransportError::SerializationError`] if encoding fails or
+/// the header exceeds a `u16` length.
+pub fn serialize_usb_tunnel_header(header: &UsbTunnelHeader) -> Result<Vec<u8>, TransportError> {
+    let body = postcard::to_allocvec(header)
+        .map_err(|e| TransportError::SerializationError(e.to_string()))?;
+    let len = u16::try_from(body.len())
+        .map_err(|_| TransportError::SerializationError("usb header too large".to_string()))?;
+    let mut bytes = Vec::with_capacity(USB_STREAM_MAGIC.len() + 2 + body.len());
+    bytes.extend_from_slice(&USB_STREAM_MAGIC);
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(&body);
+    Ok(bytes)
+}
+
+/// Deserializes the postcard body of a USB tunnel header (the bytes
+/// after the magic and the `u16` length prefix).
+///
+/// # Errors
+///
+/// Returns [`TransportError::SerializationError`] on malformed input.
+pub fn deserialize_usb_tunnel_header(body: &[u8]) -> Result<UsbTunnelHeader, TransportError> {
+    postcard::from_bytes(body).map_err(|e| TransportError::SerializationError(e.to_string()))
+}
+
 /// A fully reassembled frame ready for decoding.
 #[derive(Debug, Clone)]
 pub struct ReassembledFrame {
@@ -321,6 +374,23 @@ mod tests {
         let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
         let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn usb_tunnel_header_round_trip() {
+        let header = UsbTunnelHeader {
+            vendor: 0x28de,
+            product: 0x1142,
+            devid: (3 << 16) | 7,
+            speed: 2,
+            name: "Valve Software Steam Controller".to_string(),
+        };
+        let bytes = serialize_usb_tunnel_header(&header).unwrap();
+        assert_eq!(bytes[..4], USB_STREAM_MAGIC);
+        let len = u16::from_le_bytes(bytes[4..6].try_into().unwrap()) as usize;
+        assert_eq!(len, bytes.len() - 6);
+        let decoded = deserialize_usb_tunnel_header(&bytes[6..]).unwrap();
+        assert_eq!(decoded, header);
     }
 
     #[test]
