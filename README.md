@@ -88,6 +88,8 @@ On the host machine:
 ```bash
 stargaze-server --resolution 2560x1440 --framerate 60 --bitrate 20
 # A portal dialog asks which screen to share on first run.
+# Headless host (no display to approve the dialog)? See
+# docs/headless-screencast.md for an auto-approving portal setup.
 ```
 
 On the client machine:
