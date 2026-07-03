@@ -190,9 +190,15 @@ fn parse_kernel_event(buf: &[u8]) -> Option<UhidKernelEvent> {
     })
 }
 
+/// How often forwarded input reports are logged (first, then every Nth).
+const REPORT_LOG_EVERY: u64 = 512;
+
 /// One live uhid device mirroring a client-side HID controller.
 pub(crate) struct UhidDevice {
     file: File,
+    hid: u8,
+    /// Input reports injected so far, for periodic diagnostics.
+    reports: u64,
     /// Signals the kernel-event reader thread to stop after destroy.
     stopping: Arc<AtomicBool>,
 }
@@ -226,12 +232,32 @@ impl UhidDevice {
         if let Err(e) = spawned {
             warn!(hid, "Failed to spawn uhid reader thread: {e}");
         }
-        Ok(Self { file, stopping })
+        Ok(Self {
+            file,
+            hid,
+            reports: 0,
+            stopping,
+        })
     }
 
     /// Replays one raw input report from the client.
     pub(crate) fn input(&mut self, data: &[u8]) -> std::io::Result<()> {
-        self.file.write_all(&input2_event(data))
+        self.file.write_all(&input2_event(data))?;
+        self.reports += 1;
+        if self.reports == 1 {
+            debug!(
+                hid = self.hid,
+                len = data.len(),
+                "First input report injected into uhid"
+            );
+        } else if self.reports.is_multiple_of(REPORT_LOG_EVERY) {
+            debug!(
+                hid = self.hid,
+                count = self.reports,
+                "Input reports injected into uhid"
+            );
+        }
+        Ok(())
     }
 
     /// Answers a pending `UHID_GET_REPORT` from the kernel.

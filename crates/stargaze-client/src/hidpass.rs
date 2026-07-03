@@ -48,6 +48,9 @@ const VALVE_VENDOR_ID: u16 = 0x28de;
 /// `HID_MAX_DESCRIPTOR_SIZE`; also an upper bound on report sizes.
 const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
 
+/// How often forwarded input reports are logged (first, then every Nth).
+const REPORT_LOG_EVERY: u64 = 512;
+
 // hidraw ioctl encoding (linux/hidraw.h via asm-generic/ioctl.h).
 const IOC_WRITE: u64 = 1;
 const IOC_READ: u64 = 2;
@@ -483,6 +486,7 @@ fn read_loop(
     name: &str,
 ) {
     let mut buf = [0u8; HID_MAX_DESCRIPTOR_SIZE];
+    let mut reports: u64 = 0;
     loop {
         match file.read(&mut buf) {
             Ok(0) => {
@@ -490,6 +494,12 @@ fn read_loop(
                 break;
             }
             Ok(n) => {
+                reports += 1;
+                if reports == 1 {
+                    debug!(hid, len = n, "First input report read, forwarding");
+                } else if reports.is_multiple_of(REPORT_LOG_EVERY) {
+                    debug!(hid, count = reports, "Input reports forwarded");
+                }
                 let report = InputEvent::HidPassthroughReport {
                     hid,
                     data: buf[..n].to_vec(),

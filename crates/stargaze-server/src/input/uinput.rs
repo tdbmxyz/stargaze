@@ -411,6 +411,8 @@ fn inject_event(devices: &mut VirtualDevices, event: &InputEvent) -> Result<(), 
         InputEvent::HidPassthroughReport { hid, data } => {
             if let Some(device) = devices.hids.get_mut(hid) {
                 device.input(data)?;
+            } else {
+                debug!(hid = *hid, "Input report for unknown uhid device dropped");
             }
         }
         InputEvent::HidPassthroughReply {
