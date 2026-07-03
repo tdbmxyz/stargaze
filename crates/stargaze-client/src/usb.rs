@@ -37,6 +37,12 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// Backoff before a device whose tunnel ended may be re-exported.
 const REEXPORT_BACKOFF: Duration = Duration::from_secs(3);
 
+/// A tunnel that dies faster than this never really worked (missing
+/// permissions on either end, no free vhci port, ...). Retrying such a
+/// device would detach it from its local driver over and over, so it
+/// is skipped for the rest of the session instead.
+const MIN_HEALTHY_TUNNEL: Duration = Duration::from_secs(5);
+
 const USB_DEVICES: &str = "/sys/bus/usb/devices";
 const USBIP_HOST: &str = "/sys/bus/usb/drivers/usbip-host";
 const DRIVERS_PROBE: &str = "/sys/bus/usb/drivers_probe";
@@ -58,17 +64,21 @@ struct UsbDevice {
 pub fn start(connection: quinn::Connection) {
     tokio::spawn(async move {
         let mut exported: HashSet<String> = HashSet::new();
-        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut skipped: HashSet<String> = HashSet::new();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<(String, bool)>();
         loop {
             if connection.close_reason().is_some() {
                 debug!("Connection closed, USB forwarder exiting");
                 return;
             }
-            while let Ok(busid) = done_rx.try_recv() {
+            while let Ok((busid, gave_up)) = done_rx.try_recv() {
                 exported.remove(&busid);
+                if gave_up {
+                    skipped.insert(busid);
+                }
             }
             for device in scan_devices(Path::new(USB_DEVICES)) {
-                if exported.contains(&device.busid) {
+                if exported.contains(&device.busid) || skipped.contains(&device.busid) {
                     continue;
                 }
                 exported.insert(device.busid.clone());
@@ -76,11 +86,26 @@ pub fn start(connection: quinn::Connection) {
                 let done_tx = done_tx.clone();
                 tokio::spawn(async move {
                     let busid = device.busid.clone();
-                    if let Err(e) = export_device(&connection, device).await {
-                        warn!(busid, "USB forwarding ended: {e}");
+                    let started = std::time::Instant::now();
+                    let failed = match export_device(&connection, device).await {
+                        Err(e) => {
+                            warn!(busid, "USB forwarding failed: {e}");
+                            true
+                        }
+                        // A tunnel that barely lived never worked (e.g.
+                        // the server lacks vhci permissions).
+                        Ok(()) => started.elapsed() < MIN_HEALTHY_TUNNEL,
+                    };
+                    if failed {
+                        warn!(
+                            busid,
+                            "Not retrying this device for the rest of the session \
+                             (fix the setup and reconnect)"
+                        );
+                    } else {
+                        tokio::time::sleep(REEXPORT_BACKOFF).await;
                     }
-                    tokio::time::sleep(REEXPORT_BACKOFF).await;
-                    let _ = done_tx.send(busid);
+                    let _ = done_tx.send((busid, failed));
                 });
             }
             tokio::time::sleep(SCAN_INTERVAL).await;
@@ -199,14 +224,16 @@ fn bind_to_stub(busid: &str) -> std::io::Result<StubGuard> {
     let guard = StubGuard {
         busid: busid.to_string(),
     };
-    // Detach the regular driver (usually `usb`), then let the bus
-    // re-probe: match_busid makes the stub claim it.
+    // Detach the regular driver (usually `usb`), then bind the stub
+    // explicitly via its `bind` attribute — a bus re-probe would just
+    // hand the device back to the generic driver (probe order), which
+    // is why the usbip tool also writes to `bind` directly.
     if let Ok(driver) = std::fs::read_link(format!("{USB_DEVICES}/{busid}/driver"))
         && let Some(name) = driver.file_name().and_then(|n| n.to_str())
     {
         let _ = sysfs_write(&format!("/sys/bus/usb/drivers/{name}/unbind"), busid);
     }
-    sysfs_write(DRIVERS_PROBE, busid)?;
+    sysfs_write(&format!("{USBIP_HOST}/bind"), busid)?;
 
     let bound: PathBuf = std::fs::read_link(format!("{USB_DEVICES}/{busid}/driver"))
         .map_err(|e| std::io::Error::other(format!("no driver after probe: {e}")))?;
