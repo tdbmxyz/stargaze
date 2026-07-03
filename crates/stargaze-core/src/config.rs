@@ -232,6 +232,12 @@ pub struct ClientConfig {
     /// Xbox 360 pad. Devices that cannot be opened or grabbed fall back
     /// to the emulated path automatically.
     pub gamepad_passthrough: bool,
+    /// Forward Valve USB controller hardware (e.g. the Steam Controller
+    /// dongle) wholesale over USB/IP tunneled through the session
+    /// connection, so the server's Steam sees the real device. Requires
+    /// the sysfs permission setup from the flake's
+    /// `nixosModules.usb-client`.
+    pub usb_forward: bool,
     /// Mic forwarding configuration.
     pub mic_forward: MicForwardConfig,
 }
@@ -243,6 +249,7 @@ impl Default for ClientConfig {
             port: DEFAULT_PORT,
             fullscreen: true,
             gamepad_passthrough: true,
+            usb_forward: true,
             mic_forward: MicForwardConfig::default(),
         }
     }
