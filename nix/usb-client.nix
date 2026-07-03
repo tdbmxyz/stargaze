@@ -41,12 +41,15 @@ in {
       wantedBy = ["multi-user.target"];
       serviceConfig.Type = "oneshot";
       script = ''
-        for f in match_busid bind unbind rebind; do
-          p=/sys/bus/usb/drivers/usbip-host/$f
-          [ -e "$p" ] && { chgrp ${group} "$p"; chmod g+w "$p"; }
+        for p in /sys/bus/usb/drivers/usbip-host/{match_busid,bind,unbind,rebind} \
+                 /sys/bus/usb/drivers_probe; do
+          if [ -e "$p" ]; then
+            chgrp ${group} "$p"
+            chmod g+w "$p"
+          else
+            echo "missing $p (usbip_host module not loaded?)" >&2
+          fi
         done
-        chgrp ${group} /sys/bus/usb/drivers_probe
-        chmod g+w /sys/bus/usb/drivers_probe
       '';
     };
 

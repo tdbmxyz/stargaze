@@ -252,16 +252,44 @@ enum LocalPair {
     Tcp(std::net::TcpStream),
 }
 
+/// How long to wait for the `usbip_sockfd` attribute to become
+/// writable: it is created when the stub binds, and the udev rule that
+/// grants group access runs asynchronously shortly after.
+const SOCKFD_PERM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Writes the tunnel socket fd to `usbip_sockfd`, riding out the short
+/// window between the stub binding and udev applying permissions.
+async fn write_sockfd(path: &str, fd: i32) -> std::io::Result<()> {
+    let deadline = tokio::time::Instant::now() + SOCKFD_PERM_TIMEOUT;
+    loop {
+        match sysfs_write(path, &fd.to_string()) {
+            Err(e)
+                if tokio::time::Instant::now() < deadline
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                    ) =>
+            {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Hands the kernel one end of a socket pair via `usbip_sockfd` and
 /// returns our end. Tries a unix socketpair first (the kernel only
 /// checks for `SOCK_STREAM`); falls back to a loopback TCP pair if the
 /// running kernel is stricter.
-fn attach_kernel_socket(busid: &str) -> std::io::Result<LocalPair> {
+async fn attach_kernel_socket(busid: &str) -> std::io::Result<LocalPair> {
     let sockfd_path = format!("{USB_DEVICES}/{busid}/usbip_sockfd");
 
     let (kernel_end, ours) = std::os::unix::net::UnixStream::pair()?;
-    match sysfs_write(&sockfd_path, &kernel_end.as_raw_fd().to_string()) {
+    match write_sockfd(&sockfd_path, kernel_end.as_raw_fd()).await {
         Ok(()) => return Ok(LocalPair::Unix(ours)),
+        // Permissions never arrived — the TCP pair would hit the same
+        // wall, so surface the setup problem instead of masking it.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Err(e),
         Err(e) => debug!(
             busid,
             "unix socketpair rejected by stub ({e}), trying TCP loopback"
@@ -274,7 +302,7 @@ fn attach_kernel_socket(busid: &str) -> std::io::Result<LocalPair> {
     let (kernel_end, _) = listener.accept()?;
     kernel_end.set_nodelay(true)?;
     ours.set_nodelay(true)?;
-    sysfs_write(&sockfd_path, &kernel_end.as_raw_fd().to_string())?;
+    write_sockfd(&sockfd_path, kernel_end.as_raw_fd()).await?;
     Ok(LocalPair::Tcp(ours))
 }
 
@@ -294,7 +322,13 @@ async fn export_device(
         )
     })?;
 
-    let local = attach_kernel_socket(&busid)?;
+    let local = attach_kernel_socket(&busid).await.map_err(|e| {
+        format!(
+            "cannot hand the tunnel socket to the kernel for {busid}: {e}; \
+             are the udev rules from nixosModules.usb-client active? \
+             (replug the device or re-trigger udev after enabling them)"
+        )
+    })?;
 
     let (mut send, recv) = connection.open_bi().await?;
     let header = UsbTunnelHeader {
