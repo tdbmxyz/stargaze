@@ -84,6 +84,7 @@ pub async fn connect(
         mpsc::Sender<()>,
         RttProbe,
         std::sync::Arc<NetStats>,
+        quinn::Connection,
     ),
     TransportError,
 > {
@@ -126,6 +127,9 @@ pub async fn connect(
     let net_stats = std::sync::Arc::new(NetStats::default());
     let net_stats_clone = std::sync::Arc::clone(&net_stats);
 
+    // Handle for opening extra streams (USB tunnels) on the same session.
+    let usb_connection = connection.clone();
+
     let task_handle = tokio::spawn(async move {
         if let Err(e) = receiver::receive_loop(
             connection,
@@ -151,5 +155,6 @@ pub async fn connect(
         idr_tx,
         rtt_probe,
         net_stats,
+        usb_connection,
     ))
 }

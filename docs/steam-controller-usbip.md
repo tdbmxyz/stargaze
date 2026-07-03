@@ -1,97 +1,91 @@
-# Steam Controller on the server via USB/IP
-
-Stargaze's controller pass-through recreates the client's pad on the
-server as a virtual device. That works for most controllers, but **not
-for the Steam Controller when the server runs Steam**: Valve's
-controller handling only accepts the real USB topology.
-
-## Why virtual recreations don't work for Valve pads
+# Steam Controller on the server (built-in USB forwarding)
 
 Steam talks to the Steam Controller through its raw HID protocol, not
-through evdev, and it identifies the dongle's controller slots by **USB
-interface number** (interfaces 1–4 on the `28de:1142` wireless dongle,
-interface 2 on the wired `28de:1102` — see `SDL_hidapi_steam.c` for the
-public mirror of this logic). Virtual devices (uinput or uhid) have no
-USB parent, so hidapi reports `Interface: -1` and Steam enumerates them
-(`Local Device Found` in `logs/controller.txt`) but never adopts them.
-This was verified end to end: a uhid recreation gets the kernel
-`hid-steam` driver, registers a "Wireless Steam Controller" evdev, and
-Steam still ignores it.
+through evdev, and it identifies the hardware by its **USB topology**:
+interface numbers 1–4 on the `28de:1142` wireless dongle, interface 2
+on the wired `28de:1102` (see `SDL_hidapi_steam.c` for the public
+mirror of this logic). Virtual recreations (uinput or uhid) have no USB
+parent, so hidapi reports `Interface: -1` and Steam enumerates them but
+never adopts them. This was verified end to end: a uhid recreation gets
+the kernel `hid-steam` driver and a working evdev device, and Steam
+still ignores it.
 
-The fix is to forward the **USB device itself** with USB/IP: the dongle
-detaches from the client machine and shows up on the server as genuine
-USB hardware — real interface numbers, steam-devices udev rules apply,
-Steam adopts it exactly as if it were plugged in locally (gyro,
-paddles, per-game configs included).
+Stargaze therefore forwards Valve controller hardware **as a USB
+device**, using the kernel's USB/IP drivers with the byte flow tunneled
+through the session's own QUIC connection:
 
-## One-time setup
+```
+CLIENT                                       SERVER
+dongle → usbip-host stub                     vhci-hcd virtual host controller
+   ↑ socket pair end                            ↑ socket pair end
+stargaze-client ══ QUIC bidirectional stream ══ stargaze-server
+```
 
-**Client machine** (the one with the dongle) — exports USB devices:
+- No `usbipd`, no open TCP port: the tunnel rides the existing session.
+- Session-scoped: the device leaves the client when the session starts
+  and **returns automatically** when it ends (or the connection drops).
+- On the server it is genuine USB hardware — steam-devices udev rules
+  match, Steam adopts it fully (gyro, paddles, per-game configs).
+
+Enabled by default; disable with `--usb-forward false` (or
+`usb_forward = false` in `client.toml`). Forwarded hardware: wired
+Steam Controller (`28de:1102`), wireless dongle (`28de:1142`), Steam
+Deck controller (`28de:1205`).
+
+## One-time system setup
+
+The kernel interfaces involved (binding a device to the `usbip-host`
+stub, attaching to `vhci-hcd`) are root-only sysfs attributes. The
+flake ships NixOS modules that load the kernel modules and make those
+attributes writable by a `stargaze-usb` group — the same pattern
+Sunshine uses for `/dev/uinput` — so the binaries run unprivileged.
+
+On the **client** machine:
 
 ```nix
-# NixOS
-boot.kernelModules = ["usbip_host"];
-environment.systemPackages = [config.boot.kernelPackages.usbip];
-# USB/IP has no authentication: LAN only, ideally restrict to the
-# server's address with an iptables/nftables rule instead.
-networking.firewall.allowedTCPPorts = [3240];
-systemd.services.usbipd = {
-  description = "USB/IP export daemon";
-  wantedBy = ["multi-user.target"];
-  serviceConfig.ExecStart = "${config.boot.kernelPackages.usbip}/bin/usbipd";
+# flake input: stargaze.url = "github:tdbmxyz/stargaze";
+imports = [inputs.stargaze.nixosModules.usb-client];
+services.stargaze.usbClient = {
+  enable = true;
+  users = ["yourname"];
 };
 ```
 
-(Non-NixOS: install `usbip`/`linux-tools`, `modprobe usbip_host`, run
-`usbipd -D`, open TCP 3240 on the LAN.)
-
-**Server** — attaches remote USB devices:
+On the **server**:
 
 ```nix
-# NixOS
-boot.kernelModules = ["vhci-hcd"];
-environment.systemPackages = [config.boot.kernelPackages.usbip];
+imports = [inputs.stargaze.nixosModules.usb-server];
+services.stargaze.usbServer = {
+  enable = true;
+  users = ["yourname"];
+};
 ```
 
-## Per-session flow
+Non-NixOS equivalent: load `usbip_host` (client) / `vhci-hcd` (server)
+at boot, and make these sysfs attributes group-writable for the user
+running stargaze — `/sys/bus/usb/drivers/usbip-host/{match_busid,bind,unbind,rebind}`,
+`/sys/bus/usb/drivers/usb/unbind`, `/sys/bus/usb/drivers_probe`, and
+per-device `usbip_sockfd` on the client (a udev rule keeps up with
+hotplug); `/sys/devices/platform/vhci_hcd.*/{attach,detach}` on the
+server.
 
-On the **client**, find and export the dongle:
+## Behavior notes
 
-```sh
-usbip list -l                 # find the busid of 28de:1142
-sudo usbip bind -b 3-1.3      # replace with your busid
-```
+- While a session is up, the controller drives the **server**; the
+  client machine doesn't see it at all (that's the point — no double
+  input, no lizard-mode leakage through the local cursor).
+- If the session dies abruptly, both sides clean up on their own: the
+  server detaches the vhci port, the client rebinds the device to its
+  regular driver.
+- The client rescans every 2 seconds, so plugging the dongle in
+  mid-session forwards it without a restart.
 
-On the **server**, attach it:
+## Manual alternative (standalone usbip)
 
-```sh
-usbip list -r <client-ip>     # sanity check: the dongle is exported
-sudo usbip attach -r <client-ip> -b 3-1.3
-```
-
-The dongle now disappears from the client and appears on the server
-(`lsusb`, then Steam detects it within seconds). Stargaze needs no
-configuration: the client never sees the pad, and its input reaches
-the server through the dongle directly instead of the stream's input
-channel.
-
-To give the pad back to the client:
-
-```sh
-# server: find the vhci port, then detach
-usbip port
-sudo usbip detach -p 00
-# client: stop exporting
-sudo usbip unbind -b 3-1.3
-```
-
-## Caveats
-
-- While attached, the controller drives the **server** even outside a
-  stargaze session — power it off when not streaming.
-- USB/IP runs over its own TCP connection (port 3240), outside
-  stargaze's QUIC transport, with **no authentication or encryption**:
-  keep it strictly on the trusted LAN.
-- Input latency over a wired/solid LAN is negligible (single-digit
-  milliseconds); flaky Wi-Fi will affect the controller as much as the
-  stream.
+The classic `usbip` tooling still works without any stargaze
+involvement — useful for debugging or for forwarding devices stargaze
+doesn't know about: run `usbipd` on the client, `usbip bind -b <busid>`
+(client) and `usbip attach -r <client> -b <busid>` (server), with TCP
+3240 reachable. Remember that plain usbip is unauthenticated and
+unencrypted: keep it on a trusted network. The built-in tunnel doesn't
+have this problem (it inherits the session's QUIC/TLS).

@@ -96,7 +96,7 @@
     # metadata and build environment across the two package derivations.
     commonPackageAttrs = {
       pname = "stargaze";
-      version = "1.0.1";
+      version = "1.1.0";
       src = self;
 
       cargoLock.lockFile = ./Cargo.lock;
@@ -356,6 +356,15 @@
       };
 
       default = self.packages.${system}.stargaze-server;
+    };
+
+    # Permission setup for the built-in USB forwarding (Steam Controller
+    # hardware tunneled over the session connection). Import the client
+    # module on the machine running stargaze-client, the server module on
+    # the host, and set services.stargaze.usbClient/usbServer.{enable,users}.
+    nixosModules = {
+      usb-client = import ./nix/usb-client.nix;
+      usb-server = import ./nix/usb-server.nix;
     };
   };
 }
