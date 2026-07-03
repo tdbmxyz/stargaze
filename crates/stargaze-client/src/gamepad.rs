@@ -16,6 +16,15 @@
 //! consults [`SharedGamepads::is_grabbed`] to skip devices this module
 //! already owns, and both paths allocate pad slots from the same table
 //! so the server never sees two controllers on one slot.
+//!
+//! Valve controllers (Steam Controller, Steam Deck) are deliberately
+//! excluded from pass-through: hosts only drive them through Steam's
+//! hidraw stack, and SDL's controller database has no mapping for
+//! their evdev nodes — an identity clone on the server enumerates but
+//! is invisible to games. Grabbing them is also fragile: hid-steam
+//! removes its evdev node whenever anything (Steam, SDL's HIDAPI)
+//! opens the hidraw side. They take the SDL → Xbox 360 emulation path;
+//! true identity pass-through would require hidraw/uhid forwarding.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -31,6 +40,9 @@ use tracing::{debug, info, warn};
 
 /// How often the scanner looks for newly connected controllers.
 const SCAN_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Valve's USB vendor id (Steam Controller, Steam Deck, dongles).
+const VALVE_VENDOR_ID: u16 = 0x28de;
 
 /// Identifies who owns a pad slot: the SDL emulation path (keyed by SDL
 /// joystick instance id) or the evdev pass-through path (keyed by the
@@ -51,6 +63,16 @@ struct SharedState {
     grabbed: HashSet<(u16, u16)>,
     /// Device nodes currently owned by a pass-through reader thread.
     active_nodes: HashSet<PathBuf>,
+    /// Nodes the scanner decided to leave alone (Valve devices, grab
+    /// failures), so the decision is logged once instead of every scan.
+    /// Pruned when the node disappears, giving re-plugged devices a
+    /// fresh chance.
+    ignored_nodes: HashSet<PathBuf>,
+    /// (vendor, product) pairs whose pass-through ended because the
+    /// device node vanished. The SDL loop uses this to warn loudly when
+    /// such a device resurfaces on the emulation path instead of being
+    /// silently downgraded to an Xbox 360 pad.
+    lost: HashSet<(u16, u16)>,
 }
 
 /// Pad slot table and grab registry shared between the SDL event loop
@@ -70,6 +92,8 @@ impl SharedGamepads {
                 slots: [const { None }; MAX_GAMEPADS as usize],
                 grabbed: HashSet::new(),
                 active_nodes: HashSet::new(),
+                ignored_nodes: HashSet::new(),
+                lost: HashSet::new(),
             }),
             generation: AtomicU64::new(0),
         })
@@ -141,11 +165,28 @@ impl SharedGamepads {
             .and_then(|i| u8::try_from(i).ok())
     }
 
+    /// Whether pass-through for this (vendor, product) previously ended
+    /// with the device node vanishing (e.g. another process opened the
+    /// controller's hidraw node and the kernel dropped the evdev one).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the slot table lock is poisoned.
+    pub fn passthrough_was_lost(&self, vendor: u16, product: u16) -> bool {
+        self.state.lock().unwrap().lost.contains(&(vendor, product))
+    }
+
     fn mark_grabbed(&self, node: PathBuf, vendor: u16, product: u16) {
         let mut state = self.state.lock().unwrap();
         state.grabbed.insert((vendor, product));
         state.active_nodes.insert(node);
+        // The device is passed through (again); clear any stale loss.
+        state.lost.remove(&(vendor, product));
         self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    fn mark_lost(&self, vendor: u16, product: u16) {
+        self.state.lock().unwrap().lost.insert((vendor, product));
     }
 
     fn unmark_grabbed(&self, node: &PathBuf, vendor: u16, product: u16) {
@@ -157,6 +198,25 @@ impl SharedGamepads {
 
     fn is_active_node(&self, node: &PathBuf) -> bool {
         self.state.lock().unwrap().active_nodes.contains(node)
+    }
+
+    fn mark_ignored(&self, node: PathBuf) {
+        self.state.lock().unwrap().ignored_nodes.insert(node);
+    }
+
+    fn is_ignored(&self, node: &PathBuf) -> bool {
+        self.state.lock().unwrap().ignored_nodes.contains(node)
+    }
+
+    /// Drops ignore records for nodes that no longer exist, so a device
+    /// re-plugged at a recycled path is evaluated again.
+    fn prune_ignored<'a>(&self, existing: impl Iterator<Item = &'a PathBuf>) {
+        let existing: HashSet<&PathBuf> = existing.collect();
+        self.state
+            .lock()
+            .unwrap()
+            .ignored_nodes
+            .retain(|node| existing.contains(node));
     }
 }
 
@@ -238,8 +298,10 @@ pub fn start_passthrough(
 
 /// One enumeration pass: claim every new gamepad node we can grab.
 fn scan_once(shared: &Arc<SharedGamepads>, input_tx: &std::sync::mpsc::Sender<InputEvent>) {
-    for (path, device) in evdev::enumerate() {
-        if shared.is_active_node(&path) {
+    let nodes: Vec<(PathBuf, Device)> = evdev::enumerate().collect();
+    shared.prune_ignored(nodes.iter().map(|(path, _)| path));
+    for (path, device) in nodes {
+        if shared.is_active_node(&path) || shared.is_ignored(&path) {
             continue;
         }
         let Some(keys) = device.supported_keys() else {
@@ -263,6 +325,19 @@ fn claim_device(
 ) {
     let descriptor = build_descriptor(&device);
 
+    if descriptor.vendor == VALVE_VENDOR_ID {
+        // A server-side evdev clone of a Valve controller is invisible
+        // to games (no SDL mapping; hosts drive these via Steam/hidraw),
+        // and grabbing it races hid-steam's node removal. See module docs.
+        info!(
+            name = %descriptor.name,
+            "Valve controller: skipping evdev pass-through (hosts only \
+             support these via Steam/hidraw); using Xbox 360 emulation"
+        );
+        shared.mark_ignored(path);
+        return;
+    }
+
     if let Err(e) = device.grab() {
         // Something else holds the device (or we lack permissions).
         // SDL will emulate it instead.
@@ -272,6 +347,7 @@ fn claim_device(
             "Cannot grab gamepad for pass-through ({e}); \
              falling back to Xbox 360 emulation"
         );
+        shared.mark_ignored(path);
         return;
     }
 
@@ -355,6 +431,7 @@ fn read_loop(
                     name = %descriptor.name,
                     "Gamepad disconnected ({e})"
                 );
+                shared.mark_lost(descriptor.vendor, descriptor.product);
                 let _ = input_tx.send(InputEvent::GamepadDisconnected { pad });
                 break;
             }
@@ -415,6 +492,35 @@ mod tests {
 
         shared.unmark_grabbed(&PathBuf::from("/dev/input/event9"), 0x28de, 0x1102);
         assert!(!shared.is_grabbed(0x28de, 0x1102));
+    }
+
+    #[test]
+    fn ignored_nodes_pruned_when_device_disappears() {
+        let shared = SharedGamepads::new();
+        let node = PathBuf::from("/dev/input/event3");
+        shared.mark_ignored(node.clone());
+        assert!(shared.is_ignored(&node));
+
+        // Node still enumerated: the ignore record is kept.
+        shared.prune_ignored(std::iter::once(&node));
+        assert!(shared.is_ignored(&node));
+
+        // Node gone: the record is dropped so a re-plug is re-evaluated.
+        shared.prune_ignored(std::iter::empty());
+        assert!(!shared.is_ignored(&node));
+    }
+
+    #[test]
+    fn lost_passthrough_tracked_until_regrabbed() {
+        let shared = SharedGamepads::new();
+        assert!(!shared.passthrough_was_lost(0x28de, 0x1142));
+
+        shared.mark_lost(0x28de, 0x1142);
+        assert!(shared.passthrough_was_lost(0x28de, 0x1142));
+
+        // Re-establishing pass-through clears the loss record.
+        shared.mark_grabbed(PathBuf::from("/dev/input/event9"), 0x28de, 0x1142);
+        assert!(!shared.passthrough_was_lost(0x28de, 0x1142));
     }
 
     #[test]

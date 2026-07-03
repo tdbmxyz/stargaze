@@ -11,7 +11,7 @@ Stargaze streams a Wayland desktop from a host machine (the **server**) to anoth
 
 - **Video**: PipeWire screen capture (DMA-BUF zero-copy or CPU path) → NVENC H.265 → QUIC → VAAPI or multi-threaded software decode → SDL2
 - **Audio**: PipeWire capture → Opus (stereo, 48 kHz) → SDL2 playback
-- **Input**: keyboard, mouse, and game controller events forwarded from the client and injected on the server via uinput. Controllers are passed through at the evdev level — the host sees the real device (name, vendor/product ids, exact button/axis layout, e.g. an actual Steam Controller) — with automatic per-device fallback to Xbox 360 pad emulation (`--gamepad-passthrough false` forces emulation)
+- **Input**: keyboard, mouse, and game controller events forwarded from the client and injected on the server via uinput. Controllers are passed through at the evdev level — the host sees the real device (name, vendor/product ids, exact button/axis layout) — with automatic per-device fallback to Xbox 360 pad emulation (`--gamepad-passthrough false` forces emulation). Valve controllers are the exception: Steam only accepts them with their real USB topology, so forward the dongle with USB/IP instead — see [docs/steam-controller-usbip.md](docs/steam-controller-usbip.md)
 - **Mic forwarding** (optional): client microphone streamed back to the server via an [rsonance](https://github.com/tdbmxyz/rsonance) subprocess
 - **Loss recovery**: unreliable QUIC datagrams for media with in-order frame reassembly; lost frames trigger rate-limited IDR keyframe requests so the picture recovers in a few frames instead of seconds
 - **Low latency by design**: no vsync blocking in the render path, bounded channels with drop-oldest backpressure, IDR-on-drop
@@ -88,6 +88,8 @@ On the host machine:
 ```bash
 stargaze-server --resolution 2560x1440 --framerate 60 --bitrate 20
 # A portal dialog asks which screen to share on first run.
+# Headless host (no display to approve the dialog)? See
+# docs/headless-screencast.md for an auto-approving portal setup.
 ```
 
 On the client machine:
