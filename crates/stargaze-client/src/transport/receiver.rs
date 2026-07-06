@@ -8,9 +8,9 @@ use std::time::Instant;
 
 use stargaze_core::input::InputEvent;
 use stargaze_core::transport::{
-    ControlMessage, DatagramHeader, IDR_RATE_LIMIT_MS, MAX_PENDING_FRAMES, ReassembledFrame,
-    STREAM_TYPE_AUDIO, STREAM_TYPE_VIDEO, TransportError, deserialize_control_message,
-    deserialize_header, serialize_control_message,
+    ControlMessage, DatagramHeader, IDR_RATE_LIMIT_MS, IDR_RETRY_MS, MAX_PENDING_FRAMES,
+    ReassembledFrame, STREAM_TYPE_AUDIO, STREAM_TYPE_VIDEO, TransportError,
+    deserialize_control_message, deserialize_header, serialize_control_message,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -144,6 +144,18 @@ pub struct FrameAssembler {
     max_pending: usize,
     /// Last time an `IDR` request was sent.
     last_idr_request: Option<Instant>,
+    /// True from the moment video continuity breaks (a frame was lost or
+    /// dropped) until a keyframe is delivered. While set, IDR requests
+    /// are re-issued every [`IDR_RETRY_MS`]: a single request can be
+    /// lost, or the keyframe it produces can itself be lost, and with an
+    /// infinite GOP nothing else would ever clean the corruption up.
+    awaiting_keyframe: bool,
+    /// A disruption happened and its IDR request has not been issued yet
+    /// (deferred by the rate limiter). Unlike `awaiting_keyframe` this
+    /// clears as soon as a request goes out: fresh disruptions request at
+    /// the [`IDR_RATE_LIMIT_MS`] floor, unanswered ones retry at the
+    /// slower [`IDR_RETRY_MS`] cadence.
+    request_pending: bool,
 }
 
 impl FrameAssembler {
@@ -154,6 +166,8 @@ impl FrameAssembler {
             next_frame: HashMap::new(),
             max_pending: MAX_PENDING_FRAMES,
             last_idr_request: None,
+            awaiting_keyframe: false,
+            request_pending: false,
         }
     }
 
@@ -204,29 +218,82 @@ impl FrameAssembler {
             pending.received_count += 1;
         }
 
-        let skipped = self.deliver_in_order(header.stream_type, &mut completed);
+        self.deliver_in_order(header.stream_type, next, &mut completed);
 
-        // Request IDR if we skipped a gap (lost video frame) or too many
-        // incomplete video frames are pending.
-        if header.stream_type == STREAM_TYPE_VIDEO && skipped {
-            need_idr = self.should_request_idr();
-        }
+        // Too many incomplete video frames pending: reassembly is
+        // hopelessly behind.
         let video_pending = self
             .pending
             .keys()
             .filter(|(st, _)| *st == STREAM_TYPE_VIDEO)
             .count();
         if video_pending > self.max_pending {
-            if !need_idr {
-                need_idr = self.should_request_idr();
+            self.note_disruption();
+        }
+
+        // Fresh disruptions request at the rate-limit floor (deferred,
+        // never dropped, if inside the window); an unanswered awaiting
+        // state retries at the slower cadence so a keyframe still in
+        // flight is not duplicated.
+        if self.request_pending {
+            if self.should_request_idr() {
+                self.request_pending = false;
+                need_idr = true;
             }
-            if need_idr {
-                self.pending.retain(|(st, _), _| *st != STREAM_TYPE_VIDEO);
-                self.next_frame.remove(&STREAM_TYPE_VIDEO);
+        } else if self.awaiting_keyframe && self.retry_due() {
+            need_idr = self.should_request_idr();
+        }
+
+        // Reset video tracking to the freshest frames — but only once the
+        // paired IDR request actually goes out: wiping earlier would
+        // destroy buffered frames (possibly a recovery keyframe stuck
+        // behind a gap) with no replacement on the way yet.
+        if need_idr && video_pending > self.max_pending {
+            let resume = self
+                .pending
+                .keys()
+                .filter(|(st, _)| *st == STREAM_TYPE_VIDEO)
+                .map(|(_, idx)| *idx)
+                .max()
+                .map(|idx| idx.wrapping_add(1));
+            self.pending.retain(|(st, _), _| *st != STREAM_TYPE_VIDEO);
+            if let Some(resume) = resume {
+                // Keep the in-order cursor monotonic instead of removing
+                // it: re-seeding from the next datagram would let an
+                // unordered straggler of a wiped frame anchor tracking
+                // backwards and stall delivery.
+                self.next_frame.insert(STREAM_TYPE_VIDEO, resume);
             }
         }
 
         (completed, need_idr)
+    }
+
+    /// Records a video disruption (lost frame, decoder backpressure drop,
+    /// decode failure, pending overflow): keeps IDR requests firing until
+    /// the next keyframe is delivered.
+    pub fn note_disruption(&mut self) {
+        self.awaiting_keyframe = true;
+        self.request_pending = true;
+    }
+
+    /// Records an external disruption and immediately decides whether to
+    /// send the IDR request now (rate-limited). If deferred, the pending
+    /// request is issued from the datagram path as soon as the limiter
+    /// allows.
+    pub fn request_idr_now(&mut self) -> bool {
+        self.note_disruption();
+        if self.should_request_idr() {
+            self.request_pending = false;
+            return true;
+        }
+        false
+    }
+
+    /// True once enough time has passed to re-issue an unanswered request.
+    fn retry_due(&self) -> bool {
+        self.last_idr_request
+            .is_none_or(|last| last.elapsed().as_millis() >= u128::from(IDR_RETRY_MS))
     }
 
     fn assemble_frame(&mut self, key: (u8, u32)) -> Option<ReassembledFrame> {
@@ -249,10 +316,14 @@ impl FrameAssembler {
         })
     }
 
-    fn deliver_in_order(&mut self, stream_type: u8, completed: &mut Vec<ReassembledFrame>) -> bool {
-        let mut next = *self.next_frame.entry(stream_type).or_insert(0);
-        let mut skipped_gap = false;
-
+    /// Delivers complete frames in order starting from `next` (the
+    /// caller's already-seeded cursor for this stream).
+    fn deliver_in_order(
+        &mut self,
+        stream_type: u8,
+        mut next: u32,
+        completed: &mut Vec<ReassembledFrame>,
+    ) {
         loop {
             let key = (stream_type, next);
             let is_complete = self
@@ -261,6 +332,13 @@ impl FrameAssembler {
                 .is_some_and(|pf| pf.received_count == pf.fragment_count);
             if is_complete {
                 if let Some(frame) = self.assemble_frame(key) {
+                    if stream_type == STREAM_TYPE_VIDEO && frame.is_keyframe {
+                        // A keyframe fully resets the decoder (extradata is
+                        // prepended server-side) — recovery is complete and
+                        // any queued request is moot.
+                        self.awaiting_keyframe = false;
+                        self.request_pending = false;
+                    }
                     completed.push(frame);
                 }
                 next = next.wrapping_add(1);
@@ -293,15 +371,15 @@ impl FrameAssembler {
                          requesting an IDR (expect decoder reference warnings \
                          until the keyframe arrives)"
                     );
+                    self.awaiting_keyframe = true;
+                    self.request_pending = true;
                 }
                 next = next.wrapping_add(1);
-                skipped_gap = true;
                 continue;
             }
             break;
         }
         self.next_frame.insert(stream_type, next);
-        skipped_gap
     }
 
     /// Checks if we should send an `IDR` request based on rate limiting.
@@ -358,11 +436,17 @@ pub(crate) async fn receive_loop(
             // rate-limited like every other IDR request.
             idr = decoder_idr_rx.recv(), if decoder_idr_open => {
                 match idr {
-                    Some(()) if assembler.should_request_idr() => {
-                        debug!("Requesting IDR keyframe (decoder recovery)");
-                        send_idr_request(&mut control_send).await?;
+                    Some(()) => {
+                        // Sticky: if this request (or its keyframe) is lost,
+                        // the assembler re-requests until a keyframe lands.
+                        // A message racing with an already-delivered keyframe
+                        // costs one redundant keyframe — acceptable, since
+                        // NOT requesting risks persistent corruption.
+                        if assembler.request_idr_now() {
+                            debug!("Requesting IDR keyframe (decoder recovery)");
+                            send_idr_request(&mut control_send).await?;
+                        }
                     }
-                    Some(()) => {}
                     None => decoder_idr_open = false,
                 }
             }
@@ -428,14 +512,16 @@ pub(crate) async fn receive_loop(
                                     net_stats.video_dropped.fetch_add(1, Ordering::Relaxed);
                                     // Channel full — decoder is behind. Drop
                                     // the frame and request an IDR: the gap
-                                    // would otherwise corrupt decoding until
-                                    // the next periodic keyframe.
+                                    // would otherwise corrupt decoding
+                                    // forever (infinite GOP).
                                     debug!(
                                         pts = f.pts,
                                         "Dropping video frame (decoder backpressure)"
                                     );
                                     if !need_idr {
-                                        need_idr = assembler.should_request_idr();
+                                        need_idr = assembler.request_idr_now();
+                                    } else {
+                                        assembler.note_disruption();
                                     }
                                     Ok(())
                                 }
@@ -737,6 +823,138 @@ mod tests {
         let (frames, need_idr) = assembler.process_datagram(&f1_late, vec![7]);
         assert!(frames.is_empty());
         assert!(!need_idr);
+    }
+
+    /// Backdates the last IDR request by `ms` milliseconds.
+    fn backdate_last_request(assembler: &mut FrameAssembler, ms: u64) {
+        assembler.last_idr_request = Some(Instant::now() - std::time::Duration::from_millis(ms));
+    }
+
+    fn video_pending_count(assembler: &FrameAssembler) -> usize {
+        assembler
+            .pending
+            .keys()
+            .filter(|(st, _)| *st == STREAM_TYPE_VIDEO)
+            .count()
+    }
+
+    #[test]
+    fn idr_rerequested_until_keyframe_arrives() {
+        let mut assembler = FrameAssembler::new();
+
+        // Frame 0 delivered normally.
+        let (frames, _) = assembler.process_datagram(&video_header(0, 0, 1, 0, true), vec![1]);
+        assert_eq!(frames.len(), 1);
+
+        // Frame 1 lost; frames 2 and 3 arrive → gap skipped, IDR requested.
+        assembler.process_datagram(&video_header(2, 0, 1, 2, false), vec![2]);
+        let (_, need_idr) = assembler.process_datagram(&video_header(3, 0, 1, 3, false), vec![3]);
+        assert!(need_idr);
+
+        // Within the retry window: no duplicate request while the
+        // keyframe may still be in flight.
+        let (_, need_idr) = assembler.process_datagram(&video_header(4, 0, 1, 4, false), vec![4]);
+        assert!(!need_idr);
+        backdate_last_request(&mut assembler, IDR_RATE_LIMIT_MS * 2);
+        let (_, need_idr) = assembler.process_datagram(&video_header(5, 0, 1, 5, false), vec![5]);
+        assert!(!need_idr, "retries are slower than the rate-limit floor");
+
+        // Retry window elapses and still no keyframe (the request or the
+        // IDR it produced was lost): the request must be re-issued.
+        backdate_last_request(&mut assembler, IDR_RETRY_MS * 2);
+        let (_, need_idr) = assembler.process_datagram(&video_header(6, 0, 1, 6, false), vec![6]);
+        assert!(
+            need_idr,
+            "IDR must be re-requested until a keyframe arrives"
+        );
+
+        // Keyframe delivered: recovery complete, requests stop.
+        let (frames, need_idr) =
+            assembler.process_datagram(&video_header(7, 0, 1, 7, true), vec![7]);
+        assert_eq!(frames.len(), 1);
+        assert!(!need_idr);
+        backdate_last_request(&mut assembler, IDR_RETRY_MS * 2);
+        let (_, need_idr) = assembler.process_datagram(&video_header(8, 0, 1, 8, false), vec![8]);
+        assert!(!need_idr, "recovery is over once a keyframe is delivered");
+    }
+
+    #[test]
+    fn fresh_disruption_request_is_deferred_not_dropped() {
+        let mut assembler = FrameAssembler::new();
+
+        // Frame 0 delivered; an IDR request just went out.
+        assembler.process_datagram(&video_header(0, 0, 1, 0, true), vec![1]);
+        assembler.last_idr_request = Some(Instant::now());
+
+        // A fresh disruption inside the rate-limit window: the request is
+        // deferred, not dropped.
+        assembler.note_disruption();
+        let (_, need_idr) = assembler.process_datagram(&video_header(1, 0, 1, 1, false), vec![2]);
+        assert!(!need_idr);
+
+        // Once the rate-limit floor passes (well before the retry
+        // cadence), the deferred request goes out.
+        backdate_last_request(&mut assembler, IDR_RATE_LIMIT_MS * 2);
+        let (_, need_idr) = assembler.process_datagram(&video_header(2, 0, 1, 2, false), vec![3]);
+        assert!(
+            need_idr,
+            "a deferred fresh request fires at the rate-limit floor"
+        );
+    }
+
+    #[test]
+    fn note_disruption_triggers_idr_rerequests() {
+        let mut assembler = FrameAssembler::new();
+
+        // Frame 0 delivered, then a frame is dropped outside the assembler
+        // (decoder backpressure).
+        assembler.process_datagram(&video_header(0, 0, 1, 0, true), vec![1]);
+        assembler.note_disruption();
+
+        backdate_last_request(&mut assembler, IDR_RATE_LIMIT_MS * 2);
+        let (_, need_idr) = assembler.process_datagram(&video_header(1, 0, 1, 1, false), vec![2]);
+        assert!(need_idr);
+
+        // Cleared by the next keyframe.
+        let (_, need_idr) = assembler.process_datagram(&video_header(2, 0, 1, 2, true), vec![3]);
+        assert!(!need_idr);
+        backdate_last_request(&mut assembler, IDR_RETRY_MS * 2);
+        let (_, need_idr) = assembler.process_datagram(&video_header(3, 0, 1, 3, false), vec![4]);
+        assert!(!need_idr);
+    }
+
+    #[test]
+    fn overflow_wipe_waits_for_granted_request_and_resumes_forward() {
+        let mut assembler = FrameAssembler::new();
+        // An IDR request just went out: the limiter suppresses new ones.
+        assembler.last_idr_request = Some(Instant::now());
+
+        // Fill past max_pending with incomplete frames (1 of 2 fragments).
+        for i in 0..=MAX_PENDING_FRAMES as u32 {
+            let h = video_header(i, 0, 2, u64::from(i), false);
+            let (_, need_idr) = assembler.process_datagram(&h, vec![0]);
+            assert!(!need_idr, "request suppressed inside the rate window");
+        }
+        assert!(
+            video_pending_count(&assembler) > MAX_PENDING_FRAMES,
+            "buffered frames must be retained until the request can go out"
+        );
+
+        // Window expires: the request fires and video tracking resets
+        // past the freshest wiped frame.
+        backdate_last_request(&mut assembler, IDR_RATE_LIMIT_MS * 2);
+        let newest = MAX_PENDING_FRAMES as u32 + 1;
+        let (_, need_idr) =
+            assembler.process_datagram(&video_header(newest, 0, 2, 99, false), vec![0]);
+        assert!(need_idr);
+        assert_eq!(video_pending_count(&assembler), 0);
+        assert_eq!(assembler.next_frame[&STREAM_TYPE_VIDEO], newest + 1);
+
+        // A straggler fragment of a wiped frame must not re-anchor the
+        // cursor backwards.
+        let (frames, _) = assembler.process_datagram(&video_header(3, 1, 2, 3, false), vec![1]);
+        assert!(frames.is_empty());
+        assert_eq!(assembler.next_frame[&STREAM_TYPE_VIDEO], newest + 1);
     }
 
     #[test]

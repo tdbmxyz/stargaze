@@ -96,7 +96,7 @@
     # metadata and build environment across the two package derivations.
     commonPackageAttrs = {
       pname = "stargaze";
-      version = "1.2.1";
+      version = "1.2.2";
       src = self;
 
       cargoLock.lockFile = ./Cargo.lock;

@@ -22,6 +22,14 @@ pub const MAX_PENDING_FRAMES: usize = 8;
 /// Minimum interval between IDR requests in milliseconds.
 pub const IDR_RATE_LIMIT_MS: u64 = 100;
 
+/// Minimum interval in milliseconds before an *unanswered* IDR request is
+/// re-issued (no keyframe delivered yet). Deliberately longer than
+/// [`IDR_RATE_LIMIT_MS`]: a keyframe is the largest frame on the wire and
+/// can take well over 100 ms to encode and transmit on slow links, and
+/// re-requesting while one is still in flight would produce redundant
+/// keyframes that further congest the link.
+pub const IDR_RETRY_MS: u64 = 500;
+
 /// Conservative header size upper bound (bytes) for [`DatagramHeader`].
 ///
 /// Postcard uses varint encoding, so the actual serialized size depends
