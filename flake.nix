@@ -173,6 +173,7 @@
         binName = "stargaze-client";
         libs = clientLibs;
         inherit extraWrapFlags;
+        runSnippet = stripSteamEnvSnippet;
         drv = rustPlatform.buildRustPackage (commonPackageAttrs
           // {
             pname = "stargaze-client";
@@ -204,21 +205,52 @@
           });
       };
 
+    # Shell snippet run by the client wrapper before exec: Steam launches
+    # non-Steam games with its scout runtime in LD_LIBRARY_PATH and the
+    # overlay in LD_PRELOAD. LD_LIBRARY_PATH outranks the DT_RUNPATH Nix
+    # binaries resolve their libraries with, so Steam's ancient libs
+    # shadow the bundled ones and the client dies on startup (launching
+    # from a file manager works, from Steam does not). Strip exactly the
+    # Steam entries and keep everything else (e.g. nixGL).
+    stripSteamEnvSnippet = ''
+      strip_steam_entries() {
+        local out="" p IFS=': '
+        for p in $1; do
+          case "$p" in
+            *steam-runtime* | *gameoverlay* | */Steam/ubuntu12_32* | */Steam/ubuntu12_64*) ;;
+            *) out="''${out:+$out:}$p" ;;
+          esac
+        done
+        printf '%s' "$out"
+      }
+      if [ -n "''${LD_LIBRARY_PATH-}" ]; then
+        LD_LIBRARY_PATH="$(strip_steam_entries "$LD_LIBRARY_PATH")"
+      fi
+      if [ -n "''${LD_PRELOAD-}" ]; then
+        LD_PRELOAD="$(strip_steam_entries "$LD_PRELOAD")"
+      fi
+    '';
+
     # Helper: wrap a binary so it finds .so files at runtime.
     wrapBin = {
       drv,
       binName,
       libs,
       extraWrapFlags ? [],
+      runSnippet ? null,
     }: let
       libPath = pkgs.lib.makeLibraryPath libs;
+      runFlag =
+        if runSnippet == null
+        then ""
+        else "--run ${pkgs.lib.escapeShellArg runSnippet}";
     in
       drv.overrideAttrs (old: {
         postFixup =
           (old.postFixup or "")
           + ''
             wrapProgram $out/bin/${binName} \
-              --prefix LD_LIBRARY_PATH : "${libPath}" ${pkgs.lib.concatStringsSep " " extraWrapFlags}
+              --prefix LD_LIBRARY_PATH : "${libPath}" ${runFlag} ${pkgs.lib.concatStringsSep " " extraWrapFlags}
           '';
       });
   in {
