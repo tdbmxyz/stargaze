@@ -38,6 +38,7 @@ pub fn start_renderer(
     commands: &SessionCommands,
     zero_copy: &std::sync::atomic::AtomicBool,
     gamepads: &crate::gamepad::SharedGamepads,
+    idr_tx: &tokio::sync::mpsc::Sender<()>,
 ) -> Result<(), anyhow::Error> {
     sdl::run_sdl_loop(
         sdl,
@@ -52,5 +53,6 @@ pub fn start_renderer(
         commands,
         zero_copy,
         gamepads,
+        idr_tx,
     )
 }
