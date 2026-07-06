@@ -20,18 +20,6 @@ use super::font::TextRenderer;
 use super::widgets::{self, FocusList, NavEvent, Ui, palette};
 use crate::transport::{self, ConnectedSession};
 
-/// Resolution presets for the host-edit spinner.
-const RESOLUTIONS: [(u32, u32); 5] = [
-    (1280, 800),
-    (1920, 1080),
-    (2560, 1440),
-    (3440, 1440),
-    (3840, 2160),
-];
-
-/// Framerate presets for the host-edit spinner.
-const FRAMERATES: [u32; 4] = [30, 60, 90, 120];
-
 /// Extra rows below the hosts on the main screen.
 const HOST_LIST_EXTRA: usize = 3; // Add host, Settings, Quit
 
@@ -72,6 +60,10 @@ enum Screen {
         draft: HostEntry,
         /// Port edited as text (digits only).
         port_text: String,
+        /// Resolution edited as free-form text ("WIDTHxHEIGHT").
+        resolution_text: String,
+        /// Framerate edited as free-form text (digits only).
+        fps_text: String,
         focus: FocusList,
         /// A text field is in editing mode.
         editing: bool,
@@ -217,6 +209,8 @@ impl Model {
             index,
             draft,
             port_text,
+            resolution_text,
+            fps_text,
             focus,
             editing,
         } = &mut self.screen
@@ -240,11 +234,18 @@ impl Model {
                         FIELD_NAME => &mut draft.name,
                         FIELD_ADDRESS => &mut draft.address,
                         FIELD_PORT => port_text,
+                        FIELD_RESOLUTION => resolution_text,
+                        FIELD_FPS => fps_text,
                         _ => unreachable!("editing a non-text field"),
                     };
                     for ch in s.chars() {
+                        let ch = if ch == 'X' { 'x' } else { ch };
                         let ok = match focus.focus {
                             FIELD_PORT => ch.is_ascii_digit() && target.len() < 5,
+                            FIELD_FPS => ch.is_ascii_digit() && target.len() < 4,
+                            FIELD_RESOLUTION => {
+                                (ch.is_ascii_digit() || ch == 'x') && target.len() < 10
+                            }
                             // Addresses/names: printable ASCII is plenty.
                             _ => !ch.is_control() && target.len() < 64,
                         };
@@ -258,6 +259,8 @@ impl Model {
                         FIELD_NAME => &mut draft.name,
                         FIELD_ADDRESS => &mut draft.address,
                         FIELD_PORT => port_text,
+                        FIELD_RESOLUTION => resolution_text,
+                        FIELD_FPS => fps_text,
                         _ => unreachable!("editing a non-text field"),
                     };
                     target.pop();
@@ -289,20 +292,15 @@ impl Model {
             }
             NavEvent::Left | NavEvent::Right => {
                 let forward = matches!(event, NavEvent::Right);
-                match focus.focus {
-                    FIELD_RESOLUTION => cycle_resolution(&mut draft.resolution, forward),
-                    FIELD_FPS => cycle_framerate(&mut draft.framerate, forward),
-                    FIELD_CODEC => cycle_codec(&mut draft.codec, forward),
-                    _ => {}
+                if focus.focus == FIELD_CODEC {
+                    cycle_codec(&mut draft.codec, forward);
                 }
             }
             NavEvent::Activate => match focus.focus {
-                FIELD_NAME | FIELD_ADDRESS | FIELD_PORT => {
+                FIELD_NAME | FIELD_ADDRESS | FIELD_PORT | FIELD_RESOLUTION | FIELD_FPS => {
                     *editing = true;
                     return Effect::EditingChanged(true);
                 }
-                FIELD_RESOLUTION => cycle_resolution(&mut draft.resolution, true),
-                FIELD_FPS => cycle_framerate(&mut draft.framerate, true),
                 FIELD_CODEC => cycle_codec(&mut draft.codec, true),
                 FIELD_SAVE => {
                     if draft.address.is_empty() {
@@ -313,7 +311,31 @@ impl Model {
                         self.error = Some(format!("Invalid port: {port_text}"));
                         return Effect::None;
                     };
+                    let Ok(resolution) = resolution_text.parse::<Resolution>() else {
+                        self.error = Some(format!(
+                            "Invalid resolution: {resolution_text} (expected WIDTHxHEIGHT, \
+                             e.g. 1920x1080)"
+                        ));
+                        return Effect::None;
+                    };
+                    if resolution.width < 16
+                        || resolution.height < 16
+                        || resolution.width > 16384
+                        || resolution.height > 16384
+                    {
+                        self.error = Some(format!("Resolution out of range: {resolution}"));
+                        return Effect::None;
+                    }
+                    let fps = match fps_text.parse::<u32>() {
+                        Ok(fps) if (1..=1000).contains(&fps) => fps,
+                        _ => {
+                            self.error = Some(format!("Invalid framerate: {fps_text}"));
+                            return Effect::None;
+                        }
+                    };
                     draft.port = port;
+                    draft.resolution = resolution;
+                    draft.framerate = fps;
                     let committed = draft.clone();
                     let index = *index;
                     match index {
@@ -397,37 +419,17 @@ impl Model {
 
 fn new_host_edit(index: Option<usize>, draft: HostEntry) -> Screen {
     let port_text = draft.port.to_string();
+    let resolution_text = draft.resolution.to_string();
+    let fps_text = draft.framerate.to_string();
     Screen::HostEdit {
         index,
         draft,
         port_text,
+        resolution_text,
+        fps_text,
         focus: FocusList::new(EDIT_FIELDS),
         editing: false,
     }
-}
-
-fn cycle_resolution(resolution: &mut Resolution, forward: bool) {
-    let current = RESOLUTIONS
-        .iter()
-        .position(|&(w, h)| w == resolution.width && h == resolution.height);
-    let next = match (current, forward) {
-        (Some(i), true) => (i + 1) % RESOLUTIONS.len(),
-        (Some(i), false) => (i + RESOLUTIONS.len() - 1) % RESOLUTIONS.len(),
-        // Custom value not in the presets: snap to the first.
-        (None, _) => 0,
-    };
-    let (width, height) = RESOLUTIONS[next];
-    *resolution = Resolution { width, height };
-}
-
-fn cycle_framerate(framerate: &mut u32, forward: bool) {
-    let current = FRAMERATES.iter().position(|&f| f == *framerate);
-    let next = match (current, forward) {
-        (Some(i), true) => (i + 1) % FRAMERATES.len(),
-        (Some(i), false) => (i + FRAMERATES.len() - 1) % FRAMERATES.len(),
-        (None, _) => 1, // default to 60
-    };
-    *framerate = FRAMERATES[next];
 }
 
 fn cycle_codec(codec: &mut Codec, forward: bool) {
@@ -452,21 +454,25 @@ fn draw(model: &Model, connecting: Option<&str>, ui: &mut Ui) {
             index,
             draft,
             port_text,
+            resolution_text,
+            fps_text,
             focus,
             editing,
-        } => draw_host_edit(*index, draft, port_text, focus, *editing, ui),
+        } => {
+            let texts = EditTexts {
+                port: port_text,
+                resolution: resolution_text,
+                fps: fps_text,
+            };
+            draw_host_edit(*index, draft, &texts, focus, *editing, ui);
+        }
         Screen::Settings { focus } => draw_settings(model, focus, ui),
     }
 
     if let Some(host) = connecting {
-        let rect = Rect::new(0, 0, widgets::UI_WIDTH, 44);
-        ui.canvas.set_draw_color(palette::WIDGET_FOCUS);
-        let _ = ui.canvas.fill_rect(rect);
-        ui.text(
+        ui.banner(
             &format!("Connecting to {host}…  (B / Esc to cancel)"),
-            16,
-            10,
-            18,
+            palette::WIDGET_FOCUS,
             palette::TEXT,
         );
     } else if let Some(error) = &model.error {
@@ -484,7 +490,7 @@ fn draw_host_list(model: &Model, focus: &FocusList, ui: &mut Ui) {
         let rect = rects[i];
         let focused = focus.focus == i;
         ui.widget_box(rect, focused);
-        let y = rect.y() + (rect.height() as i32 - ui.text.line_height(22) as i32) / 2;
+        let y = ui.centered_text_y(rect, 22);
         ui.text(host.display_name(), rect.x() + 16, y, 22, palette::TEXT);
         let details = format!(
             "{}:{}   {} @ {}fps {}",
@@ -512,10 +518,17 @@ fn draw_host_list(model: &Model, focus: &FocusList, ui: &mut Ui) {
     ui.hint_bar("A/Enter connect   X/E edit   Y/Del delete   B/Esc quit");
 }
 
+/// The free-form text buffers of the host-edit screen.
+struct EditTexts<'a> {
+    port: &'a str,
+    resolution: &'a str,
+    fps: &'a str,
+}
+
 fn draw_host_edit(
     index: Option<usize>,
     draft: &HostEntry,
-    port_text: &str,
+    texts: &EditTexts,
     focus: &FocusList,
     editing: bool,
     ui: &mut Ui,
@@ -536,18 +549,25 @@ fn draw_host_edit(
         f == 1,
         editing && f == 1,
     );
-    ui.text_field(rects[2], "Port", port_text, f == 2, editing && f == 2);
-    ui.choice(
+    ui.text_field(rects[2], "Port", texts.port, f == 2, editing && f == 2);
+    ui.text_field(
         rects[3],
-        "Resolution",
-        &draft.resolution.to_string(),
+        "Resolution (WIDTHxHEIGHT)",
+        texts.resolution,
         f == 3,
+        editing && f == 3,
     );
-    ui.choice(rects[4], "Framerate", &draft.framerate.to_string(), f == 4);
+    ui.text_field(
+        rects[4],
+        "Framerate (fps)",
+        texts.fps,
+        f == 4,
+        editing && f == 4,
+    );
     ui.choice(rects[5], "Codec", &draft.codec.to_string(), f == 5);
     ui.button(rects[6], "Save", f == 6);
     ui.button(rects[7], "Cancel", f == 7);
-    ui.hint_bar("A/Enter edit or apply   ◄ ► change value   B/Esc back");
+    ui.hint_bar("A/Enter edit or apply   ◄ ► change codec   B/Esc back");
 }
 
 fn draw_settings(model: &Model, focus: &FocusList, ui: &mut Ui) {
@@ -625,10 +645,11 @@ pub fn run_launcher(
         builder.fullscreen_desktop();
     }
     let window = builder.build()?;
+    // No SDL logical scaling: layout stays in 1280x800 logical space,
+    // but drawing maps through a ViewTransform and rasterizes text at
+    // the physical pixel size — GPU-upscaling a 1280x800 canvas made
+    // the text visibly blurry on larger displays.
     let mut canvas = window.into_canvas().accelerated().present_vsync().build()?;
-    canvas
-        .set_logical_size(widgets::UI_WIDTH, widgets::UI_HEIGHT)
-        .map_err(|e| anyhow!("SDL logical size: {e}"))?;
     let texture_creator = canvas.texture_creator();
     let mut text = TextRenderer::new()?;
 
@@ -652,6 +673,16 @@ pub fn run_launcher(
     let mut connecting: Option<Connecting> = None;
 
     loop {
+        // Drawing maps logical → drawable pixels; pointer events arrive
+        // in window coordinates, which can differ from the drawable on
+        // hidpi, so they get their own transform.
+        let (out_w, out_h) = canvas
+            .output_size()
+            .unwrap_or((widgets::UI_WIDTH, widgets::UI_HEIGHT));
+        let view = widgets::ViewTransform::for_output(out_w, out_h);
+        let (win_w, win_h) = canvas.window().size();
+        let pointer_view = widgets::ViewTransform::for_output(win_w, win_h);
+
         let mut events: Vec<NavEvent> = Vec::new();
         for event in event_pump.poll_iter() {
             match &event {
@@ -671,7 +702,7 @@ pub fn run_launcher(
                 _ => {}
             }
             if let Some(nav) = mapper.map(&event) {
-                events.push(nav);
+                events.push(to_logical(nav, pointer_view));
             }
         }
         if let Some(nav) = mapper.tick() {
@@ -768,12 +799,29 @@ pub fn run_launcher(
             canvas: &mut canvas,
             textures: &texture_creator,
             text: &mut text,
+            view,
         };
         draw(&model, connecting_label.as_deref(), &mut ui);
 
         // present_vsync paces us; the sleep only matters on drivers
         // that ignore vsync for occluded windows.
         std::thread::sleep(Duration::from_millis(4));
+    }
+}
+
+/// Maps pointer coordinates from window space to logical UI space;
+/// other events pass through untouched.
+fn to_logical(nav: NavEvent, view: widgets::ViewTransform) -> NavEvent {
+    match nav {
+        NavEvent::PointerMove(x, y) => {
+            let (lx, ly) = view.pointer_to_logical(x, y);
+            NavEvent::PointerMove(lx, ly)
+        }
+        NavEvent::PointerClick(x, y) => {
+            let (lx, ly) = view.pointer_to_logical(x, y);
+            NavEvent::PointerClick(lx, ly)
+        }
+        other => other,
     }
 }
 
@@ -925,6 +973,90 @@ mod tests {
             panic!("expected host edit screen");
         };
         assert_eq!(port_text, "91");
+    }
+
+    #[test]
+    fn resolution_and_fps_accept_free_form_text() {
+        let mut model = model_with_hosts(1);
+        model.update(&NavEvent::Edit); // edit host 0
+
+        // Resolution (field 3): replace with a non-preset value.
+        for _ in 0..3 {
+            model.update(&NavEvent::Down);
+        }
+        model.update(&NavEvent::Activate);
+        for _ in 0..10 {
+            model.update(&NavEvent::Backspace);
+        }
+        // 'X' is normalized to 'x', letters are dropped.
+        model.update(&NavEvent::Text("2256X1504abc".to_string()));
+        model.update(&NavEvent::Activate); // leave editing
+
+        // Framerate (field 4): a value no preset list would offer.
+        model.update(&NavEvent::Down);
+        model.update(&NavEvent::Activate);
+        for _ in 0..4 {
+            model.update(&NavEvent::Backspace);
+        }
+        model.update(&NavEvent::Text("144".to_string()));
+        model.update(&NavEvent::Activate);
+
+        // Save (field 6).
+        model.update(&NavEvent::Down);
+        model.update(&NavEvent::Down);
+        assert_eq!(model.update(&NavEvent::Activate), Effect::Save);
+        assert_eq!(
+            model.cfg.hosts[0].resolution,
+            Resolution {
+                width: 2256,
+                height: 1504
+            }
+        );
+        assert_eq!(model.cfg.hosts[0].framerate, 144);
+    }
+
+    #[test]
+    fn invalid_resolution_or_fps_blocks_save() {
+        let mut model = model_with_hosts(1);
+        model.update(&NavEvent::Edit);
+
+        // Corrupt the resolution text.
+        for _ in 0..3 {
+            model.update(&NavEvent::Down);
+        }
+        model.update(&NavEvent::Activate);
+        for _ in 0..10 {
+            model.update(&NavEvent::Backspace);
+        }
+        model.update(&NavEvent::Text("1920x".to_string()));
+        model.update(&NavEvent::Activate);
+
+        // Jump to Save.
+        for _ in 0..3 {
+            model.update(&NavEvent::Down);
+        }
+        assert_eq!(model.update(&NavEvent::Activate), Effect::None);
+        assert!(model.error.is_some());
+        assert!(matches!(model.screen, Screen::HostEdit { .. }));
+
+        // Fix the resolution but break the fps.
+        for _ in 0..3 {
+            model.update(&NavEvent::Up);
+        }
+        model.update(&NavEvent::Activate);
+        model.update(&NavEvent::Text("1080".to_string()));
+        model.update(&NavEvent::Activate);
+        model.update(&NavEvent::Down);
+        model.update(&NavEvent::Activate);
+        for _ in 0..4 {
+            model.update(&NavEvent::Backspace);
+        }
+        model.update(&NavEvent::Text("0".to_string()));
+        model.update(&NavEvent::Activate);
+        model.update(&NavEvent::Down);
+        model.update(&NavEvent::Down);
+        assert_eq!(model.update(&NavEvent::Activate), Effect::None);
+        assert!(model.error.is_some());
     }
 
     #[test]
