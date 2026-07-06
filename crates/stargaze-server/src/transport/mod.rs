@@ -114,9 +114,20 @@ async fn run_server_loop(
     input_tx: mpsc::Sender<InputEvent>,
 ) -> Result<(), TransportError> {
     loop {
-        let Some(incoming) = endpoint.accept().await else {
-            info!("Endpoint closed, transport exiting");
-            return Ok(());
+        // While waiting for a client, keep draining the encoder outputs:
+        // nothing consumes them otherwise, so the audio pipeline would
+        // back up all the way to the PipeWire capture thread, which then
+        // drops frames and logs "Audio encoder behind" forever.
+        let incoming = tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    info!("Endpoint closed, transport exiting");
+                    return Ok(());
+                };
+                incoming
+            }
+            Some(_) = video_packets.recv() => continue,
+            Some(_) = audio_packets.recv() => continue,
         };
 
         let connection = match incoming.await {
