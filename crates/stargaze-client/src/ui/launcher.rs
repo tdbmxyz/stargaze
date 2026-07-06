@@ -632,6 +632,13 @@ pub fn run_launcher(
     last_error: Option<String>,
 ) -> anyhow::Result<LauncherOutcome> {
     let video = sdl.video().map_err(|e| anyhow!("SDL video: {e}"))?;
+    // The driver matters for diagnosing "runs but nothing on screen":
+    // gamescope only displays XWayland clients, so "wayland" here in
+    // gaming mode means an invisible window.
+    info!(
+        driver = video.current_video_driver(),
+        "Launcher video subsystem ready"
+    );
     let controllers = sdl
         .game_controller()
         .map_err(|e| anyhow!("SDL game controller: {e}"))?;
@@ -687,6 +694,9 @@ pub fn run_launcher(
         for event in event_pump.poll_iter() {
             match &event {
                 sdl2::event::Event::Quit { .. } => {
+                    // Also covers SIGTERM (e.g. Steam's "Stop" button):
+                    // SDL converts it into a Quit event.
+                    info!("Launcher: quit (window close or SIGTERM)");
                     save(cfg, &model, config_path);
                     return Ok(LauncherOutcome::Quit);
                 }
@@ -754,6 +764,7 @@ pub fn run_launcher(
                     Effect::None => {}
                     Effect::Save => save(cfg, &model, config_path),
                     Effect::Quit => {
+                        info!("Launcher: quit (user input)");
                         save(cfg, &model, config_path);
                         return Ok(LauncherOutcome::Quit);
                     }

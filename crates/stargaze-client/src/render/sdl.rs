@@ -447,11 +447,12 @@ pub(super) fn run_sdl_loop(
     let video_desc = format!("{}x{}", config.width, config.height);
 
     info!(
-        "Renderer started: {}x{} (fullscreen: {}, gl: {})",
+        "Renderer started: {}x{} (fullscreen: {}, gl: {}, video driver: {})",
         config.width,
         config.height,
         fullscreen,
-        matches!(backend, Backend::Gl(_))
+        matches!(backend, Backend::Gl(_)),
+        video.current_video_driver()
     );
 
     backend.clear_black();
