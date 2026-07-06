@@ -185,6 +185,18 @@
                 pkgs.llvmPackages.libclang
               ];
 
+            # Desktop entry + icons so the client shows up in XDG menus;
+            # the AppImage bundler also picks these up for its root
+            # .desktop/.DirIcon instead of synthesizing a stub.
+            postInstall = ''
+              install -Dm644 $src/assets/stargaze.desktop \
+                $out/share/applications/stargaze.desktop
+              install -Dm644 $src/assets/icons/stargaze.svg \
+                $out/share/icons/hicolor/scalable/apps/stargaze.svg
+              install -Dm644 $src/assets/icons/stargaze-256.png \
+                $out/share/icons/hicolor/256x256/apps/stargaze.png
+            '';
+
             meta = {
               description = "Stargaze streaming client — decode, render, input forwarding";
               mainProgram = "stargaze-client";

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2140"/>
+      <stop offset="1" stop-color="#0d0f1c"/>
+    </linearGradient>
+    <linearGradient id="star" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#9db4ff"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <!-- small background stars -->
+  <circle cx="70" cy="66" r="4" fill="#7896ff" opacity="0.8"/>
+  <circle cx="196" cy="86" r="3" fill="#7896ff" opacity="0.6"/>
+  <circle cx="176" cy="190" r="4" fill="#7896ff" opacity="0.7"/>
+  <circle cx="58" cy="176" r="3" fill="#7896ff" opacity="0.5"/>
+  <!-- main four-point star -->
+  <path d="M128 40 L143 113 L216 128 L143 143 L128 216 L113 143 L40 128 L113 113 Z"
+        fill="url(#star)"/>
+  <!-- orbit swoosh suggesting streaming motion -->
+  <path d="M52 204 C 96 236, 176 228, 210 178"
+        fill="none" stroke="#5f7cff" stroke-width="10" stroke-linecap="round" opacity="0.85"/>
+</svg>
