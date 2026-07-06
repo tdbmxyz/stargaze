@@ -499,10 +499,17 @@ pub(super) fn run_sdl_loop(
                             ShortcutAction::ToggleStats => {
                                 overlay.visible = !overlay.visible;
                             }
-                            ShortcutAction::Refresh => {
-                                info!("Manual refresh: requesting IDR keyframe");
-                                let _ = idr_tx.try_send(());
-                            }
+                            ShortcutAction::Refresh => match idr_tx.try_send(()) {
+                                Ok(()) => {
+                                    info!("Manual refresh: requesting IDR keyframe");
+                                }
+                                // Full: recovery requests are already
+                                // queued, the refresh is effectively
+                                // underway. Closed: transport is gone.
+                                Err(e) => {
+                                    warn!("Manual refresh not sent ({e})");
+                                }
+                            },
                         }
                     } else if captured {
                         tracker.key_down(sc as u32);
