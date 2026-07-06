@@ -65,6 +65,21 @@ struct Cli {
     #[arg(long, verbatim_doc_comment)]
     usb_forward: Option<bool>,
 
+    /// Requested stream resolution, e.g. 1920x1080 [default: 1920x1080].
+    ///
+    /// The server may confirm a different resolution (e.g. its display's
+    /// native size); the confirmed value is what gets decoded and shown.
+    #[arg(long, verbatim_doc_comment)]
+    resolution: Option<stargaze_core::config::Resolution>,
+
+    /// Requested stream framerate [default: 60].
+    #[arg(long)]
+    fps: Option<u32>,
+
+    /// Video codec to request: h265 or av1 [default: h265].
+    #[arg(long)]
+    codec: Option<Codec>,
+
     /// Periodically log pipeline progress (received frame counts).
     ///
     /// Off by default: a healthy session would otherwise log a progress
@@ -138,6 +153,15 @@ fn build_config(cli: &Cli) -> anyhow::Result<ClientConfig> {
     if let Some(usb_forward) = cli.usb_forward {
         cfg.usb_forward = usb_forward;
     }
+    if let Some(resolution) = cli.resolution {
+        cfg.resolution = resolution;
+    }
+    if let Some(fps) = cli.fps {
+        cfg.framerate = fps;
+    }
+    if let Some(codec) = cli.codec {
+        cfg.codec = codec;
+    }
 
     if cfg.server_address.is_empty() {
         bail!("Server address is required — pass --server <address> or set it in a config file");
@@ -165,12 +189,11 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Connect to server.
-    // TODO: derive session parameters from ClientConfig instead of hardcoding.
     let session_request = transport::SessionRequest {
-        width: 1920,
-        height: 1080,
-        framerate: 60,
-        codec: Codec::H265,
+        width: cfg.resolution.width,
+        height: cfg.resolution.height,
+        framerate: cfg.framerate,
+        codec: cfg.codec,
     };
 
     let audio_decoder_config = AudioDecoderConfig {
@@ -204,7 +227,7 @@ async fn main() -> anyhow::Result<()> {
     let decoder_config = DecoderConfig {
         width: session_params.width,
         height: session_params.height,
-        codec: Codec::H265,
+        codec: cfg.codec,
     };
 
     info!(

@@ -68,6 +68,30 @@ pub struct NetStats {
     pub video_dropped: std::sync::atomic::AtomicU64,
 }
 
+/// Resolves the configured server address (IP literal or DNS hostname)
+/// to a socket address, preferring IPv4 (the QUIC endpoint binds an
+/// IPv4 wildcard by default; IPv6 results are used only when nothing
+/// else resolves).
+async fn resolve_server_addr(
+    address: &str,
+    port: u16,
+) -> Result<std::net::SocketAddr, TransportError> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((address, port))
+        .await
+        .map_err(|e| {
+            TransportError::ConnectionError(format!("cannot resolve server address {address}: {e}"))
+        })?
+        .collect();
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first())
+        .copied()
+        .ok_or_else(|| {
+            TransportError::ConnectionError(format!("server address {address} resolved to nothing"))
+        })
+}
+
 /// # Errors
 ///
 /// Returns `TransportError` if connection or handshake fails.
@@ -88,9 +112,7 @@ pub async fn connect(
     ),
     TransportError,
 > {
-    let server_addr: std::net::SocketAddr = format!("{}:{}", config.server_address, config.port)
-        .parse()
-        .map_err(|e| TransportError::ConnectionError(format!("invalid server address: {e}")))?;
+    let server_addr = resolve_server_addr(&config.server_address, config.port).await?;
 
     let connection = quic::connect_to_server(server_addr).await?;
     info!(
