@@ -1,10 +1,12 @@
+use std::path::PathBuf;
+
 use anyhow::{anyhow, bail};
 use clap::Parser;
 use stargaze_core::config::{self, ClientConfig, Codec};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use stargaze_client::{session, transport};
+use stargaze_client::{session, transport, ui};
 
 /// Stargaze streaming client — connects to a server, decodes video/audio, and forwards input.
 // Doc comments here are clap help text rendered verbatim; list items align
@@ -114,8 +116,9 @@ fn init_tracing() {
 /// # Errors
 ///
 /// Returns an error if the config file exists but cannot be read or parsed,
-/// or if the final `server_address` is empty.
-fn build_config(cli: &Cli) -> anyhow::Result<ClientConfig> {
+/// or if `require_server` is set and the final `server_address` is empty
+/// (direct-connect mode; the launcher can start with no hosts at all).
+fn build_config(cli: &Cli, require_server: bool) -> anyhow::Result<ClientConfig> {
     let config_path: Option<String> = if let Some(ref path) = cli.config {
         Some(path.clone())
     } else {
@@ -160,7 +163,7 @@ fn build_config(cli: &Cli) -> anyhow::Result<ClientConfig> {
         cfg.codec = codec;
     }
 
-    if cfg.server_address.is_empty() {
+    if require_server && cfg.server_address.is_empty() {
         bail!("Server address is required — pass --server <address> or set it in a config file");
     }
 
@@ -177,28 +180,58 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let cfg = build_config(&cli)?;
+    let direct = cli.server.is_some();
+    let mut cfg = build_config(&cli, direct)?;
     stargaze_core::logging::set_progress_logging(cli.log_progress);
-
-    info!(
-        "Connecting to {}:{} (fullscreen: {})",
-        cfg.server_address, cfg.port, cfg.fullscreen
-    );
-
-    // Connect to server.
-    let session_request = transport::SessionRequest {
-        width: cfg.resolution.width,
-        height: cfg.resolution.height,
-        framerate: cfg.framerate,
-        codec: cfg.codec,
-    };
-
-    let conn = transport::connect(&cfg, session_request).await?;
 
     // SDL2 must be initialized on the main thread.
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
 
-    session::run_session(&sdl, &cfg, conn, cli.stats_file.clone()).await?;
+    if direct {
+        // --server given: connect straight away, exit when the session
+        // ends (scriptable behavior, same as before the launcher).
+        info!(
+            "Connecting to {}:{} (fullscreen: {})",
+            cfg.server_address, cfg.port, cfg.fullscreen
+        );
+        let session_request = transport::SessionRequest {
+            width: cfg.resolution.width,
+            height: cfg.resolution.height,
+            framerate: cfg.framerate,
+            codec: cfg.codec,
+        };
+        let conn = transport::connect(&cfg, session_request).await?;
+        session::run_session(&sdl, &cfg, conn, cli.stats_file.clone()).await?;
+        info!("Client shut down");
+        return Ok(());
+    }
+
+    // Launcher mode: menu → session → back to the menu, until quit.
+    let config_path = cli
+        .config
+        .as_ref()
+        .map_or_else(|| config::config_file_path("client"), PathBuf::from);
+    let rt = tokio::runtime::Handle::current();
+    let mut last_error: Option<String> = None;
+    loop {
+        let outcome = tokio::task::block_in_place(|| {
+            ui::launcher::run_launcher(&sdl, &rt, &mut cfg, &config_path, last_error.take())
+        })?;
+        match outcome {
+            ui::launcher::LauncherOutcome::Quit => break,
+            ui::launcher::LauncherOutcome::Connect {
+                cfg: session_cfg,
+                conn,
+            } => {
+                if let Err(e) =
+                    session::run_session(&sdl, &session_cfg, *conn, cli.stats_file.clone()).await
+                {
+                    warn!("Session ended with error: {e:#}");
+                    last_error = Some(format!("{e:#}"));
+                }
+            }
+        }
+    }
 
     info!("Client shut down");
 

@@ -8,6 +8,7 @@
 //! events) handled through the same [`widgets::NavEvent`] vocabulary.
 
 pub mod font;
+pub mod launcher;
 pub mod widgets;
 
 use std::time::{Duration, Instant};
@@ -84,6 +85,7 @@ impl InputMapper {
                 Keycode::Return | Keycode::KpEnter => Some(NavEvent::Activate),
                 Keycode::Escape => Some(NavEvent::Back),
                 Keycode::Delete => Some(NavEvent::Delete),
+                Keycode::E => Some(NavEvent::Edit),
                 Keycode::Backspace => Some(NavEvent::Backspace),
                 _ => None,
             },
@@ -96,6 +98,7 @@ impl InputMapper {
                 Button::A => Some(NavEvent::Activate),
                 Button::B => Some(NavEvent::Back),
                 Button::Y => Some(NavEvent::Delete),
+                Button::X => Some(NavEvent::Edit),
                 Button::Start => Some(NavEvent::ConnectShortcut),
                 _ => None,
             },

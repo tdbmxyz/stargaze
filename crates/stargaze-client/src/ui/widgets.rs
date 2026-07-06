@@ -60,6 +60,8 @@ pub enum NavEvent {
     Back,
     /// Delete the focused item (Y / Delete).
     Delete,
+    /// Edit the focused item (X / E).
+    Edit,
     /// Connect to the focused or default host (Start).
     ConnectShortcut,
     /// Text input (physical keyboard or the platform's on-screen one).
