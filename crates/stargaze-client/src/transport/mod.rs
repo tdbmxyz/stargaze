@@ -68,29 +68,70 @@ pub struct NetStats {
     pub video_dropped: std::sync::atomic::AtomicU64,
 }
 
+/// Resolves the configured server address (IP literal or DNS hostname)
+/// to a socket address, preferring IPv4 (the QUIC endpoint binds an
+/// IPv4 wildcard by default; IPv6 results are used only when nothing
+/// else resolves).
+async fn resolve_server_addr(
+    address: &str,
+    port: u16,
+) -> Result<std::net::SocketAddr, TransportError> {
+    // IP literals (including bracketed IPv6, as the pre-DNS config
+    // format required) skip the resolver entirely.
+    let bare = address
+        .strip_prefix('[')
+        .and_then(|a| a.strip_suffix(']'))
+        .unwrap_or(address);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, port));
+    }
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((address, port))
+        .await
+        .map_err(|e| {
+            TransportError::ConnectionError(format!("cannot resolve server address {address}: {e}"))
+        })?
+        .collect();
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first())
+        .copied()
+        .ok_or_else(|| {
+            TransportError::ConnectionError(format!("server address {address} resolved to nothing"))
+        })
+}
+
+/// An established session connection: everything the client needs to
+/// run decoders, forward input, and render until the session ends.
+pub struct ConnectedSession {
+    /// Handle to abort the transport receive task.
+    pub transport: ClientTransport,
+    /// Server-confirmed session parameters.
+    pub session_params: SessionParams,
+    /// Reassembled video frames.
+    pub video_frames: mpsc::Receiver<ReassembledFrame>,
+    /// Reassembled audio frames.
+    pub audio_frames: mpsc::Receiver<ReassembledFrame>,
+    /// Input events to forward to the server.
+    pub input_tx: mpsc::Sender<InputEvent>,
+    /// Keyframe requests from the decoder.
+    pub idr_tx: mpsc::Sender<()>,
+    /// RTT query handle for the stats overlay.
+    pub rtt_probe: RttProbe,
+    /// Network counters for the stats overlay.
+    pub net_stats: std::sync::Arc<NetStats>,
+    /// Connection handle for opening USB tunnel streams.
+    pub usb_connection: quinn::Connection,
+}
+
 /// # Errors
 ///
 /// Returns `TransportError` if connection or handshake fails.
 pub async fn connect(
     config: &ClientConfig,
     session_request: SessionRequest,
-) -> Result<
-    (
-        ClientTransport,
-        SessionParams,
-        mpsc::Receiver<ReassembledFrame>,
-        mpsc::Receiver<ReassembledFrame>,
-        mpsc::Sender<InputEvent>,
-        mpsc::Sender<()>,
-        RttProbe,
-        std::sync::Arc<NetStats>,
-        quinn::Connection,
-    ),
-    TransportError,
-> {
-    let server_addr: std::net::SocketAddr = format!("{}:{}", config.server_address, config.port)
-        .parse()
-        .map_err(|e| TransportError::ConnectionError(format!("invalid server address: {e}")))?;
+) -> Result<ConnectedSession, TransportError> {
+    let server_addr = resolve_server_addr(&config.server_address, config.port).await?;
 
     let connection = quic::connect_to_server(server_addr).await?;
     info!(
@@ -146,15 +187,35 @@ pub async fn connect(
         }
     });
 
-    Ok((
-        ClientTransport { task_handle },
-        session_response,
-        video_rx,
-        audio_rx,
+    Ok(ConnectedSession {
+        transport: ClientTransport { task_handle },
+        session_params: session_response,
+        video_frames: video_rx,
+        audio_frames: audio_rx,
         input_tx,
         idr_tx,
         rtt_probe,
         net_stats,
         usb_connection,
-    ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_server_addr;
+
+    #[tokio::test]
+    async fn resolves_ip_literals_without_dns() {
+        let v4 = resolve_server_addr("192.168.1.10", 9000).await.unwrap();
+        assert_eq!(v4.to_string(), "192.168.1.10:9000");
+
+        // Bracketed IPv6, as the pre-DNS "addr:port".parse() format required.
+        let v6 = resolve_server_addr("[::1]", 9000).await.unwrap();
+        assert!(v6.is_ipv6());
+        assert_eq!(v6.port(), 9000);
+
+        // Bare IPv6 literals work too.
+        let v6 = resolve_server_addr("fd00::1", 9000).await.unwrap();
+        assert!(v6.is_ipv6());
+    }
 }

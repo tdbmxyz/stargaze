@@ -215,6 +215,52 @@ impl Default for ServerConfig {
     }
 }
 
+// --- HostEntry ---
+
+/// One saved server in the client's host list, with its session quality
+/// settings. Shown and edited in the client's launcher UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostEntry {
+    /// Display label for the launcher (falls back to the address if empty).
+    pub name: String,
+    /// Server IP address or DNS hostname.
+    pub address: String,
+    /// Server port.
+    pub port: u16,
+    /// Requested stream resolution.
+    pub resolution: Resolution,
+    /// Requested framerate.
+    pub framerate: u32,
+    /// Requested video codec.
+    pub codec: Codec,
+}
+
+impl Default for HostEntry {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            address: String::new(),
+            port: DEFAULT_PORT,
+            resolution: Resolution::default(),
+            framerate: 60,
+            codec: Codec::default(),
+        }
+    }
+}
+
+impl HostEntry {
+    /// The label the launcher shows for this host.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.address
+        } else {
+            &self.name
+        }
+    }
+}
+
 // --- ClientConfig ---
 
 /// Configuration for the stargaze client.
@@ -240,6 +286,15 @@ pub struct ClientConfig {
     pub usb_forward: bool,
     /// Mic forwarding configuration.
     pub mic_forward: MicForwardConfig,
+    /// Requested stream resolution (direct-connect / legacy path; hosts
+    /// saved in the launcher carry their own).
+    pub resolution: Resolution,
+    /// Requested framerate (direct-connect / legacy path).
+    pub framerate: u32,
+    /// Requested video codec (direct-connect / legacy path).
+    pub codec: Codec,
+    /// Saved hosts for the launcher UI (`[[hosts]]` tables).
+    pub hosts: Vec<HostEntry>,
 }
 
 impl Default for ClientConfig {
@@ -251,8 +306,34 @@ impl Default for ClientConfig {
             gamepad_passthrough: true,
             usb_forward: true,
             mic_forward: MicForwardConfig::default(),
+            resolution: Resolution::default(),
+            framerate: 60,
+            codec: Codec::default(),
+            hosts: Vec::new(),
         }
     }
+}
+
+/// The hosts the launcher should show: the saved `[[hosts]]` list, or a
+/// single entry synthesized from the legacy `server_address`/`port`
+/// fields when the list is empty. The synthesized entry becomes a real
+/// saved host the first time the launcher writes the config.
+#[must_use]
+pub fn effective_hosts(cfg: &ClientConfig) -> Vec<HostEntry> {
+    if !cfg.hosts.is_empty() {
+        return cfg.hosts.clone();
+    }
+    if cfg.server_address.is_empty() {
+        return Vec::new();
+    }
+    vec![HostEntry {
+        name: cfg.server_address.clone(),
+        address: cfg.server_address.clone(),
+        port: cfg.port,
+        resolution: cfg.resolution,
+        framerate: cfg.framerate,
+        codec: cfg.codec,
+    }]
 }
 
 // --- Helper functions ---
@@ -306,6 +387,29 @@ where
         path: path_str,
         reason: e.to_string(),
     })
+}
+
+/// Saves a configuration to a TOML file, creating parent directories as
+/// needed. The file is written to a temporary sibling and renamed into
+/// place so a crash mid-write cannot truncate an existing config.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::WriteError`] if serialization or any
+/// filesystem step fails.
+pub fn save_config<T: Serialize>(path: &std::path::Path, config: &T) -> Result<(), ConfigError> {
+    let write_error = |reason: String| ConfigError::WriteError {
+        path: path.display().to_string(),
+        reason,
+    };
+
+    let contents = toml::to_string_pretty(config).map_err(|e| write_error(e.to_string()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| write_error(e.to_string()))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, contents).map_err(|e| write_error(e.to_string()))?;
+    std::fs::rename(&tmp, path).map_err(|e| write_error(e.to_string()))
 }
 
 /// Returns this process's command line with network-identifying arguments
@@ -594,6 +698,119 @@ mod tests {
         "#;
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert!(config.cursor.show_cursor);
+    }
+
+    #[test]
+    fn host_entry_toml_round_trip() {
+        let config = ClientConfig {
+            hosts: vec![
+                HostEntry {
+                    name: "zeus".to_string(),
+                    address: "100.64.0.3".to_string(),
+                    port: 9000,
+                    resolution: Resolution {
+                        width: 2560,
+                        height: 1440,
+                    },
+                    framerate: 90,
+                    codec: Codec::Av1,
+                },
+                HostEntry {
+                    name: String::new(),
+                    address: "hestia.lan".to_string(),
+                    ..HostEntry::default()
+                },
+            ],
+            ..ClientConfig::default()
+        };
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: ClientConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn host_entry_defaults_when_fields_absent() {
+        let toml_str = r#"
+            [[hosts]]
+            address = "10.0.0.5"
+        "#;
+        let config: ClientConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.hosts.len(), 1);
+        let host = &config.hosts[0];
+        assert_eq!(host.address, "10.0.0.5");
+        assert_eq!(host.port, DEFAULT_PORT);
+        assert_eq!(host.resolution, Resolution::default());
+        assert_eq!(host.framerate, 60);
+        assert_eq!(host.codec, Codec::H265);
+        assert_eq!(host.display_name(), "10.0.0.5");
+    }
+
+    #[test]
+    fn client_config_quality_defaults() {
+        let config = ClientConfig::default();
+        assert_eq!(config.resolution, Resolution::default());
+        assert_eq!(config.framerate, 60);
+        assert_eq!(config.codec, Codec::H265);
+        assert!(config.hosts.is_empty());
+    }
+
+    #[test]
+    fn effective_hosts_prefers_saved_list() {
+        let config = ClientConfig {
+            server_address: "legacy".to_string(),
+            hosts: vec![HostEntry {
+                address: "10.0.0.5".to_string(),
+                ..HostEntry::default()
+            }],
+            ..ClientConfig::default()
+        };
+        let hosts = effective_hosts(&config);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].address, "10.0.0.5");
+    }
+
+    #[test]
+    fn effective_hosts_synthesizes_from_legacy_fields() {
+        let config = ClientConfig {
+            server_address: "192.168.1.10".to_string(),
+            port: 7000,
+            framerate: 120,
+            ..ClientConfig::default()
+        };
+        let hosts = effective_hosts(&config);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].address, "192.168.1.10");
+        assert_eq!(hosts[0].port, 7000);
+        assert_eq!(hosts[0].framerate, 120);
+        assert_eq!(hosts[0].display_name(), "192.168.1.10");
+    }
+
+    #[test]
+    fn effective_hosts_empty_config() {
+        assert!(effective_hosts(&ClientConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn save_config_round_trips_and_creates_dirs() {
+        let dir =
+            std::env::temp_dir().join(format!("stargaze-save-config-test-{}", std::process::id()));
+        let path = dir.join("nested").join("client.toml");
+        let config = ClientConfig {
+            hosts: vec![HostEntry {
+                name: "zeus".to_string(),
+                address: "zeus.lan".to_string(),
+                ..HostEntry::default()
+            }],
+            ..ClientConfig::default()
+        };
+        save_config(&path, &config).unwrap();
+        let loaded: ClientConfig = load_config(Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(loaded, config);
+        // Overwrite goes through the temp-and-rename path.
+        save_config(&path, &ClientConfig::default()).unwrap();
+        let loaded: ClientConfig = load_config(Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(loaded, ClientConfig::default());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

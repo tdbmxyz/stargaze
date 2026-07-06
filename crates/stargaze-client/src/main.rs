@@ -1,13 +1,12 @@
+use std::path::PathBuf;
+
 use anyhow::{anyhow, bail};
 use clap::Parser;
-use stargaze_core::audio::AudioDecoderConfig;
 use stargaze_core::config::{self, ClientConfig, Codec};
-use stargaze_core::decode::DecoderConfig;
-use stargaze_core::mic_forward;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use stargaze_client::{decode, gamepad, render, transport, usb};
+use stargaze_client::{session, transport, ui};
 
 /// Stargaze streaming client — connects to a server, decodes video/audio, and forwards input.
 // Doc comments here are clap help text rendered verbatim; list items align
@@ -65,6 +64,21 @@ struct Cli {
     #[arg(long, verbatim_doc_comment)]
     usb_forward: Option<bool>,
 
+    /// Requested stream resolution, e.g. 1920x1080 [default: 1920x1080].
+    ///
+    /// The server may confirm a different resolution (e.g. its display's
+    /// native size); the confirmed value is what gets decoded and shown.
+    #[arg(long, verbatim_doc_comment)]
+    resolution: Option<stargaze_core::config::Resolution>,
+
+    /// Requested stream framerate [default: 60].
+    #[arg(long)]
+    fps: Option<u32>,
+
+    /// Video codec to request: h265 or av1 [default: h265].
+    #[arg(long)]
+    codec: Option<Codec>,
+
     /// Periodically log pipeline progress (received frame counts).
     ///
     /// Off by default: a healthy session would otherwise log a progress
@@ -72,6 +86,12 @@ struct Cli {
     /// frame, keyframes, decoder events) are always emitted at info level.
     #[arg(long)]
     log_progress: bool,
+
+    /// Force the launcher UI even when the config file's legacy
+    /// server_address would auto-connect (e.g. to migrate that config
+    /// into the host list).
+    #[arg(long)]
+    gui: bool,
 
     /// Path to config file (default: ~/.config/stargaze/client.toml).
     #[arg(long)]
@@ -101,9 +121,8 @@ fn init_tracing() {
 ///
 /// # Errors
 ///
-/// Returns an error if the config file exists but cannot be read or parsed,
-/// or if the final `server_address` is empty.
-fn build_config(cli: &Cli) -> anyhow::Result<ClientConfig> {
+/// Returns an error if the config file exists but cannot be read or parsed.
+fn load_file_config(cli: &Cli) -> anyhow::Result<ClientConfig> {
     let config_path: Option<String> = if let Some(ref path) = cli.config {
         Some(path.clone())
     } else {
@@ -114,9 +133,13 @@ fn build_config(cli: &Cli) -> anyhow::Result<ClientConfig> {
             None
         }
     };
+    Ok(config::load_config(config_path.as_deref())?)
+}
 
-    let mut cfg: ClientConfig = config::load_config(config_path.as_deref())?;
-
+/// Applies one-shot CLI overrides on top of the file config. Only used
+/// in direct-connect mode: the launcher persists its config on every
+/// change, and a transient flag must never be baked into the file.
+fn apply_cli_overrides(cfg: &mut ClientConfig, cli: &Cli) {
     if let Some(ref server) = cli.server {
         cfg.server_address.clone_from(server);
     }
@@ -138,12 +161,29 @@ fn build_config(cli: &Cli) -> anyhow::Result<ClientConfig> {
     if let Some(usb_forward) = cli.usb_forward {
         cfg.usb_forward = usb_forward;
     }
-
-    if cfg.server_address.is_empty() {
-        bail!("Server address is required — pass --server <address> or set it in a config file");
+    if let Some(resolution) = cli.resolution {
+        cfg.resolution = resolution;
     }
+    if let Some(fps) = cli.fps {
+        cfg.framerate = fps;
+    }
+    if let Some(codec) = cli.codec {
+        cfg.codec = codec;
+    }
+}
 
-    Ok(cfg)
+/// True when any per-session override flag was passed — flags the
+/// launcher ignores (it manages these settings itself).
+fn has_session_overrides(cli: &Cli) -> bool {
+    cli.port.is_some()
+        || cli.fullscreen.is_some()
+        || cli.mic_forward
+        || cli.mic_forward_port.is_some()
+        || cli.gamepad_passthrough.is_some()
+        || cli.usb_forward.is_some()
+        || cli.resolution.is_some()
+        || cli.fps.is_some()
+        || cli.codec.is_some()
 }
 
 #[tokio::main]
@@ -156,154 +196,78 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let cfg = build_config(&cli)?;
+    let mut cfg = load_file_config(&cli)?;
     stargaze_core::logging::set_progress_logging(cli.log_progress);
 
-    info!(
-        "Connecting to {}:{} (fullscreen: {})",
-        cfg.server_address, cfg.port, cfg.fullscreen
-    );
-
-    // Connect to server.
-    // TODO: derive session parameters from ClientConfig instead of hardcoding.
-    let session_request = transport::SessionRequest {
-        width: 1920,
-        height: 1080,
-        framerate: 60,
-        codec: Codec::H265,
-    };
-
-    let audio_decoder_config = AudioDecoderConfig {
-        sample_rate: 48_000,
-        channels: 2,
-    };
-
-    let (
-        client_transport,
-        session_params,
-        video_frames,
-        audio_frames,
-        transport_input_tx,
-        decoder_idr_tx,
-        rtt_probe,
-        net_stats,
-        usb_connection,
-    ) = transport::connect(&cfg, session_request).await?;
-
-    // USB forwarding: tunnel Valve controller hardware to the server
-    // over the session connection (Steam needs the real USB device).
-    if cfg.usb_forward {
-        usb::start(usb_connection);
-    } else {
-        drop(usb_connection);
-    }
-
-    // Use the server-confirmed resolution for decoding and rendering.
-    // The server may advertise a different resolution than what the client
-    // requested (e.g. 3440x1440 on an ultrawide display).
-    let decoder_config = DecoderConfig {
-        width: session_params.width,
-        height: session_params.height,
-        codec: Codec::H265,
-    };
-
-    info!(
-        "Connected, session: {}x{} @ {}fps, {} Mbps",
-        session_params.width,
-        session_params.height,
-        session_params.framerate,
-        session_params.bitrate_mbps
-    );
-
-    // Optionally start rsonance transmitter for mic forwarding.
-    let mut rsonance_child = if cfg.mic_forward.enabled {
-        match mic_forward::spawn_rsonance_transmitter(&cfg.mic_forward, &cfg.server_address) {
-            Ok(child) => {
-                info!("Mic forwarding enabled (rsonance transmitter)");
-                Some(child)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to start rsonance transmitter: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Direct-connect (scriptable, exits when the session ends) when
+    // --server is passed, or for a pre-launcher config that sets the
+    // legacy server_address and has never saved a host list — those
+    // setups auto-connected before the launcher existed and must keep
+    // doing so. --gui forces the launcher regardless.
+    let direct = cli.server.is_some()
+        || (!cli.gui && !cfg.server_address.is_empty() && cfg.hosts.is_empty());
 
     // SDL2 must be initialized on the main thread.
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
 
-    // Bridge: SDL event loop (std::sync::mpsc) → tokio channel → transport.
-    // A plain detached OS thread, not spawn_blocking: it blocks in recv()
-    // with senders held by long-lived gamepad scanner/reader threads, so
-    // it only wakes on the next input event — a tokio blocking task would
-    // stall runtime shutdown until then (client hung on quit).
-    let (sdl_input_tx, sdl_input_rx) =
-        std::sync::mpsc::channel::<stargaze_core::input::InputEvent>();
-    if let Err(e) = std::thread::Builder::new()
-        .name("stargaze-input-bridge".into())
-        .spawn(move || {
-            while let Ok(event) = sdl_input_rx.recv() {
-                if transport_input_tx.blocking_send(event).is_err() {
-                    break;
+    if direct {
+        apply_cli_overrides(&mut cfg, &cli);
+        if cfg.server_address.is_empty() {
+            bail!(
+                "Server address is required — pass --server <address> or set it in a config file"
+            );
+        }
+        info!(
+            "Connecting to {}:{} (fullscreen: {})",
+            cfg.server_address, cfg.port, cfg.fullscreen
+        );
+        let session_request = transport::SessionRequest {
+            width: cfg.resolution.width,
+            height: cfg.resolution.height,
+            framerate: cfg.framerate,
+            codec: cfg.codec,
+        };
+        let conn = transport::connect(&cfg, session_request).await?;
+        session::run_session(&sdl, &cfg, conn, cli.stats_file.clone()).await?;
+        info!("Client shut down");
+        return Ok(());
+    }
+
+    // Launcher mode: menu → session → back to the menu, until quit.
+    // One-shot CLI overrides are NOT applied here: the launcher saves
+    // its config on every change, and a transient flag like --fps 30
+    // must not be silently persisted into client.toml.
+    if has_session_overrides(&cli) {
+        warn!(
+            "Per-session flags (--fps/--resolution/--codec/toggles) are ignored in launcher \
+             mode; use the launcher's settings, or --server for a direct connection"
+        );
+    }
+    let config_path = cli
+        .config
+        .as_ref()
+        .map_or_else(|| config::config_file_path("client"), PathBuf::from);
+    let rt = tokio::runtime::Handle::current();
+    let mut last_error: Option<String> = None;
+    loop {
+        let outcome = tokio::task::block_in_place(|| {
+            ui::launcher::run_launcher(&sdl, &rt, &mut cfg, &config_path, last_error.take())
+        })?;
+        match outcome {
+            ui::launcher::LauncherOutcome::Quit => break,
+            ui::launcher::LauncherOutcome::Connect {
+                cfg: session_cfg,
+                conn,
+            } => {
+                if let Err(e) =
+                    session::run_session(&sdl, &session_cfg, *conn, cli.stats_file.clone()).await
+                {
+                    warn!("Session ended with error: {e:#}");
+                    last_error = Some(format!("{e:#}"));
                 }
             }
-        })
-    {
-        bail!("Failed to spawn input bridge thread: {e}");
+        }
     }
-
-    // Gamepads: evdev pass-through (server clones the real device) with
-    // automatic per-device fallback to SDL → Xbox 360 emulation. Started
-    // before the SDL loop so devices present at startup are grabbed
-    // before SDL delivers their hotplug events.
-    let gamepads = gamepad::SharedGamepads::new();
-    if cfg.gamepad_passthrough {
-        gamepad::start_passthrough(gamepads.clone(), sdl_input_tx.clone());
-    } else {
-        info!("Gamepad pass-through disabled; using Xbox 360 emulation");
-    }
-
-    // Start the audio decoder thread — sends decoded PCM to a channel.
-    let (audio_decoder_session, audio_pcm_rx) =
-        decode::start_audio_decoder(audio_decoder_config, audio_frames)?;
-
-    // Start the video decoder thread.
-    let (video_decoder_session, decoded_rx, zero_copy) =
-        decode::start_decoder(decoder_config.clone(), video_frames, decoder_idr_tx)?;
-
-    let session_commands = render::SessionCommands {
-        server: session_params.server_command.clone(),
-        client: config::sanitized_command_line(),
-    };
-
-    // SDL2 event loop must run on the main OS thread.
-    // Audio PCM is queued to the SDL2 AudioQueue inside the event loop.
-    tokio::task::block_in_place(|| {
-        render::start_renderer(
-            &sdl,
-            &decoder_config,
-            decoded_rx,
-            audio_pcm_rx,
-            cfg.fullscreen,
-            sdl_input_tx,
-            rtt_probe,
-            net_stats,
-            cli.stats_file.clone(),
-            &session_commands,
-            &zero_copy,
-            &gamepads,
-        )
-    })?;
-
-    info!("Renderer closed, shutting down");
-    if let Some(ref mut child) = rsonance_child {
-        mic_forward::stop_rsonance(child).await;
-    }
-    video_decoder_session.stop().ok();
-    audio_decoder_session.stop().ok();
-    client_transport.abort();
 
     info!("Client shut down");
 

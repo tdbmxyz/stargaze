@@ -88,8 +88,14 @@ pub(crate) async fn connect_to_server(
     transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER_SIZE);
     client_config.transport_config(Arc::new(transport));
 
+    // Bind the same address family the server resolved to.
+    let bind_addr = if server_addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let mut endpoint =
-        quinn::Endpoint::client("0.0.0.0:0".parse().expect("valid addr")).map_err(|e| {
+        quinn::Endpoint::client(bind_addr.parse().expect("valid addr")).map_err(|e| {
             TransportError::ConnectionError(format!("failed to create client endpoint: {e}"))
         })?;
     endpoint.set_default_client_config(client_config);

@@ -28,6 +28,9 @@ pub struct SessionParams {
     pub framerate: u32,
     /// Bitrate in Mbps.
     pub bitrate_mbps: u32,
+    /// Confirmed video codec — what the server actually encodes with
+    /// (it may ignore the requested codec); the decoder must use this.
+    pub codec: stargaze_core::config::Codec,
     /// Maximum datagram payload size for the connection.
     pub max_datagram_size: u16,
     /// Server command line, sanitized of addresses and ports.
@@ -87,7 +90,7 @@ pub(crate) async fn perform_handshake(
             height,
             framerate,
             bitrate_mbps,
-            codec: _,
+            codec,
             max_datagram_size,
             cursor_embedded: _,
             server_command,
@@ -96,6 +99,7 @@ pub(crate) async fn perform_handshake(
             height,
             framerate,
             bitrate_mbps,
+            codec,
             max_datagram_size,
             server_command,
         }),

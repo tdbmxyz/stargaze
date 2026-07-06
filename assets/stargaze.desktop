@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Stargaze
+Comment=Low-latency game streaming client
+Exec=stargaze-client
+Icon=stargaze
+Terminal=false
+Categories=Game;Network;RemoteAccess;
+Keywords=streaming;remote;gaming;moonlight;sunshine;
