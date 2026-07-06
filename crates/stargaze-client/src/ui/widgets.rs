@@ -4,6 +4,11 @@
 //! every frame from its own state, and layout functions return the
 //! widget rectangles so pointer hit-testing and unit tests share the
 //! same geometry.
+//!
+//! Layout happens in a logical 1280x800 space (the Steam Deck panel);
+//! drawing maps it to the real window through a [`ViewTransform`] and
+//! rasterizes text at the physical pixel size, so glyphs stay crisp on
+//! any display instead of being GPU-upscaled from a 1280x800 canvas.
 
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
@@ -12,8 +17,7 @@ use sdl2::video::{Window, WindowContext};
 
 use super::font::TextRenderer;
 
-/// Logical UI resolution; SDL scales it to the actual window (matches
-/// the Steam Deck panel, and scales cleanly elsewhere).
+/// Logical UI width all layout code targets.
 pub const UI_WIDTH: u32 = 1280;
 /// Logical UI height.
 pub const UI_HEIGHT: u32 = 800;
@@ -43,7 +47,8 @@ pub mod palette {
 }
 
 /// A device-independent navigation event, mapped from SDL keyboard,
-/// game controller, and pointer events.
+/// game controller, and pointer events. Pointer coordinates are in
+/// logical space (already mapped through the [`ViewTransform`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum NavEvent {
     /// Move focus up.
@@ -72,6 +77,73 @@ pub enum NavEvent {
     PointerMove(i32, i32),
     /// Pointer pressed at logical coordinates (click activates).
     PointerClick(i32, i32),
+}
+
+/// Maps the logical 1280x800 layout space onto the real drawable:
+/// uniform scale, letterboxed centering.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewTransform {
+    /// Logical → physical scale factor.
+    pub scale: f32,
+    /// Horizontal letterbox offset in physical pixels.
+    pub offset_x: i32,
+    /// Vertical letterbox offset in physical pixels.
+    pub offset_y: i32,
+}
+
+impl ViewTransform {
+    /// Transform for a drawable of `width` x `height` physical pixels.
+    #[must_use]
+    pub fn for_output(width: u32, height: u32) -> Self {
+        let scale = (width as f32 / UI_WIDTH as f32)
+            .min(height as f32 / UI_HEIGHT as f32)
+            .max(0.1);
+        let offset_x = ((width as f32 - UI_WIDTH as f32 * scale) / 2.0) as i32;
+        let offset_y = ((height as f32 - UI_HEIGHT as f32 * scale) / 2.0) as i32;
+        Self {
+            scale,
+            offset_x,
+            offset_y,
+        }
+    }
+
+    /// Logical rect → physical rect.
+    #[must_use]
+    pub fn rect(&self, r: Rect) -> Rect {
+        Rect::new(
+            self.x(r.x()),
+            self.y(r.y()),
+            ((r.width() as f32) * self.scale).round() as u32,
+            ((r.height() as f32) * self.scale).round() as u32,
+        )
+    }
+
+    /// Logical x → physical x.
+    #[must_use]
+    pub fn x(&self, x: i32) -> i32 {
+        (x as f32 * self.scale).round() as i32 + self.offset_x
+    }
+
+    /// Logical y → physical y.
+    #[must_use]
+    pub fn y(&self, y: i32) -> i32 {
+        (y as f32 * self.scale).round() as i32 + self.offset_y
+    }
+
+    /// Logical font size → physical font size (what fontdue rasterizes).
+    #[must_use]
+    pub fn px(&self, px: u16) -> u16 {
+        ((f32::from(px) * self.scale).round() as u16).max(6)
+    }
+
+    /// Physical pointer coordinates → logical, for hit-testing.
+    #[must_use]
+    pub fn pointer_to_logical(&self, x: i32, y: i32) -> (i32, i32) {
+        (
+            ((x - self.offset_x) as f32 / self.scale).round() as i32,
+            ((y - self.offset_y) as f32 / self.scale).round() as i32,
+        )
+    }
 }
 
 /// Focus position within a screen's widget list.
@@ -150,7 +222,8 @@ pub fn layout_rows(count: usize, top: i32, height: u32, gap: u32, margin: i32) -
         .collect()
 }
 
-/// Shared context for widget drawing.
+/// Shared context for widget drawing. All coordinates passed to its
+/// methods are logical; the transform maps them to the drawable.
 pub struct Ui<'a> {
     /// Canvas to draw on.
     pub canvas: &'a mut Canvas<Window>,
@@ -158,46 +231,80 @@ pub struct Ui<'a> {
     pub textures: &'a TextureCreator<WindowContext>,
     /// Glyph cache (must belong to `canvas`, see [`TextRenderer`]).
     pub text: &'a mut TextRenderer,
+    /// Logical → physical mapping for this frame.
+    pub view: ViewTransform,
 }
 
 impl Ui<'_> {
-    /// Draws `text` at (x, y); returns the x-advance.
-    pub fn text(&mut self, s: &str, x: i32, y: i32, px: u16, color: Color) -> i32 {
-        self.text
-            .draw(self.canvas, self.textures, s, x, y, px, color)
+    /// Draws `text` at logical (x, y); rasterized at physical size.
+    pub fn text(&mut self, s: &str, x: i32, y: i32, px: u16, color: Color) {
+        let (px_phys, x_phys, y_phys) = (self.view.px(px), self.view.x(x), self.view.y(y));
+        self.text.draw(
+            self.canvas,
+            self.textures,
+            s,
+            x_phys,
+            y_phys,
+            px_phys,
+            color,
+        );
     }
 
-    /// Draws `text` right-aligned so it ends at `right`.
+    /// Draws `text` right-aligned so it ends at logical `right`.
     pub fn text_right(&mut self, s: &str, right: i32, y: i32, px: u16, color: Color) {
-        let (w, _) = self.text.measure(s, px);
-        self.text(s, right - w as i32, y, px, color);
+        let (px_phys, right_phys, y_phys) = (self.view.px(px), self.view.x(right), self.view.y(y));
+        let (w, _) = self.text.measure(s, px_phys);
+        self.text.draw(
+            self.canvas,
+            self.textures,
+            s,
+            right_phys - w as i32,
+            y_phys,
+            px_phys,
+            color,
+        );
+    }
+
+    /// Vertical origin (logical) that centers one `px`-sized text line
+    /// in `rect`. Kept in logical space so callers stay transform-free.
+    pub fn centered_text_y(&mut self, rect: Rect, px: u16) -> i32 {
+        let line_phys = self.text.line_height(self.view.px(px));
+        let line_logical = (line_phys as f32 / self.view.scale).round() as i32;
+        rect.y() + (rect.height() as i32 - line_logical) / 2
+    }
+
+    /// Fills a logical rect with a color.
+    pub fn fill(&mut self, rect: Rect, color: Color) {
+        self.canvas.set_draw_color(color);
+        let _ = self.canvas.fill_rect(self.view.rect(rect));
     }
 
     /// Fills a widget background, outlined when focused.
     pub fn widget_box(&mut self, rect: Rect, focused: bool) {
+        let phys = self.view.rect(rect);
         self.canvas.set_draw_color(if focused {
             palette::WIDGET_FOCUS
         } else {
             palette::WIDGET
         });
-        let _ = self.canvas.fill_rect(rect);
+        let _ = self.canvas.fill_rect(phys);
         if focused {
             self.canvas.set_draw_color(palette::OUTLINE_FOCUS);
-            let _ = self.canvas.draw_rect(rect);
+            let _ = self.canvas.draw_rect(phys);
         }
     }
 
     /// A full-width button row with a left-aligned label.
     pub fn button(&mut self, rect: Rect, label: &str, focused: bool) {
         self.widget_box(rect, focused);
-        let y = rect.y() + (rect.height() as i32 - self.text.line_height(22) as i32) / 2;
+        let y = self.centered_text_y(rect, 22);
         self.text(label, rect.x() + 16, y, 22, palette::TEXT);
     }
 
     /// A labeled on/off toggle row.
     pub fn toggle(&mut self, rect: Rect, label: &str, value: bool, focused: bool) {
         self.widget_box(rect, focused);
-        let y = rect.y() + (rect.height() as i32 - self.text.line_height(22) as i32) / 2;
+        let y = self.centered_text_y(rect, 22);
         self.text(label, rect.x() + 16, y, 22, palette::TEXT);
         let (state, color) = if value {
             ("on", palette::ACCENT)
@@ -210,7 +317,7 @@ impl Ui<'_> {
     /// A labeled left/right choice spinner row (`< value >`).
     pub fn choice(&mut self, rect: Rect, label: &str, value: &str, focused: bool) {
         self.widget_box(rect, focused);
-        let y = rect.y() + (rect.height() as i32 - self.text.line_height(22) as i32) / 2;
+        let y = self.centered_text_y(rect, 22);
         self.text(label, rect.x() + 16, y, 22, palette::TEXT);
         let arrows = if focused {
             palette::OUTLINE_FOCUS
@@ -219,9 +326,10 @@ impl Ui<'_> {
         };
         let right = rect.x() + rect.width() as i32 - 16;
         self.text_right(">", right, y, 22, arrows);
-        let (value_width, _) = self.text.measure(value, 22);
+        let value_width_phys = self.text.measure(value, self.view.px(22)).0;
+        let value_width = (value_width_phys as f32 / self.view.scale).round() as i32;
         self.text_right(value, right - 24, y, 22, palette::TEXT);
-        self.text_right("<", right - 32 - value_width as i32, y, 22, arrows);
+        self.text_right("<", right - 32 - value_width, y, 22, arrows);
     }
 
     /// A labeled text field row with a cursor when editing.
@@ -234,7 +342,7 @@ impl Ui<'_> {
         editing: bool,
     ) {
         self.widget_box(rect, focused);
-        let y = rect.y() + (rect.height() as i32 - self.text.line_height(22) as i32) / 2;
+        let y = self.centered_text_y(rect, 22);
         self.text(label, rect.x() + 16, y, 22, palette::TEXT);
         let shown = if editing {
             format!("{value}_")
@@ -251,12 +359,15 @@ impl Ui<'_> {
         self.text_right(&shown, rect.x() + rect.width() as i32 - 16, y, 22, color);
     }
 
+    /// A banner across the top of the screen.
+    pub fn banner(&mut self, message: &str, background: Color, foreground: Color) {
+        self.fill(Rect::new(0, 0, UI_WIDTH, 44), background);
+        self.text(message, 16, 10, 18, foreground);
+    }
+
     /// A dismissible error banner across the top of the screen.
     pub fn error_banner(&mut self, message: &str) {
-        let rect = Rect::new(0, 0, UI_WIDTH, 44);
-        self.canvas.set_draw_color(palette::ERROR_BG);
-        let _ = self.canvas.fill_rect(rect);
-        self.text(message, 16, 10, 18, palette::ERROR_TEXT);
+        self.banner(message, palette::ERROR_BG, palette::ERROR_TEXT);
     }
 
     /// A dim hint line (button legend) at the bottom of the screen.
@@ -320,5 +431,38 @@ mod tests {
         let rects = layout_rows(2, 100, 56, 8, 40);
         assert_eq!(rects[0], Rect::new(40, 100, 1200, 56));
         assert_eq!(rects[1], Rect::new(40, 164, 1200, 56));
+    }
+
+    #[test]
+    fn view_transform_scales_and_centers() {
+        // 2x integer scale, no letterbox.
+        let view = ViewTransform::for_output(2560, 1600);
+        assert!((view.scale - 2.0).abs() < f32::EPSILON);
+        assert_eq!(view.offset_x, 0);
+        assert_eq!(
+            view.rect(Rect::new(40, 100, 1200, 56)),
+            Rect::new(80, 200, 2400, 112)
+        );
+        assert_eq!(view.px(22), 44);
+
+        // 16:9 display: uniform scale on height, horizontal letterbox.
+        let view = ViewTransform::for_output(1920, 1080);
+        assert!((view.scale - 1.35).abs() < 0.01);
+        assert!(view.offset_x > 0);
+        assert_eq!(view.offset_y, 0);
+
+        // Pointer round-trips back to logical space.
+        let (lx, ly) = view.pointer_to_logical(view.x(640), view.y(400));
+        assert!((lx - 640).abs() <= 1);
+        assert!((ly - 400).abs() <= 1);
+    }
+
+    #[test]
+    fn view_transform_native_deck_is_identity() {
+        let view = ViewTransform::for_output(1280, 800);
+        assert!((view.scale - 1.0).abs() < f32::EPSILON);
+        assert_eq!(view.offset_x, 0);
+        assert_eq!(view.offset_y, 0);
+        assert_eq!(view.px(22), 22);
     }
 }
