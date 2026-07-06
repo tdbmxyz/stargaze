@@ -213,6 +213,13 @@ fn has_session_overrides(cli: &Cli) -> bool {
         || cli.codec.is_some()
 }
 
+/// True when running inside a gamescope session (Steam Deck gaming
+/// mode, or a nested gamescope on a desktop).
+fn running_under_gamescope() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|v| v.eq_ignore_ascii_case("gamescope"))
+        || std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Install the ring crypto provider for rustls/quinn before any TLS operation.
@@ -233,6 +240,20 @@ async fn main() -> anyhow::Result<()> {
     // doing so. --gui forces the launcher regardless.
     let direct = cli.server.is_some()
         || (!cli.gui && !cfg.server_address.is_empty() && cfg.hosts.is_empty());
+
+    // Gamescope (Steam Deck gaming mode) only displays clients that come
+    // in through XWayland — native Wayland surfaces need gamescope's
+    // --expose-wayland and are otherwise never shown. SDL3 (under
+    // sdl2-compat) prefers Wayland whenever WAYLAND_DISPLAY is set, so
+    // the launcher would run invisibly. Force X11 there; an explicit
+    // SDL_VIDEODRIVER/SDL_VIDEO_DRIVER environment variable still wins
+    // (SDL gives the environment priority over normal hints).
+    if running_under_gamescope() {
+        info!("Gamescope session detected: preferring the x11 SDL video driver");
+        // Old and new hint names; sdl2-compat forwards both to SDL3.
+        sdl2::hint::set("SDL_VIDEODRIVER", "x11");
+        sdl2::hint::set("SDL_VIDEO_DRIVER", "x11");
+    }
 
     // SDL2 must be initialized on the main thread.
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
