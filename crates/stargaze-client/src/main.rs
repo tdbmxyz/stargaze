@@ -108,9 +108,36 @@ struct Cli {
 }
 
 fn init_tracing() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Besides stderr, log to a file next to the config: launchers like
+    // Steam swallow stderr, and without a file there is nothing to
+    // diagnose a failed launch with. Truncated each run; best effort.
+    let log_path = config::config_file_path("client").with_file_name("client.log");
+    let log_file = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")))
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&log_path)
+        })
+        .ok();
+
+    let file_layer = log_file.map(|f| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::sync::Arc::new(f))
+            .with_ansi(false)
+    });
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(file_layer)
+        .init();
 
     // Route FFmpeg's own diagnostics (e.g. HEVC reference errors during
     // loss recovery) through tracing instead of raw stderr.
