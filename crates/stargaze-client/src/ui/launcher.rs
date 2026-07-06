@@ -690,11 +690,20 @@ pub fn run_launcher(
                     });
                 }
                 Ok(Ok(conn)) => {
-                    // Cancelled at the same moment it succeeded: drop it.
-                    drop(conn);
+                    // Cancelled at the same moment it succeeded: close
+                    // the session outright (the receive task holds its
+                    // own connection handle, so dropping isn't enough).
+                    conn.usb_connection.close(0u32.into(), b"cancelled");
+                    conn.transport.abort();
                 }
                 Ok(Err(e)) => {
-                    model.error = Some(format!("Connection failed: {e}"));
+                    // A cancel racing the failure should read as the
+                    // cancel the user asked for, not a surprise error.
+                    model.error = if cancelled {
+                        Some("Connection cancelled".to_string())
+                    } else {
+                        Some(format!("Connection failed: {e}"))
+                    };
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if cancelled {
@@ -745,6 +754,10 @@ pub fn run_launcher(
                             session_cfg,
                             host_name: host.display_name().to_string(),
                         });
+                        // Drop the rest of this frame's events: a second
+                        // Activate must not spawn a competing connect
+                        // and leak the first attempt.
+                        break;
                     }
                 }
             }

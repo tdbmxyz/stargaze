@@ -2,30 +2,34 @@
 //! decoders, input forwarding, and the renderer until the session ends.
 //!
 //! Extracted from `main` so the launcher UI can run sessions in a loop
-//! (menu → session → back to menu). Everything here is re-runnable;
-//! once-only process state (tracing, rustls provider, `sdl2::init()`)
-//! stays in `main`.
+//! (menu → session → back to menu). Everything here is re-runnable and
+//! every exit path (including decoder start failures) runs the same
+//! teardown — the pre-launcher code could rely on process exit to
+//! release controllers, kill rsonance, and close the connection; this
+//! code cannot. Once-only process state (tracing, rustls provider,
+//! `sdl2::init()`) stays in `main`.
 
-use anyhow::bail;
+use anyhow::anyhow;
 use stargaze_core::audio::AudioDecoderConfig;
 use stargaze_core::config::{self, ClientConfig};
 use stargaze_core::decode::DecoderConfig;
 use stargaze_core::mic_forward;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::transport::ConnectedSession;
+use crate::transport::{ConnectedSession, SessionParams};
 use crate::{decode, gamepad, render, usb};
 
 /// Runs a full session on an established connection, returning when the
 /// renderer exits (window closed, quit shortcut, or transport death).
 ///
-/// `cfg` carries both the toggles (fullscreen, gamepad passthrough, USB
-/// forward, mic forward) and the session quality: `cfg.codec` must be
-/// the codec that was requested in the handshake.
+/// `cfg` carries the toggles (fullscreen, gamepad passthrough, USB
+/// forward, mic forward); the decode codec comes from the
+/// server-confirmed session parameters, not the request.
 ///
 /// # Errors
 ///
-/// Returns an error if a decoder or the renderer fails to start.
+/// Returns an error if a decoder or the renderer fails to start or
+/// fails fatally; the session is fully torn down either way.
 pub async fn run_session(
     sdl: &sdl2::Sdl,
     cfg: &ClientConfig,
@@ -44,6 +48,12 @@ pub async fn run_session(
         usb_connection,
     } = conn;
 
+    // Handle for closing the connection at teardown: without an
+    // explicit close, the USB forwarder (which owns its own clone)
+    // would keep Valve hardware tunneled to a dead session until the
+    // server's idle timeout.
+    let connection = usb_connection.clone();
+
     // USB forwarding: tunnel Valve controller hardware to the server
     // over the session connection (Steam needs the real USB device).
     if cfg.usb_forward {
@@ -52,22 +62,20 @@ pub async fn run_session(
         drop(usb_connection);
     }
 
-    // Use the server-confirmed resolution for decoding and rendering.
-    // The server may advertise a different resolution than what the client
-    // requested (e.g. 3440x1440 on an ultrawide display).
-    let decoder_config = DecoderConfig {
-        width: session_params.width,
-        height: session_params.height,
-        codec: cfg.codec,
-    };
-
     info!(
-        "Connected, session: {}x{} @ {}fps, {} Mbps",
+        "Connected, session: {}x{} @ {}fps, {} Mbps, codec {}",
         session_params.width,
         session_params.height,
         session_params.framerate,
-        session_params.bitrate_mbps
+        session_params.bitrate_mbps,
+        session_params.codec,
     );
+    if session_params.codec != cfg.codec {
+        warn!(
+            "Server encodes {} (its configured codec), not the requested {}; decoding {0}",
+            session_params.codec, cfg.codec
+        );
+    }
 
     // Optionally start rsonance transmitter for mic forwarding.
     let mut rsonance_child = if cfg.mic_forward.enabled {
@@ -92,7 +100,7 @@ pub async fn run_session(
     // stall runtime shutdown until then (client hung on quit).
     let (sdl_input_tx, sdl_input_rx) =
         std::sync::mpsc::channel::<stargaze_core::input::InputEvent>();
-    if let Err(e) = std::thread::Builder::new()
+    let bridge = std::thread::Builder::new()
         .name("stargaze-input-bridge".into())
         .spawn(move || {
             while let Ok(event) = sdl_input_rx.recv() {
@@ -100,24 +108,87 @@ pub async fn run_session(
                     break;
                 }
             }
-        })
-    {
-        bail!("Failed to spawn input bridge thread: {e}");
-    }
+        });
 
-    // Gamepads: evdev pass-through (server clones the real device) with
-    // automatic per-device fallback to SDL → Xbox 360 emulation. Started
-    // before the SDL loop so devices present at startup are grabbed
-    // before SDL delivers their hotplug events.
-    let gamepads = gamepad::SharedGamepads::new();
-    let passthrough = if cfg.gamepad_passthrough {
-        Some(gamepad::start_passthrough(
-            gamepads.clone(),
-            sdl_input_tx.clone(),
-        ))
-    } else {
-        info!("Gamepad pass-through disabled; using Xbox 360 emulation");
-        None
+    // Everything below must funnel through the shared teardown at the
+    // bottom, whatever fails.
+    let mut passthrough = None;
+    let result = match bridge {
+        Err(e) => Err(anyhow!("Failed to spawn input bridge thread: {e}")),
+        Ok(_) => {
+            // Gamepads: evdev pass-through (server clones the real
+            // device) with automatic per-device fallback to SDL →
+            // Xbox 360 emulation. Started before the SDL loop so
+            // devices present at startup are grabbed before SDL
+            // delivers their hotplug events.
+            let gamepads = gamepad::SharedGamepads::new();
+            if cfg.gamepad_passthrough {
+                passthrough = Some(gamepad::start_passthrough(
+                    gamepads.clone(),
+                    sdl_input_tx.clone(),
+                ));
+            } else {
+                info!("Gamepad pass-through disabled; using Xbox 360 emulation");
+            }
+            run_decoders_and_renderer(
+                sdl,
+                cfg,
+                &session_params,
+                video_frames,
+                audio_frames,
+                sdl_input_tx,
+                decoder_idr_tx,
+                rtt_probe,
+                net_stats,
+                stats_file,
+                &gamepads,
+            )
+        }
+    };
+
+    info!("Shutting down session");
+    // Release grabbed controllers so whatever runs next (the launcher
+    // menu, the desktop) sees them again; stop() waits for the release
+    // so an immediate reconnect's scan cannot hit EBUSY.
+    if let Some(handle) = passthrough {
+        handle.stop();
+    }
+    if let Some(ref mut child) = rsonance_child {
+        mic_forward::stop_rsonance(child).await;
+    }
+    // Closing the connection (not just aborting the receive task) ends
+    // the USB forwarder and releases tunneled devices locally.
+    connection.close(0u32.into(), b"session ended");
+    client_transport.abort();
+
+    result?;
+    info!("Session ended");
+    Ok(())
+}
+
+/// Starts both decoders and runs the blocking SDL render loop; stops
+/// the decoders on every exit path.
+#[allow(clippy::too_many_arguments)]
+fn run_decoders_and_renderer(
+    sdl: &sdl2::Sdl,
+    cfg: &ClientConfig,
+    session_params: &SessionParams,
+    video_frames: tokio::sync::mpsc::Receiver<stargaze_core::transport::ReassembledFrame>,
+    audio_frames: tokio::sync::mpsc::Receiver<stargaze_core::transport::ReassembledFrame>,
+    sdl_input_tx: std::sync::mpsc::Sender<stargaze_core::input::InputEvent>,
+    decoder_idr_tx: tokio::sync::mpsc::Sender<()>,
+    rtt_probe: crate::transport::RttProbe,
+    net_stats: std::sync::Arc<crate::transport::NetStats>,
+    stats_file: Option<std::path::PathBuf>,
+    gamepads: &gamepad::SharedGamepads,
+) -> anyhow::Result<()> {
+    // Use the server-confirmed parameters for decoding and rendering:
+    // the server may override the resolution (e.g. its display's
+    // native size) and encodes with its own configured codec.
+    let decoder_config = DecoderConfig {
+        width: session_params.width,
+        height: session_params.height,
+        codec: session_params.codec,
     };
 
     let audio_decoder_config = AudioDecoderConfig {
@@ -131,7 +202,13 @@ pub async fn run_session(
 
     // Start the video decoder thread.
     let (video_decoder_session, decoded_rx, zero_copy) =
-        decode::start_decoder(decoder_config.clone(), video_frames, decoder_idr_tx)?;
+        match decode::start_decoder(decoder_config.clone(), video_frames, decoder_idr_tx) {
+            Ok(started) => started,
+            Err(e) => {
+                audio_decoder_session.stop().ok();
+                return Err(e.into());
+            }
+        };
 
     let session_commands = render::SessionCommands {
         server: session_params.server_command.clone(),
@@ -153,24 +230,12 @@ pub async fn run_session(
             stats_file,
             &session_commands,
             &zero_copy,
-            &gamepads,
+            gamepads,
         )
     });
 
-    info!("Renderer closed, shutting down session");
-    // Release grabbed controllers so whatever runs next (the launcher
-    // menu, the desktop) sees them again.
-    if let Some(handle) = passthrough {
-        handle.stop();
-    }
-    if let Some(ref mut child) = rsonance_child {
-        mic_forward::stop_rsonance(child).await;
-    }
+    info!("Renderer closed");
     video_decoder_session.stop().ok();
     audio_decoder_session.stop().ok();
-    client_transport.abort();
-
-    render_result?;
-    info!("Session ended");
-    Ok(())
+    render_result
 }

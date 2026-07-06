@@ -205,6 +205,10 @@ impl SharedGamepads {
         self.state.lock().unwrap().active_nodes.contains(node)
     }
 
+    fn active_node_count(&self) -> usize {
+        self.state.lock().unwrap().active_nodes.len()
+    }
+
     fn mark_ignored(&self, node: PathBuf) {
         self.state.lock().unwrap().ignored_nodes.insert(node);
     }
@@ -283,14 +287,27 @@ fn build_descriptor(device: &Device) -> GamepadDescriptor {
 /// launcher menu shown after the session sees the controllers again).
 pub struct PassthroughHandle {
     stop: Arc<AtomicBool>,
+    shared: Arc<SharedGamepads>,
 }
 
 impl PassthroughHandle {
-    /// Signals all pass-through threads to exit and ungrab. Readers
-    /// notice within [`READER_POLL_TIMEOUT_MS`]; this does not wait for
-    /// them.
+    /// Signals all pass-through threads to exit and ungrab, then waits
+    /// (bounded) for the readers to actually release their grabs — the
+    /// next session's initial scan must not race a dying reader's
+    /// grab, or the device would be marked ignored (EBUSY) and fall
+    /// back to Xbox 360 emulation for that whole session.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Readers poll every READER_POLL_TIMEOUT_MS; give them a few
+        // rounds before giving up (a vanished device errors out of its
+        // reader on its own).
+        let deadline = std::time::Instant::now() + Duration::from_millis(1000);
+        while self.shared.active_node_count() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if self.shared.active_node_count() > 0 {
+            warn!("Some pass-through gamepads did not release within 1s");
+        }
     }
 }
 
@@ -305,6 +322,10 @@ pub fn start_passthrough(
 ) -> PassthroughHandle {
     let stop = Arc::new(AtomicBool::new(false));
     scan_once(&shared, &input_tx, &stop);
+    let handle = PassthroughHandle {
+        stop: Arc::clone(&stop),
+        shared: Arc::clone(&shared),
+    };
     let scan_stop = Arc::clone(&stop);
     let spawned = std::thread::Builder::new()
         .name("stargaze-gamepad-scan".into())
@@ -325,7 +346,7 @@ pub fn start_passthrough(
     if let Err(e) = spawned {
         warn!("Failed to spawn gamepad scanner thread: {e}");
     }
-    PassthroughHandle { stop }
+    handle
 }
 
 /// One enumeration pass: claim every new gamepad node we can grab.
@@ -337,6 +358,11 @@ fn scan_once(
     let nodes: Vec<(PathBuf, Device)> = evdev::enumerate().collect();
     shared.prune_ignored(nodes.iter().map(|(path, _)| path));
     for (path, device) in nodes {
+        // A stop can arrive mid-scan (session ending); don't grab
+        // devices for a session that is already going away.
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         if shared.is_active_node(&path) || shared.is_ignored(&path) {
             continue;
         }
@@ -436,7 +462,9 @@ fn wait_readable(device: &Device) -> bool {
     };
     // SAFETY: pfd points to a valid pollfd for the duration of the call.
     let ret = unsafe { libc::poll(&raw mut pfd, 1, READER_POLL_TIMEOUT_MS) };
-    ret != 0
+    // Errors (e.g. EINTR) count as "not readable": the caller re-checks
+    // the stop flag and retries instead of entering a blocking read.
+    ret > 0
 }
 
 /// Blocking per-device reader: forwards raw events until the device

@@ -87,6 +87,12 @@ struct Cli {
     #[arg(long)]
     log_progress: bool,
 
+    /// Force the launcher UI even when the config file's legacy
+    /// server_address would auto-connect (e.g. to migrate that config
+    /// into the host list).
+    #[arg(long)]
+    gui: bool,
+
     /// Path to config file (default: ~/.config/stargaze/client.toml).
     #[arg(long)]
     config: Option<String>,
@@ -115,10 +121,8 @@ fn init_tracing() {
 ///
 /// # Errors
 ///
-/// Returns an error if the config file exists but cannot be read or parsed,
-/// or if `require_server` is set and the final `server_address` is empty
-/// (direct-connect mode; the launcher can start with no hosts at all).
-fn build_config(cli: &Cli, require_server: bool) -> anyhow::Result<ClientConfig> {
+/// Returns an error if the config file exists but cannot be read or parsed.
+fn load_file_config(cli: &Cli) -> anyhow::Result<ClientConfig> {
     let config_path: Option<String> = if let Some(ref path) = cli.config {
         Some(path.clone())
     } else {
@@ -129,9 +133,13 @@ fn build_config(cli: &Cli, require_server: bool) -> anyhow::Result<ClientConfig>
             None
         }
     };
+    Ok(config::load_config(config_path.as_deref())?)
+}
 
-    let mut cfg: ClientConfig = config::load_config(config_path.as_deref())?;
-
+/// Applies one-shot CLI overrides on top of the file config. Only used
+/// in direct-connect mode: the launcher persists its config on every
+/// change, and a transient flag must never be baked into the file.
+fn apply_cli_overrides(cfg: &mut ClientConfig, cli: &Cli) {
     if let Some(ref server) = cli.server {
         cfg.server_address.clone_from(server);
     }
@@ -162,12 +170,20 @@ fn build_config(cli: &Cli, require_server: bool) -> anyhow::Result<ClientConfig>
     if let Some(codec) = cli.codec {
         cfg.codec = codec;
     }
+}
 
-    if require_server && cfg.server_address.is_empty() {
-        bail!("Server address is required — pass --server <address> or set it in a config file");
-    }
-
-    Ok(cfg)
+/// True when any per-session override flag was passed — flags the
+/// launcher ignores (it manages these settings itself).
+fn has_session_overrides(cli: &Cli) -> bool {
+    cli.port.is_some()
+        || cli.fullscreen.is_some()
+        || cli.mic_forward
+        || cli.mic_forward_port.is_some()
+        || cli.gamepad_passthrough.is_some()
+        || cli.usb_forward.is_some()
+        || cli.resolution.is_some()
+        || cli.fps.is_some()
+        || cli.codec.is_some()
 }
 
 #[tokio::main]
@@ -180,16 +196,27 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let direct = cli.server.is_some();
-    let mut cfg = build_config(&cli, direct)?;
+    let mut cfg = load_file_config(&cli)?;
     stargaze_core::logging::set_progress_logging(cli.log_progress);
+
+    // Direct-connect (scriptable, exits when the session ends) when
+    // --server is passed, or for a pre-launcher config that sets the
+    // legacy server_address and has never saved a host list — those
+    // setups auto-connected before the launcher existed and must keep
+    // doing so. --gui forces the launcher regardless.
+    let direct = cli.server.is_some()
+        || (!cli.gui && !cfg.server_address.is_empty() && cfg.hosts.is_empty());
 
     // SDL2 must be initialized on the main thread.
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
 
     if direct {
-        // --server given: connect straight away, exit when the session
-        // ends (scriptable behavior, same as before the launcher).
+        apply_cli_overrides(&mut cfg, &cli);
+        if cfg.server_address.is_empty() {
+            bail!(
+                "Server address is required — pass --server <address> or set it in a config file"
+            );
+        }
         info!(
             "Connecting to {}:{} (fullscreen: {})",
             cfg.server_address, cfg.port, cfg.fullscreen
@@ -207,6 +234,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Launcher mode: menu → session → back to the menu, until quit.
+    // One-shot CLI overrides are NOT applied here: the launcher saves
+    // its config on every change, and a transient flag like --fps 30
+    // must not be silently persisted into client.toml.
+    if has_session_overrides(&cli) {
+        warn!(
+            "Per-session flags (--fps/--resolution/--codec/toggles) are ignored in launcher \
+             mode; use the launcher's settings, or --server for a direct connection"
+        );
+    }
     let config_path = cli
         .config
         .as_ref()

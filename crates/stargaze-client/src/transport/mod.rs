@@ -76,6 +76,15 @@ async fn resolve_server_addr(
     address: &str,
     port: u16,
 ) -> Result<std::net::SocketAddr, TransportError> {
+    // IP literals (including bracketed IPv6, as the pre-DNS config
+    // format required) skip the resolver entirely.
+    let bare = address
+        .strip_prefix('[')
+        .and_then(|a| a.strip_suffix(']'))
+        .unwrap_or(address);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, port));
+    }
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((address, port))
         .await
         .map_err(|e| {
@@ -189,4 +198,24 @@ pub async fn connect(
         net_stats,
         usb_connection,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_server_addr;
+
+    #[tokio::test]
+    async fn resolves_ip_literals_without_dns() {
+        let v4 = resolve_server_addr("192.168.1.10", 9000).await.unwrap();
+        assert_eq!(v4.to_string(), "192.168.1.10:9000");
+
+        // Bracketed IPv6, as the pre-DNS "addr:port".parse() format required.
+        let v6 = resolve_server_addr("[::1]", 9000).await.unwrap();
+        assert!(v6.is_ipv6());
+        assert_eq!(v6.port(), 9000);
+
+        // Bare IPv6 literals work too.
+        let v6 = resolve_server_addr("fd00::1", 9000).await.unwrap();
+        assert!(v6.is_ipv6());
+    }
 }
