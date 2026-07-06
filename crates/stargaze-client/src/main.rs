@@ -1,13 +1,10 @@
 use anyhow::{anyhow, bail};
 use clap::Parser;
-use stargaze_core::audio::AudioDecoderConfig;
 use stargaze_core::config::{self, ClientConfig, Codec};
-use stargaze_core::decode::DecoderConfig;
-use stargaze_core::mic_forward;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use stargaze_client::{decode, gamepad, render, transport, usb};
+use stargaze_client::{session, transport};
 
 /// Stargaze streaming client — connects to a server, decodes video/audio, and forwards input.
 // Doc comments here are clap help text rendered verbatim; list items align
@@ -196,137 +193,12 @@ async fn main() -> anyhow::Result<()> {
         codec: cfg.codec,
     };
 
-    let audio_decoder_config = AudioDecoderConfig {
-        sample_rate: 48_000,
-        channels: 2,
-    };
-
-    let (
-        client_transport,
-        session_params,
-        video_frames,
-        audio_frames,
-        transport_input_tx,
-        decoder_idr_tx,
-        rtt_probe,
-        net_stats,
-        usb_connection,
-    ) = transport::connect(&cfg, session_request).await?;
-
-    // USB forwarding: tunnel Valve controller hardware to the server
-    // over the session connection (Steam needs the real USB device).
-    if cfg.usb_forward {
-        usb::start(usb_connection);
-    } else {
-        drop(usb_connection);
-    }
-
-    // Use the server-confirmed resolution for decoding and rendering.
-    // The server may advertise a different resolution than what the client
-    // requested (e.g. 3440x1440 on an ultrawide display).
-    let decoder_config = DecoderConfig {
-        width: session_params.width,
-        height: session_params.height,
-        codec: cfg.codec,
-    };
-
-    info!(
-        "Connected, session: {}x{} @ {}fps, {} Mbps",
-        session_params.width,
-        session_params.height,
-        session_params.framerate,
-        session_params.bitrate_mbps
-    );
-
-    // Optionally start rsonance transmitter for mic forwarding.
-    let mut rsonance_child = if cfg.mic_forward.enabled {
-        match mic_forward::spawn_rsonance_transmitter(&cfg.mic_forward, &cfg.server_address) {
-            Ok(child) => {
-                info!("Mic forwarding enabled (rsonance transmitter)");
-                Some(child)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to start rsonance transmitter: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let conn = transport::connect(&cfg, session_request).await?;
 
     // SDL2 must be initialized on the main thread.
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
 
-    // Bridge: SDL event loop (std::sync::mpsc) → tokio channel → transport.
-    // A plain detached OS thread, not spawn_blocking: it blocks in recv()
-    // with senders held by long-lived gamepad scanner/reader threads, so
-    // it only wakes on the next input event — a tokio blocking task would
-    // stall runtime shutdown until then (client hung on quit).
-    let (sdl_input_tx, sdl_input_rx) =
-        std::sync::mpsc::channel::<stargaze_core::input::InputEvent>();
-    if let Err(e) = std::thread::Builder::new()
-        .name("stargaze-input-bridge".into())
-        .spawn(move || {
-            while let Ok(event) = sdl_input_rx.recv() {
-                if transport_input_tx.blocking_send(event).is_err() {
-                    break;
-                }
-            }
-        })
-    {
-        bail!("Failed to spawn input bridge thread: {e}");
-    }
-
-    // Gamepads: evdev pass-through (server clones the real device) with
-    // automatic per-device fallback to SDL → Xbox 360 emulation. Started
-    // before the SDL loop so devices present at startup are grabbed
-    // before SDL delivers their hotplug events.
-    let gamepads = gamepad::SharedGamepads::new();
-    if cfg.gamepad_passthrough {
-        gamepad::start_passthrough(gamepads.clone(), sdl_input_tx.clone());
-    } else {
-        info!("Gamepad pass-through disabled; using Xbox 360 emulation");
-    }
-
-    // Start the audio decoder thread — sends decoded PCM to a channel.
-    let (audio_decoder_session, audio_pcm_rx) =
-        decode::start_audio_decoder(audio_decoder_config, audio_frames)?;
-
-    // Start the video decoder thread.
-    let (video_decoder_session, decoded_rx, zero_copy) =
-        decode::start_decoder(decoder_config.clone(), video_frames, decoder_idr_tx)?;
-
-    let session_commands = render::SessionCommands {
-        server: session_params.server_command.clone(),
-        client: config::sanitized_command_line(),
-    };
-
-    // SDL2 event loop must run on the main OS thread.
-    // Audio PCM is queued to the SDL2 AudioQueue inside the event loop.
-    tokio::task::block_in_place(|| {
-        render::start_renderer(
-            &sdl,
-            &decoder_config,
-            decoded_rx,
-            audio_pcm_rx,
-            cfg.fullscreen,
-            sdl_input_tx,
-            rtt_probe,
-            net_stats,
-            cli.stats_file.clone(),
-            &session_commands,
-            &zero_copy,
-            &gamepads,
-        )
-    })?;
-
-    info!("Renderer closed, shutting down");
-    if let Some(ref mut child) = rsonance_child {
-        mic_forward::stop_rsonance(child).await;
-    }
-    video_decoder_session.stop().ok();
-    audio_decoder_session.stop().ok();
-    client_transport.abort();
+    session::run_session(&sdl, &cfg, conn, cli.stats_file.clone()).await?;
 
     info!("Client shut down");
 

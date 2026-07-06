@@ -92,26 +92,36 @@ async fn resolve_server_addr(
         })
 }
 
+/// An established session connection: everything the client needs to
+/// run decoders, forward input, and render until the session ends.
+pub struct ConnectedSession {
+    /// Handle to abort the transport receive task.
+    pub transport: ClientTransport,
+    /// Server-confirmed session parameters.
+    pub session_params: SessionParams,
+    /// Reassembled video frames.
+    pub video_frames: mpsc::Receiver<ReassembledFrame>,
+    /// Reassembled audio frames.
+    pub audio_frames: mpsc::Receiver<ReassembledFrame>,
+    /// Input events to forward to the server.
+    pub input_tx: mpsc::Sender<InputEvent>,
+    /// Keyframe requests from the decoder.
+    pub idr_tx: mpsc::Sender<()>,
+    /// RTT query handle for the stats overlay.
+    pub rtt_probe: RttProbe,
+    /// Network counters for the stats overlay.
+    pub net_stats: std::sync::Arc<NetStats>,
+    /// Connection handle for opening USB tunnel streams.
+    pub usb_connection: quinn::Connection,
+}
+
 /// # Errors
 ///
 /// Returns `TransportError` if connection or handshake fails.
 pub async fn connect(
     config: &ClientConfig,
     session_request: SessionRequest,
-) -> Result<
-    (
-        ClientTransport,
-        SessionParams,
-        mpsc::Receiver<ReassembledFrame>,
-        mpsc::Receiver<ReassembledFrame>,
-        mpsc::Sender<InputEvent>,
-        mpsc::Sender<()>,
-        RttProbe,
-        std::sync::Arc<NetStats>,
-        quinn::Connection,
-    ),
-    TransportError,
-> {
+) -> Result<ConnectedSession, TransportError> {
     let server_addr = resolve_server_addr(&config.server_address, config.port).await?;
 
     let connection = quic::connect_to_server(server_addr).await?;
@@ -168,15 +178,15 @@ pub async fn connect(
         }
     });
 
-    Ok((
-        ClientTransport { task_handle },
-        session_response,
-        video_rx,
-        audio_rx,
+    Ok(ConnectedSession {
+        transport: ClientTransport { task_handle },
+        session_params: session_response,
+        video_frames: video_rx,
+        audio_frames: audio_rx,
         input_tx,
         idr_tx,
         rtt_probe,
         net_stats,
         usb_connection,
-    ))
+    })
 }
