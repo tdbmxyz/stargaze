@@ -92,11 +92,16 @@ stargaze-server --resolution 2560x1440 --framerate 60 --bitrate 20
 # docs/headless-screencast.md for an auto-approving portal setup.
 ```
 
-On the client machine:
+On the client machine, just launch `stargaze-client` (from the desktop
+menu or a terminal): a gamepad/touch-friendly launcher opens where you
+save hosts (name, address, port, per-host resolution/framerate/codec),
+tweak toggles, and connect. Sessions return to the launcher when they
+end. For scripts, `--server` skips the launcher and connects directly
+as before:
 
 ```bash
 stargaze-client --server 192.168.1.10
-# Esc or closing the window ends the session.
+# Esc or closing the window ends the session and exits.
 ```
 
 Both binaries accept `--help` for the full flag list and read an optional TOML config file (CLI flags override it):
@@ -122,11 +127,23 @@ port = 9001
 ```
 
 ```toml
-# ~/.config/stargaze/client.toml
-server_address = "192.168.1.10"
-port = 9000
+# ~/.config/stargaze/client.toml — managed by the launcher UI, hand-editable
 fullscreen = true
+
+[[hosts]]
+name = "zeus"
+address = "192.168.1.10"   # IP or DNS name
+port = 9000
+framerate = 60
+codec = "h265"
+
+[hosts.resolution]
+width = 1920
+height = 1080
 ```
+
+(The legacy single `server_address`/`port` form still works and is
+migrated into a host entry the first time the launcher saves.)
 
 ### Diagnostics
 
@@ -147,6 +164,8 @@ This is a personal, hardware-specific project (see the note at the top). It is l
 ## License & disclaimer
 
 Stargaze is licensed under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later). See [`LICENSE`](LICENSE) for the full text.
+
+The client embeds the DejaVu Sans typeface for its launcher UI; DejaVu is distributed under the Bitstream Vera license (free to embed and redistribute), reproduced at [`assets/fonts/LICENSE-DejaVu`](assets/fonts/LICENSE-DejaVu).
 
 The AGPL-3.0 was chosen deliberately for **compatibility with the GPL-3.0** under which [Sunshine](https://github.com/LizardByte/Sunshine) and [Moonlight](https://github.com/moonlight-stream/moonlight-qt) are distributed — as a precaution, in case any code, patterns, or protocol details turn out to have been derived or copied from those projects. Licensing under a GPL-3.0-compatible copyleft license keeps Stargaze in the clear with respect to their terms.
 

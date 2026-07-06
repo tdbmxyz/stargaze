@@ -28,6 +28,15 @@ pub enum ConfigError {
         /// Description of the read error.
         reason: String,
     },
+
+    /// The config file could not be written.
+    #[error("Failed to write config file {path}: {reason}")]
+    WriteError {
+        /// Path to the config file.
+        path: String,
+        /// Description of the write error.
+        reason: String,
+    },
 }
 
 #[cfg(test)]

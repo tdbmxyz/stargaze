@@ -96,7 +96,7 @@
     # metadata and build environment across the two package derivations.
     commonPackageAttrs = {
       pname = "stargaze";
-      version = "1.1.0";
+      version = "1.2.0";
       src = self;
 
       cargoLock.lockFile = ./Cargo.lock;
@@ -184,6 +184,18 @@
                 pkgs.libclang
                 pkgs.llvmPackages.libclang
               ];
+
+            # Desktop entry + icons so the client shows up in XDG menus;
+            # the AppImage bundler also picks these up for its root
+            # .desktop/.DirIcon instead of synthesizing a stub.
+            postInstall = ''
+              install -Dm644 $src/assets/stargaze.desktop \
+                $out/share/applications/stargaze.desktop
+              install -Dm644 $src/assets/icons/stargaze.svg \
+                $out/share/icons/hicolor/scalable/apps/stargaze.svg
+              install -Dm644 $src/assets/icons/stargaze-256.png \
+                $out/share/icons/hicolor/256x256/apps/stargaze.png
+            '';
 
             meta = {
               description = "Stargaze streaming client — decode, render, input forwarding";

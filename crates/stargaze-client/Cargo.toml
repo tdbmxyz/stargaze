@@ -21,6 +21,7 @@ evdev = "0.13"
 opus = "0.3"
 libc = "0.2"
 font8x8 = "0.3"
+fontdue = "0.9"
 khronos-egl = { version = "6", features = ["dynamic"] }
 gl = "0.14"
 
