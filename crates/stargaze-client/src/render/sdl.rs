@@ -385,6 +385,7 @@ pub(super) fn run_sdl_loop(
     commands: &SessionCommands,
     zero_copy: &AtomicBool,
     gamepads: &SharedGamepads,
+    idr_tx: &tokio::sync::mpsc::Sender<()>,
 ) -> Result<(), anyhow::Error> {
     let audio_queue: AudioQueue<f32> = create_audio_queue(sdl)?;
 
@@ -497,6 +498,10 @@ pub(super) fn run_sdl_loop(
                             }
                             ShortcutAction::ToggleStats => {
                                 overlay.visible = !overlay.visible;
+                            }
+                            ShortcutAction::Refresh => {
+                                info!("Manual refresh: requesting IDR keyframe");
+                                let _ = idr_tx.try_send(());
                             }
                         }
                     } else if captured {

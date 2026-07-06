@@ -202,7 +202,7 @@ fn run_decoders_and_renderer(
 
     // Start the video decoder thread.
     let (video_decoder_session, decoded_rx, zero_copy) =
-        match decode::start_decoder(decoder_config.clone(), video_frames, decoder_idr_tx) {
+        match decode::start_decoder(decoder_config.clone(), video_frames, decoder_idr_tx.clone()) {
             Ok(started) => started,
             Err(e) => {
                 audio_decoder_session.stop().ok();
@@ -231,6 +231,7 @@ fn run_decoders_and_renderer(
             &session_commands,
             &zero_copy,
             gamepads,
+            &decoder_idr_tx,
         )
     });
 

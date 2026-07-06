@@ -25,6 +25,10 @@ pub(super) enum ShortcutAction {
     ToggleFullscreen,
     /// Toggle the stats overlay (Ctrl+Alt+Shift+S).
     ToggleStats,
+    /// Force a video refresh by requesting an IDR keyframe from the
+    /// server (Ctrl+Alt+Shift+R) — manual escape hatch for persistent
+    /// decode artifacts.
+    Refresh,
 }
 
 /// Returns the shortcut action for a key press, if the Ctrl+Alt+Shift
@@ -41,6 +45,7 @@ pub(super) fn shortcut_action(keymod: Mod, scancode: Scancode) -> Option<Shortcu
         Scancode::Z => Some(ShortcutAction::ToggleCapture),
         Scancode::X => Some(ShortcutAction::ToggleFullscreen),
         Scancode::S => Some(ShortcutAction::ToggleStats),
+        Scancode::R => Some(ShortcutAction::Refresh),
         _ => None,
     }
 }
@@ -122,6 +127,10 @@ mod tests {
         assert_eq!(
             shortcut_action(CHORD, Scancode::S),
             Some(ShortcutAction::ToggleStats)
+        );
+        assert_eq!(
+            shortcut_action(CHORD, Scancode::R),
+            Some(ShortcutAction::Refresh)
         );
 
         // Partial chords must not trigger.
