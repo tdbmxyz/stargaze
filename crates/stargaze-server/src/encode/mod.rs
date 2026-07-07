@@ -102,6 +102,7 @@ pub fn start_encoder(
         EncoderSession,
         mpsc::Receiver<EncodedPacket>,
         watch::Sender<u64>,
+        watch::Sender<u32>,
     ),
     EncodeError,
 > {
@@ -109,6 +110,10 @@ pub fn start_encoder(
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
     let (idr_tx, idr_rx) = watch::channel(0u64);
+    // Per-session bitrate (Mbps); the transport sets it from the client
+    // request at each handshake and the encode loop rebuilds the NVENC
+    // context when it changes.
+    let (bitrate_tx, bitrate_rx) = watch::channel(config.bitrate_mbps);
 
     // Use a oneshot channel to report initialization errors back to the caller.
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), EncodeError>>();
@@ -134,10 +139,12 @@ pub fn start_encoder(
             // Run the encode loop until shutdown or channel close.
             if let Err(e) = ffmpeg::run_encode_loop(
                 &mut encoder,
+                &config,
                 &mut frames,
                 &packets_tx,
                 &shutdown_clone,
                 idr_rx,
+                bitrate_rx,
             ) {
                 error!("Encoder loop failed: {e}");
             }
@@ -163,6 +170,7 @@ pub fn start_encoder(
         },
         packets_rx,
         idr_tx,
+        bitrate_tx,
     ))
 }
 

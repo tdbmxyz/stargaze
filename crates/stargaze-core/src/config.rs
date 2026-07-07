@@ -232,6 +232,9 @@ pub struct HostEntry {
     pub resolution: Resolution,
     /// Requested framerate.
     pub framerate: u32,
+    /// Requested bitrate in Mbps. 0 = use the server's configured
+    /// bitrate (also what servers older than v1.3.0 always do).
+    pub bitrate: u32,
     /// Requested video codec.
     pub codec: Codec,
 }
@@ -244,6 +247,7 @@ impl Default for HostEntry {
             port: DEFAULT_PORT,
             resolution: Resolution::default(),
             framerate: 60,
+            bitrate: 0,
             codec: Codec::default(),
         }
     }
@@ -291,6 +295,9 @@ pub struct ClientConfig {
     pub resolution: Resolution,
     /// Requested framerate (direct-connect / legacy path).
     pub framerate: u32,
+    /// Requested bitrate in Mbps, 0 = server default (direct-connect /
+    /// legacy path).
+    pub bitrate: u32,
     /// Requested video codec (direct-connect / legacy path).
     pub codec: Codec,
     /// Saved hosts for the launcher UI (`[[hosts]]` tables).
@@ -308,6 +315,7 @@ impl Default for ClientConfig {
             mic_forward: MicForwardConfig::default(),
             resolution: Resolution::default(),
             framerate: 60,
+            bitrate: 0,
             codec: Codec::default(),
             hosts: Vec::new(),
         }
@@ -332,6 +340,7 @@ pub fn effective_hosts(cfg: &ClientConfig) -> Vec<HostEntry> {
         port: cfg.port,
         resolution: cfg.resolution,
         framerate: cfg.framerate,
+        bitrate: cfg.bitrate,
         codec: cfg.codec,
     }]
 }
@@ -713,6 +722,7 @@ mod tests {
                         height: 1440,
                     },
                     framerate: 90,
+                    bitrate: 25,
                     codec: Codec::Av1,
                 },
                 HostEntry {

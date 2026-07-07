@@ -58,6 +58,7 @@ impl ServerTransport {
 /// * `video_packets` — Receiver for encoded video packets from the video encoder
 /// * `audio_packets` — Receiver for encoded audio packets from the audio encoder
 /// * `idr_tx` — Sender to signal the video encoder to produce IDR keyframes
+/// * `bitrate_tx` — Sender for the per-session encoder bitrate (Mbps)
 /// * `input_tx` — Sender to forward client input events to the input injection pipeline
 ///
 /// # Errors
@@ -68,6 +69,7 @@ pub fn start_server_transport(
     video_packets: mpsc::Receiver<EncodedPacket>,
     audio_packets: mpsc::Receiver<EncodedPacket>,
     idr_tx: watch::Sender<u64>,
+    bitrate_tx: watch::Sender<u32>,
     input_tx: mpsc::Sender<InputEvent>,
 ) -> Result<ServerTransport, TransportError> {
     let bind_addr: std::net::SocketAddr = format!("{}:{}", config.bind_address, config.port)
@@ -88,6 +90,7 @@ pub fn start_server_transport(
             video_packets,
             audio_packets,
             idr_tx,
+            bitrate_tx,
             input_tx,
         )
         .await
@@ -111,6 +114,7 @@ async fn run_server_loop(
     mut video_packets: mpsc::Receiver<EncodedPacket>,
     mut audio_packets: mpsc::Receiver<EncodedPacket>,
     idr_tx: watch::Sender<u64>,
+    bitrate_tx: watch::Sender<u32>,
     input_tx: mpsc::Sender<InputEvent>,
 ) -> Result<(), TransportError> {
     loop {
@@ -149,6 +153,7 @@ async fn run_server_loop(
             &mut video_packets,
             &mut audio_packets,
             &idr_tx,
+            &bitrate_tx,
             &input_tx,
         )
         .await
@@ -170,15 +175,21 @@ async fn run_session(
     video_packets: &mut mpsc::Receiver<EncodedPacket>,
     audio_packets: &mut mpsc::Receiver<EncodedPacket>,
     idr_tx: &watch::Sender<u64>,
+    bitrate_tx: &watch::Sender<u32>,
     input_tx: &mpsc::Sender<InputEvent>,
 ) -> Result<(), TransportError> {
     let (mut send_stream, mut recv_stream) = connection.accept_bi().await.map_err(|e| {
         TransportError::ConnectionError(format!("failed to accept control stream: {e}"))
     })?;
 
-    let session_response =
-        sender::handle_session_handshake(config, connection, &mut send_stream, &mut recv_stream)
-            .await?;
+    let session_response = sender::handle_session_handshake(
+        config,
+        connection,
+        &mut send_stream,
+        &mut recv_stream,
+        bitrate_tx,
+    )
+    .await?;
 
     info!(
         "Session established: {}x{} @ {}fps, {} Mbps",
@@ -303,6 +314,7 @@ mod tests {
             height: 1080,
             framerate: 60,
             codec: stargaze_core::config::Codec::H265,
+            bitrate_mbps: 0,
         };
         send.write_all(&serialize_control_message(&request).unwrap())
             .await
@@ -339,10 +351,12 @@ mod tests {
         let (_video_tx, video_rx) = mpsc::channel::<EncodedPacket>(4);
         let (_audio_tx, audio_rx) = mpsc::channel::<EncodedPacket>(4);
         let (idr_tx, idr_rx) = tokio::sync::watch::channel(0u64);
+        let (bitrate_tx, _bitrate_rx) = tokio::sync::watch::channel(20u32);
         let (input_tx, _input_rx) = mpsc::channel::<InputEvent>(8);
 
-        let transport = start_server_transport(&config, video_rx, audio_rx, idr_tx, input_tx)
-            .expect("transport should start");
+        let transport =
+            start_server_transport(&config, video_rx, audio_rx, idr_tx, bitrate_tx, input_tx)
+                .expect("transport should start");
         let addr = transport.local_addr();
 
         let run = async {

@@ -77,6 +77,11 @@ pub struct DatagramHeader {
 ///
 /// Length-prefixed with 4-byte LE length before the `postcard`-serialized body.
 /// New variants may be appended without breaking backward compatibility.
+/// Trailing fields may be appended to an existing variant with care:
+/// `postcard::from_bytes` ignores unread trailing bytes, so OLD peers
+/// silently drop the new field — but NEW peers reading OLD bytes hit
+/// EOF and need an explicit fallback (see
+/// [`deserialize_session_request_compat`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMessage {
     /// Client -> Server: request a streaming session.
@@ -89,6 +94,9 @@ pub enum ControlMessage {
         framerate: u32,
         /// Requested video codec.
         codec: Codec,
+        /// Requested bitrate in Mbps; 0 = use the server's configured
+        /// bitrate. Appended in v1.3.0 — pre-1.3.0 servers ignore it.
+        bitrate_mbps: u32,
     },
     /// Server -> Client: confirm session parameters.
     SessionResponse {
@@ -284,6 +292,48 @@ pub fn deserialize_control_message(body: &[u8]) -> Result<ControlMessage, Transp
         .map_err(|e| TransportError::SerializationError(format!("control deserialize: {e}")))
 }
 
+/// The `SessionRequest` shape shipped before v1.3.0 (no bitrate).
+/// Postcard enum tags are variant indices, so this parses the same
+/// leading tag as [`ControlMessage::SessionRequest`].
+#[derive(Deserialize)]
+enum LegacyControlMessageV1 {
+    SessionRequest {
+        width: u32,
+        height: u32,
+        framerate: u32,
+        codec: Codec,
+    },
+}
+
+/// Deserializes a `SessionRequest`, accepting both the current shape
+/// and the pre-v1.3.0 one (which lacks `bitrate_mbps`; it comes back
+/// as 0 = "server default").
+///
+/// # Errors
+///
+/// Returns [`TransportError::SerializationError`] if the body is not a
+/// session request in either shape.
+pub fn deserialize_session_request_compat(body: &[u8]) -> Result<ControlMessage, TransportError> {
+    match deserialize_control_message(body) {
+        Ok(msg) => Ok(msg),
+        Err(modern_err) => match postcard::from_bytes::<LegacyControlMessageV1>(body) {
+            Ok(LegacyControlMessageV1::SessionRequest {
+                width,
+                height,
+                framerate,
+                codec,
+            }) => Ok(ControlMessage::SessionRequest {
+                width,
+                height,
+                framerate,
+                codec,
+                bitrate_mbps: 0,
+            }),
+            Err(_) => Err(modern_err),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +386,7 @@ mod tests {
             height: 1080,
             framerate: 60,
             codec: Codec::H265,
+            bitrate_mbps: 25,
         };
         let bytes = serialize_control_message(&msg).unwrap();
         // First 4 bytes are length prefix.
@@ -343,6 +394,66 @@ mod tests {
         assert_eq!(len, bytes.len() - 4);
         let decoded = deserialize_control_message(&bytes[4..]).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    /// Old client → new server: a pre-v1.3.0 request (no bitrate field)
+    /// must parse via the compat path with bitrate 0.
+    #[test]
+    fn session_request_compat_accepts_legacy_shape() {
+        #[derive(Serialize)]
+        enum OldControlMessage {
+            SessionRequest {
+                width: u32,
+                height: u32,
+                framerate: u32,
+                codec: Codec,
+            },
+        }
+        let old_bytes = postcard::to_allocvec(&OldControlMessage::SessionRequest {
+            width: 1280,
+            height: 800,
+            framerate: 90,
+            codec: Codec::H265,
+        })
+        .unwrap();
+
+        let decoded = deserialize_session_request_compat(&old_bytes).unwrap();
+        assert_eq!(
+            decoded,
+            ControlMessage::SessionRequest {
+                width: 1280,
+                height: 800,
+                framerate: 90,
+                codec: Codec::H265,
+                bitrate_mbps: 0,
+            }
+        );
+    }
+
+    /// New client → old server: postcard ignores unread trailing bytes,
+    /// so an old server parsing today's request with the legacy shape
+    /// just drops the bitrate field. This test IS the old server.
+    #[test]
+    fn legacy_parser_tolerates_new_request_bytes() {
+        let msg = ControlMessage::SessionRequest {
+            width: 1920,
+            height: 1080,
+            framerate: 60,
+            codec: Codec::Av1,
+            bitrate_mbps: 42,
+        };
+        let body = postcard::to_allocvec(&msg).unwrap();
+        let LegacyControlMessageV1::SessionRequest {
+            width,
+            height,
+            framerate,
+            codec,
+        } = postcard::from_bytes::<LegacyControlMessageV1>(&body)
+            .expect("old servers must still parse new requests");
+        assert_eq!(
+            (width, height, framerate, codec),
+            (1920, 1080, 60, Codec::Av1)
+        );
     }
 
     #[test]
