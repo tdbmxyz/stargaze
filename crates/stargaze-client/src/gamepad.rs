@@ -373,6 +373,76 @@ impl PassthroughHandle {
     }
 }
 
+/// Watches the local volume buttons for the session-end chord: both
+/// volume keys held together for [`QUIT_CHORD_HOLD`].
+///
+/// The escape hatch for the built-in-controller handoff
+/// (`forward_builtin_controller`): with the Deck's controller tunneled
+/// to the server there is no local gamepad left to carry Select+Start,
+/// but the volume keys live on a separate local input device. The
+/// device is read WITHOUT grabbing, so volume control keeps working.
+///
+/// Returns a stop flag; set it at session teardown (the thread exits
+/// within one poll interval).
+pub fn start_volume_quit_watch(shared: Arc<SharedGamepads>) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let spawned = std::thread::Builder::new()
+        .name("stargaze-volume-quit".into())
+        .spawn(move || {
+            let Some((path, mut device)) = evdev::enumerate().find(|(_, d)| {
+                d.supported_keys().is_some_and(|keys| {
+                    keys.contains(KeyCode::KEY_VOLUMEUP) && keys.contains(KeyCode::KEY_VOLUMEDOWN)
+                })
+            }) else {
+                warn!(
+                    "No volume-key device found; the volume-chord session \
+                     exit is unavailable (use the server side or suspend \
+                     to end the session)"
+                );
+                return;
+            };
+            info!(
+                device = %path.display(),
+                "Watching volume keys: hold Vol+ and Vol- together to end the session"
+            );
+            let mut chord = QuitChord::default();
+            loop {
+                if thread_stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if chord.fired() && !shared.quit_requested() {
+                    info!("Volume keys held: requesting session end");
+                    shared.request_quit();
+                }
+                if !wait_readable(&device) {
+                    continue;
+                }
+                match device.fetch_events() {
+                    Ok(events) => {
+                        for ev in events {
+                            if ev.event_type() == evdev::EventType::KEY {
+                                if ev.code() == KeyCode::KEY_VOLUMEDOWN.code() {
+                                    chord.set_select(ev.value() != 0);
+                                } else if ev.code() == KeyCode::KEY_VOLUMEUP.code() {
+                                    chord.set_start(ev.value() != 0);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Volume-key device read failed ({e}); chord watcher exiting");
+                        return;
+                    }
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        warn!("Failed to spawn volume-chord watcher: {e}");
+    }
+    stop
+}
+
 /// Starts the pass-through scanner thread.
 ///
 /// The initial scan runs synchronously before this returns, so devices

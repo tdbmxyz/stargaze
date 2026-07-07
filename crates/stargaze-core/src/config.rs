@@ -290,6 +290,15 @@ pub struct ClientConfig {
     pub usb_forward: bool,
     /// Mic forwarding configuration.
     pub mic_forward: MicForwardConfig,
+    /// Also tunnel the Steam Deck's BUILT-IN controller (28de:1205)
+    /// over USB/IP, handing the whole device to the server for the
+    /// session: the remote Steam sees a real Steam Deck Controller
+    /// (gyro, trackpads, paddles) instead of an emulated Xbox 360 pad.
+    /// While active the LOCAL Steam loses the controls — end the
+    /// session by holding both volume buttons for one second. Requires the
+    /// usbip setup (see docs/steam-deck-builtin-controller.md); off by
+    /// default.
+    pub forward_builtin_controller: bool,
     /// Requested stream resolution (direct-connect / legacy path; hosts
     /// saved in the launcher carry their own).
     pub resolution: Resolution,
@@ -313,6 +322,7 @@ impl Default for ClientConfig {
             gamepad_passthrough: true,
             usb_forward: true,
             mic_forward: MicForwardConfig::default(),
+            forward_builtin_controller: false,
             resolution: Resolution::default(),
             framerate: 60,
             bitrate: 0,
