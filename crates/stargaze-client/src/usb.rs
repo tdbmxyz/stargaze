@@ -242,8 +242,16 @@ fn bind_to_stub(busid: &str) -> std::io::Result<StubGuard> {
     // is why the usbip tool also writes to `bind` directly.
     if let Ok(driver) = std::fs::read_link(format!("{USB_DEVICES}/{busid}/driver"))
         && let Some(name) = driver.file_name().and_then(|n| n.to_str())
+        && let Err(e) = sysfs_write(&format!("/sys/bus/usb/drivers/{name}/unbind"), busid)
     {
-        let _ = sysfs_write(&format!("/sys/bus/usb/drivers/{name}/unbind"), busid);
+        // Without the detach the stub bind below fails with EBUSY —
+        // don't let the real cause vanish behind that generic error.
+        warn!(
+            busid,
+            driver = name,
+            "Cannot detach device from its driver ({e}); is the unbind \
+             knob group-writable? (usb-client module / steamos-usbip-setup.sh)"
+        );
     }
     sysfs_write(&format!("{USBIP_HOST}/bind"), busid)?;
 
