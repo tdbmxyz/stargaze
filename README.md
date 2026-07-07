@@ -87,7 +87,7 @@ Add the AppImage as a non-Steam game. Two things matter:
 
 - **Compatibility tool must be "None"** (game Properties → Compatibility → leave "Force the use of a specific Steam Play compatibility tool" unchecked). Proton and the Steam Linux Runtime run the game inside a container that breaks AppImages.
 - Steam injects its own runtime libraries via `LD_LIBRARY_PATH`/`LD_PRELOAD`; the client strips those automatically at startup (since v1.2.3).
-- Gaming mode's compositor (gamescope) only displays windows that come in through XWayland, so the client forces SDL's `x11` video driver when it detects a gamescope session (since v1.2.4). Set `SDL_VIDEODRIVER` yourself to override.
+- Gaming mode’s compositor (gamescope) only displays windows that come in through XWayland, so the client prefers SDL’s `x11` video driver whenever an X display is available (since v1.2.5; the v1.2.4 gamescope-detection approach did not fire under Steam). Set `SDL_VIDEODRIVER` yourself to override. Steam Input mirrors one button press onto several devices; the launcher de-duplicates those, so navigation moves one step per press.
 
 If the client still fails to start from Steam, check `~/.config/stargaze/client.log` — the client mirrors its stderr output there precisely because Steam swallows it.
 

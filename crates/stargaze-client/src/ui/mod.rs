@@ -26,6 +26,14 @@ const STICK_THRESHOLD: i16 = 8000;
 const STICK_REPEAT_DELAY: Duration = Duration::from_millis(400);
 /// Interval between repeats while the stick stays held.
 const STICK_REPEAT_INTERVAL: Duration = Duration::from_millis(130);
+/// Window in which the same nav event from a *different* device is
+/// treated as a duplicate of one physical press. Steam Input mirrors
+/// the controller: it exposes a virtual gamepad alongside the real one
+/// and its desktop layout synthesizes keyboard presses (D-pad → arrow
+/// keys, B → Escape), so one press can arrive as two or three SDL
+/// events. Humans can't repeat a press this fast; the mirrors arrive
+/// within a few milliseconds.
+const CROSS_DEVICE_DEDUP_WINDOW: Duration = Duration::from_millis(50);
 
 /// Stick direction currently held, for key-repeat emulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,12 +55,22 @@ impl StickDir {
     }
 }
 
+/// The device a button-like nav event came from, for cross-device
+/// duplicate suppression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavSource {
+    Keyboard,
+    Pad(u32),
+}
+
 /// Maps SDL events to [`NavEvent`]s, adding key-repeat behavior to the
 /// left stick (SDL only reports axis motion, not "still held").
 pub struct InputMapper {
     stick_x: i16,
     stick_y: i16,
     held: Option<(StickDir, Instant)>,
+    /// Last button-like nav event, for cross-device dedup.
+    last_nav: Option<(NavEvent, NavSource, Instant)>,
 }
 
 impl Default for InputMapper {
@@ -69,6 +87,7 @@ impl InputMapper {
             stick_x: 0,
             stick_y: 0,
             held: None,
+            last_nav: None,
         }
     }
 
@@ -77,31 +96,37 @@ impl InputMapper {
         match event {
             Event::KeyDown {
                 keycode: Some(key), ..
-            } => match *key {
-                Keycode::Up => Some(NavEvent::Up),
-                Keycode::Down => Some(NavEvent::Down),
-                Keycode::Left => Some(NavEvent::Left),
-                Keycode::Right => Some(NavEvent::Right),
-                Keycode::Return | Keycode::KpEnter => Some(NavEvent::Activate),
-                Keycode::Escape => Some(NavEvent::Back),
-                Keycode::Delete => Some(NavEvent::Delete),
-                Keycode::E => Some(NavEvent::Edit),
-                Keycode::Backspace => Some(NavEvent::Backspace),
-                _ => None,
-            },
+            } => {
+                let nav = match *key {
+                    Keycode::Up => NavEvent::Up,
+                    Keycode::Down => NavEvent::Down,
+                    Keycode::Left => NavEvent::Left,
+                    Keycode::Right => NavEvent::Right,
+                    Keycode::Return | Keycode::KpEnter => NavEvent::Activate,
+                    Keycode::Escape => NavEvent::Back,
+                    Keycode::Delete => NavEvent::Delete,
+                    Keycode::E => NavEvent::Edit,
+                    Keycode::Backspace => NavEvent::Backspace,
+                    _ => return None,
+                };
+                self.dedup(nav, NavSource::Keyboard)
+            }
             Event::TextInput { text, .. } => Some(NavEvent::Text(text.clone())),
-            Event::ControllerButtonDown { button, .. } => match button {
-                Button::DPadUp => Some(NavEvent::Up),
-                Button::DPadDown => Some(NavEvent::Down),
-                Button::DPadLeft => Some(NavEvent::Left),
-                Button::DPadRight => Some(NavEvent::Right),
-                Button::A => Some(NavEvent::Activate),
-                Button::B => Some(NavEvent::Back),
-                Button::Y => Some(NavEvent::Delete),
-                Button::X => Some(NavEvent::Edit),
-                Button::Start => Some(NavEvent::ConnectShortcut),
-                _ => None,
-            },
+            Event::ControllerButtonDown { button, which, .. } => {
+                let nav = match button {
+                    Button::DPadUp => NavEvent::Up,
+                    Button::DPadDown => NavEvent::Down,
+                    Button::DPadLeft => NavEvent::Left,
+                    Button::DPadRight => NavEvent::Right,
+                    Button::A => NavEvent::Activate,
+                    Button::B => NavEvent::Back,
+                    Button::Y => NavEvent::Delete,
+                    Button::X => NavEvent::Edit,
+                    Button::Start => NavEvent::ConnectShortcut,
+                    _ => return None,
+                };
+                self.dedup(nav, NavSource::Pad(*which))
+            }
             Event::ControllerAxisMotion { axis, value, .. } => {
                 match axis {
                     Axis::LeftX => self.stick_x = *value,
@@ -119,6 +144,27 @@ impl InputMapper {
             } => Some(NavEvent::PointerClick(*x, *y)),
             _ => None,
         }
+    }
+
+    /// Suppresses the same nav event arriving from a different device
+    /// within [`CROSS_DEVICE_DEDUP_WINDOW`] — one physical press echoed
+    /// by Steam Input's virtual gamepad or its synthesized key presses.
+    /// Same-device repeats (held keys, distinct presses) pass through.
+    fn dedup(&mut self, nav: NavEvent, source: NavSource) -> Option<NavEvent> {
+        if let Some((last, last_source, at)) = &self.last_nav
+            && *last == nav
+            && *last_source != source
+            && at.elapsed() < CROSS_DEVICE_DEDUP_WINDOW
+        {
+            tracing::debug!(
+                ?nav,
+                ?source,
+                "Suppressing cross-device duplicate nav event"
+            );
+            return None;
+        }
+        self.last_nav = Some((nav.clone(), source, Instant::now()));
+        Some(nav)
     }
 
     /// Emits stick repeats; call once per frame.
@@ -209,5 +255,78 @@ mod tests {
         let mut mapper = InputMapper::new();
         assert_eq!(mapper.map(&axis_event(Axis::LeftY, 4000)), None);
         assert_eq!(mapper.tick(), None);
+    }
+
+    fn pad_button(which: u32, button: Button) -> Event {
+        Event::ControllerButtonDown {
+            timestamp: 0,
+            which,
+            button,
+        }
+    }
+
+    fn key_down(keycode: Keycode) -> Event {
+        Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(keycode),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::NOMOD,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn cross_device_echo_is_suppressed() {
+        let mut mapper = InputMapper::new();
+
+        // One physical D-pad press, echoed by Steam's virtual pad and
+        // its synthesized arrow key: only the first event survives.
+        assert_eq!(
+            mapper.map(&pad_button(0, Button::DPadDown)),
+            Some(NavEvent::Down)
+        );
+        assert_eq!(mapper.map(&pad_button(1, Button::DPadDown)), None);
+        assert_eq!(mapper.map(&key_down(Keycode::Down)), None);
+
+        // B echoed as Escape (Steam desktop layout).
+        assert_eq!(mapper.map(&pad_button(0, Button::B)), Some(NavEvent::Back));
+        assert_eq!(mapper.map(&key_down(Keycode::Escape)), None);
+    }
+
+    #[test]
+    fn same_device_presses_pass_through() {
+        let mut mapper = InputMapper::new();
+
+        // Two rapid presses on the SAME device are two real inputs.
+        assert_eq!(
+            mapper.map(&pad_button(0, Button::DPadDown)),
+            Some(NavEvent::Down)
+        );
+        assert_eq!(
+            mapper.map(&pad_button(0, Button::DPadDown)),
+            Some(NavEvent::Down)
+        );
+
+        // A different nav event from another device is not a duplicate.
+        assert_eq!(
+            mapper.map(&pad_button(1, Button::DPadUp)),
+            Some(NavEvent::Up)
+        );
+    }
+
+    #[test]
+    fn echo_after_window_passes_through() {
+        let mut mapper = InputMapper::new();
+        assert_eq!(
+            mapper.map(&pad_button(0, Button::DPadDown)),
+            Some(NavEvent::Down)
+        );
+        std::thread::sleep(CROSS_DEVICE_DEDUP_WINDOW + Duration::from_millis(10));
+        assert_eq!(
+            mapper.map(&key_down(Keycode::Down)),
+            Some(NavEvent::Down),
+            "a press on another device after the window is a real input"
+        );
     }
 }
