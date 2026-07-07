@@ -28,8 +28,15 @@ use tracing::{debug, info, warn};
 
 /// Devices worth forwarding wholesale: Valve controller hardware, which
 /// Steam refuses to see through virtual recreations.
-/// (wired Steam Controller, wireless dongle, Steam Deck)
-const FORWARDED_DEVICES: [(u16, u16); 3] = [(0x28de, 0x1102), (0x28de, 0x1142), (0x28de, 0x1205)];
+/// (wired Steam Controller, wireless dongle)
+///
+/// The Steam Deck's built-in controller (0x28de:0x1205) is deliberately
+/// NOT listed: on a client machine that device can only be the local
+/// Deck's own controls, and tunneling it away would take the trackpads
+/// and buttons from local Steam Input mid-session. Deck input reaches
+/// the server through Steam Input's virtual pad (evdev pass-through)
+/// and synthesized mouse/keyboard events instead.
+const FORWARDED_DEVICES: [(u16, u16); 2] = [(0x28de, 0x1102), (0x28de, 0x1142)];
 
 /// How often to rescan for forwardable devices (hotplug support).
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);

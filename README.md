@@ -91,6 +91,11 @@ Add the AppImage as a non-Steam game. Two things matter:
 
 If the client still fails to start from Steam, check `~/.config/stargaze/client.log` — the client mirrors its stderr output there precisely because Steam swallows it.
 
+#### Steam Deck controls
+
+- **Ending a session**: hold **View (Select) + Menu (Start)** together for one second — the controller equivalent of `Ctrl+Alt+Shift+Q`. Works for both pass-through and emulated controllers; the launcher itself is fully D-pad/touch navigable.
+- **Mouse on a remote desktop**: in gaming mode every Deck input goes through Steam Input, and the default gamepad layout generates *no mouse events at all* — the remote desktop looks unresponsive even though the controller is forwarded fine. Open the controller settings for stargaze in Steam and pick the official **"Gamepad with Mouse Trackpad"** layout (or map the right trackpad to Mouse yourself). Trackpad motion then arrives as real mouse events, which stargaze forwards to the remote session; the rest of the controller keeps working as a gamepad for remote games.
+
 ## Usage
 
 On the host machine:
