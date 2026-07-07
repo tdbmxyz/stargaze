@@ -213,11 +213,30 @@ fn has_session_overrides(cli: &Cli) -> bool {
         || cli.codec.is_some()
 }
 
-/// True when running inside a gamescope session (Steam Deck gaming
-/// mode, or a nested gamescope on a desktop).
-fn running_under_gamescope() -> bool {
-    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|v| v.eq_ignore_ascii_case("gamescope"))
-        || std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some()
+/// Prefers SDL's x11 video driver whenever an X display is reachable
+/// and the user hasn't chosen a driver explicitly.
+///
+/// Gamescope (Steam Deck gaming mode) only displays clients that come
+/// in through XWayland — native Wayland surfaces need gamescope's
+/// --expose-wayland and are otherwise never shown — while SDL3 (under
+/// sdl2-compat) picks Wayland whenever WAYLAND_DISPLAY is set, so the
+/// launcher ran invisibly. Detecting gamescope by environment proved
+/// unreliable (Steam doesn't pass XDG_CURRENT_DESKTOP=gamescope to the
+/// game), so key on DISPLAY instead: X11 works wherever it is set
+/// (gaming mode, desktop Wayland sessions via XWayland, plain X11),
+/// and pure-Wayland hosts without XWayland leave it unset and keep
+/// SDL's default.
+fn prefer_x11_video_driver() {
+    fn env_nonempty(name: &str) -> bool {
+        std::env::var_os(name).is_some_and(|v| !v.is_empty())
+    }
+    let explicit = env_nonempty("SDL_VIDEODRIVER") || env_nonempty("SDL_VIDEO_DRIVER");
+    if !explicit && env_nonempty("DISPLAY") {
+        info!("X display available: preferring the x11 SDL video driver");
+        // Old and new hint names; sdl2-compat forwards both to SDL3.
+        sdl2::hint::set("SDL_VIDEODRIVER", "x11");
+        sdl2::hint::set("SDL_VIDEO_DRIVER", "x11");
+    }
 }
 
 #[tokio::main]
@@ -241,19 +260,7 @@ async fn main() -> anyhow::Result<()> {
     let direct = cli.server.is_some()
         || (!cli.gui && !cfg.server_address.is_empty() && cfg.hosts.is_empty());
 
-    // Gamescope (Steam Deck gaming mode) only displays clients that come
-    // in through XWayland — native Wayland surfaces need gamescope's
-    // --expose-wayland and are otherwise never shown. SDL3 (under
-    // sdl2-compat) prefers Wayland whenever WAYLAND_DISPLAY is set, so
-    // the launcher would run invisibly. Force X11 there; an explicit
-    // SDL_VIDEODRIVER/SDL_VIDEO_DRIVER environment variable still wins
-    // (SDL gives the environment priority over normal hints).
-    if running_under_gamescope() {
-        info!("Gamescope session detected: preferring the x11 SDL video driver");
-        // Old and new hint names; sdl2-compat forwards both to SDL3.
-        sdl2::hint::set("SDL_VIDEODRIVER", "x11");
-        sdl2::hint::set("SDL_VIDEO_DRIVER", "x11");
-    }
+    prefer_x11_video_driver();
 
     // SDL2 must be initialized on the main thread.
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
