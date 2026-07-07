@@ -24,7 +24,7 @@ use crate::transport::{self, ConnectedSession};
 const HOST_LIST_EXTRA: usize = 3; // Add host, Settings, Quit
 
 /// Fields on the host-edit screen.
-const EDIT_FIELDS: usize = 8; // name, address, port, resolution, fps, codec, save, cancel
+const EDIT_FIELDS: usize = 9; // name, address, port, resolution, fps, bitrate, codec, save, cancel
 
 /// Rows on the settings screen.
 const SETTINGS_ROWS: usize = 5; // 4 toggles + back
@@ -64,6 +64,8 @@ enum Screen {
         resolution_text: String,
         /// Framerate edited as free-form text (digits only).
         fps_text: String,
+        /// Bitrate in Mbps edited as free-form text (digits only, 0 = server default).
+        bitrate_text: String,
         focus: FocusList,
         /// A text field is in editing mode.
         editing: bool,
@@ -211,6 +213,7 @@ impl Model {
             port_text,
             resolution_text,
             fps_text,
+            bitrate_text,
             focus,
             editing,
         } = &mut self.screen
@@ -222,9 +225,10 @@ impl Model {
         const FIELD_PORT: usize = 2;
         const FIELD_RESOLUTION: usize = 3;
         const FIELD_FPS: usize = 4;
-        const FIELD_CODEC: usize = 5;
-        const FIELD_SAVE: usize = 6;
-        const FIELD_CANCEL: usize = 7;
+        const FIELD_BITRATE: usize = 5;
+        const FIELD_CODEC: usize = 6;
+        const FIELD_SAVE: usize = 7;
+        const FIELD_CANCEL: usize = 8;
 
         if *editing {
             // A text field owns the input until Activate/Back.
@@ -236,13 +240,14 @@ impl Model {
                         FIELD_PORT => port_text,
                         FIELD_RESOLUTION => resolution_text,
                         FIELD_FPS => fps_text,
+                        FIELD_BITRATE => bitrate_text,
                         _ => unreachable!("editing a non-text field"),
                     };
                     for ch in s.chars() {
                         let ch = if ch == 'X' { 'x' } else { ch };
                         let ok = match focus.focus {
                             FIELD_PORT => ch.is_ascii_digit() && target.len() < 5,
-                            FIELD_FPS => ch.is_ascii_digit() && target.len() < 4,
+                            FIELD_FPS | FIELD_BITRATE => ch.is_ascii_digit() && target.len() < 4,
                             FIELD_RESOLUTION => {
                                 (ch.is_ascii_digit() || ch == 'x') && target.len() < 10
                             }
@@ -261,6 +266,7 @@ impl Model {
                         FIELD_PORT => port_text,
                         FIELD_RESOLUTION => resolution_text,
                         FIELD_FPS => fps_text,
+                        FIELD_BITRATE => bitrate_text,
                         _ => unreachable!("editing a non-text field"),
                     };
                     target.pop();
@@ -297,7 +303,8 @@ impl Model {
                 }
             }
             NavEvent::Activate => match focus.focus {
-                FIELD_NAME | FIELD_ADDRESS | FIELD_PORT | FIELD_RESOLUTION | FIELD_FPS => {
+                FIELD_NAME | FIELD_ADDRESS | FIELD_PORT | FIELD_RESOLUTION | FIELD_FPS
+                | FIELD_BITRATE => {
                     *editing = true;
                     return Effect::EditingChanged(true);
                 }
@@ -333,9 +340,21 @@ impl Model {
                             return Effect::None;
                         }
                     };
+                    // Empty = 0 = server default.
+                    let bitrate = match bitrate_text.parse::<u32>() {
+                        _ if bitrate_text.is_empty() => 0,
+                        Ok(mbps) if mbps <= 500 => mbps,
+                        _ => {
+                            self.error = Some(format!(
+                                "Invalid bitrate: {bitrate_text} (Mbps, 0 = server default)"
+                            ));
+                            return Effect::None;
+                        }
+                    };
                     draft.port = port;
                     draft.resolution = resolution;
                     draft.framerate = fps;
+                    draft.bitrate = bitrate;
                     let committed = draft.clone();
                     let index = *index;
                     match index {
@@ -421,12 +440,14 @@ fn new_host_edit(index: Option<usize>, draft: HostEntry) -> Screen {
     let port_text = draft.port.to_string();
     let resolution_text = draft.resolution.to_string();
     let fps_text = draft.framerate.to_string();
+    let bitrate_text = draft.bitrate.to_string();
     Screen::HostEdit {
         index,
         draft,
         port_text,
         resolution_text,
         fps_text,
+        bitrate_text,
         focus: FocusList::new(EDIT_FIELDS),
         editing: false,
     }
@@ -456,6 +477,7 @@ fn draw(model: &Model, connecting: Option<&str>, ui: &mut Ui) {
             port_text,
             resolution_text,
             fps_text,
+            bitrate_text,
             focus,
             editing,
         } => {
@@ -463,6 +485,7 @@ fn draw(model: &Model, connecting: Option<&str>, ui: &mut Ui) {
                 port: port_text,
                 resolution: resolution_text,
                 fps: fps_text,
+                bitrate: bitrate_text,
             };
             draw_host_edit(*index, draft, &texts, focus, *editing, ui);
         }
@@ -523,6 +546,7 @@ struct EditTexts<'a> {
     port: &'a str,
     resolution: &'a str,
     fps: &'a str,
+    bitrate: &'a str,
 }
 
 fn draw_host_edit(
@@ -564,9 +588,16 @@ fn draw_host_edit(
         f == 4,
         editing && f == 4,
     );
-    ui.choice(rects[5], "Codec", &draft.codec.to_string(), f == 5);
-    ui.button(rects[6], "Save", f == 6);
-    ui.button(rects[7], "Cancel", f == 7);
+    ui.text_field(
+        rects[5],
+        "Bitrate (Mbps, 0 = server default)",
+        texts.bitrate,
+        f == 5,
+        editing && f == 5,
+    );
+    ui.choice(rects[6], "Codec", &draft.codec.to_string(), f == 6);
+    ui.button(rects[7], "Save", f == 7);
+    ui.button(rects[8], "Cancel", f == 8);
     ui.hint_bar("A/Enter edit or apply   ◄ ► change codec   B/Esc back");
 }
 
@@ -608,6 +639,7 @@ fn session_config(cfg: &ClientConfig, host: &HostEntry) -> ClientConfig {
     session.port = host.port;
     session.resolution = host.resolution;
     session.framerate = host.framerate;
+    session.bitrate = host.bitrate;
     session.codec = host.codec;
     session
 }
@@ -800,6 +832,7 @@ pub fn run_launcher(
                             height: host.resolution.height,
                             framerate: host.framerate,
                             codec: host.codec,
+                            bitrate_mbps: host.bitrate,
                         };
                         let (tx, rx) = std::sync::mpsc::channel();
                         let connect_cfg = session_cfg.clone();
@@ -922,8 +955,8 @@ mod tests {
             Effect::EditingChanged(false)
         );
 
-        // Down to Save (address=1 → save=6).
-        for _ in 0..5 {
+        // Down to Save (address=1 → save=7).
+        for _ in 0..6 {
             model.update(&NavEvent::Down);
         }
         assert_eq!(model.update(&NavEvent::Activate), Effect::Save);
@@ -936,7 +969,7 @@ mod tests {
     fn save_with_empty_address_shows_error() {
         let mut model = model_with_hosts(0);
         model.update(&NavEvent::Activate); // open Add host
-        for _ in 0..6 {
+        for _ in 0..7 {
             model.update(&NavEvent::Down);
         }
         assert_eq!(model.update(&NavEvent::Activate), Effect::None);
@@ -953,8 +986,8 @@ mod tests {
             model.screen,
             Screen::HostEdit { index: Some(1), .. }
         ));
-        // Cycle codec (field 5) then save.
-        for _ in 0..5 {
+        // Cycle codec (field 6) then save.
+        for _ in 0..6 {
             model.update(&NavEvent::Down);
         }
         model.update(&NavEvent::Right);
@@ -1029,7 +1062,8 @@ mod tests {
         model.update(&NavEvent::Text("144".to_string()));
         model.update(&NavEvent::Activate);
 
-        // Save (field 6).
+        // Save (field 7).
+        model.update(&NavEvent::Down);
         model.update(&NavEvent::Down);
         model.update(&NavEvent::Down);
         assert_eq!(model.update(&NavEvent::Activate), Effect::Save);
@@ -1041,6 +1075,43 @@ mod tests {
             }
         );
         assert_eq!(model.cfg.hosts[0].framerate, 144);
+    }
+
+    #[test]
+    fn bitrate_field_saves_and_rejects_out_of_range() {
+        let mut model = model_with_hosts(1);
+        model.update(&NavEvent::Edit);
+
+        // Bitrate (field 5): set 25 Mbps.
+        for _ in 0..5 {
+            model.update(&NavEvent::Down);
+        }
+        model.update(&NavEvent::Activate);
+        model.update(&NavEvent::Backspace); // clear the default "0"
+        model.update(&NavEvent::Text("25".to_string()));
+        model.update(&NavEvent::Activate);
+
+        // Save (field 7).
+        model.update(&NavEvent::Down);
+        model.update(&NavEvent::Down);
+        assert_eq!(model.update(&NavEvent::Activate), Effect::Save);
+        assert_eq!(model.cfg.hosts[0].bitrate, 25);
+
+        // Out of range (>500) blocks the save.
+        model.update(&NavEvent::Edit);
+        for _ in 0..5 {
+            model.update(&NavEvent::Down);
+        }
+        model.update(&NavEvent::Activate);
+        for _ in 0..4 {
+            model.update(&NavEvent::Backspace);
+        }
+        model.update(&NavEvent::Text("501".to_string()));
+        model.update(&NavEvent::Activate);
+        model.update(&NavEvent::Down);
+        model.update(&NavEvent::Down);
+        assert_eq!(model.update(&NavEvent::Activate), Effect::None);
+        assert!(model.error.is_some());
     }
 
     #[test]
@@ -1060,7 +1131,7 @@ mod tests {
         model.update(&NavEvent::Activate);
 
         // Jump to Save.
-        for _ in 0..3 {
+        for _ in 0..4 {
             model.update(&NavEvent::Down);
         }
         assert_eq!(model.update(&NavEvent::Activate), Effect::None);
@@ -1068,7 +1139,7 @@ mod tests {
         assert!(matches!(model.screen, Screen::HostEdit { .. }));
 
         // Fix the resolution but break the fps.
-        for _ in 0..3 {
+        for _ in 0..4 {
             model.update(&NavEvent::Up);
         }
         model.update(&NavEvent::Activate);
@@ -1081,6 +1152,7 @@ mod tests {
         }
         model.update(&NavEvent::Text("0".to_string()));
         model.update(&NavEvent::Activate);
+        model.update(&NavEvent::Down);
         model.update(&NavEvent::Down);
         model.update(&NavEvent::Down);
         assert_eq!(model.update(&NavEvent::Activate), Effect::None);
@@ -1115,6 +1187,7 @@ mod tests {
                 height: 1440,
             },
             framerate: 90,
+            bitrate: 30,
             codec: Codec::Av1,
         };
         let session = session_config(&cfg, &host);

@@ -348,16 +348,19 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
 ///
 /// Returns `EncodeError` if a fatal encoding error occurs. Non-fatal errors
 /// (e.g., a single frame upload failure) are logged and skipped.
-#[allow(clippy::unnecessary_wraps)]
+#[allow(clippy::unnecessary_wraps, clippy::too_many_arguments)]
 pub(crate) fn run_encode_loop(
     encoder: &mut FfmpegEncoder,
+    config: &EncoderConfig,
     frames: &mut mpsc::Receiver<CapturedFrame>,
     packets_tx: &mpsc::Sender<EncodedPacket>,
     shutdown: &Arc<AtomicBool>,
     mut idr_rx: watch::Receiver<u64>,
+    mut bitrate_rx: watch::Receiver<u32>,
 ) -> Result<(), EncodeError> {
     let mut frame_counter: u64 = 0;
     let mut last_idr_value: u64 = 0;
+    let mut current_bitrate = config.bitrate_mbps;
     let mut packet = ffmpeg_next::Packet::empty();
 
     info!("Encoder loop started, waiting for frames from capture pipeline");
@@ -375,6 +378,35 @@ pub(crate) fn run_encode_loop(
             break;
         };
         let frame = captured.frame;
+
+        // Session requested a different bitrate: NVENC has no runtime
+        // rate-control reconfiguration through FFmpeg, so rebuild the
+        // encoder context. Happens at most once per session handshake
+        // (~100 ms hiccup); the fresh encoder starts with an IDR and
+        // new extradata, so the client picks up seamlessly.
+        let requested_bitrate = *bitrate_rx.borrow_and_update();
+        if requested_bitrate != current_bitrate && requested_bitrate > 0 {
+            info!(
+                from = current_bitrate,
+                to = requested_bitrate,
+                "Rebuilding encoder for session-requested bitrate"
+            );
+            let new_config = EncoderConfig {
+                bitrate_mbps: requested_bitrate,
+                ..config.clone()
+            };
+            match init_encoder(&new_config) {
+                Ok(new_encoder) => {
+                    *encoder = new_encoder;
+                    current_bitrate = requested_bitrate;
+                }
+                Err(e) => {
+                    warn!("Encoder rebuild failed ({e}); keeping {current_bitrate} Mbps");
+                    // Don't retry every frame.
+                    current_bitrate = requested_bitrate;
+                }
+            }
+        }
 
         // Check if an IDR keyframe was requested.
         let current_idr = *idr_rx.borrow_and_update();

@@ -75,6 +75,10 @@ struct Cli {
     #[arg(long)]
     fps: Option<u32>,
 
+    /// Requested bitrate in Mbps (0 or omitted = server default).
+    #[arg(long)]
+    bitrate: Option<u32>,
+
     /// Video codec to request: h265 or av1 [default: h265].
     #[arg(long)]
     codec: Option<Codec>,
@@ -194,6 +198,9 @@ fn apply_cli_overrides(cfg: &mut ClientConfig, cli: &Cli) {
     if let Some(fps) = cli.fps {
         cfg.framerate = fps;
     }
+    if let Some(bitrate) = cli.bitrate {
+        cfg.bitrate = bitrate;
+    }
     if let Some(codec) = cli.codec {
         cfg.codec = codec;
     }
@@ -210,6 +217,7 @@ fn has_session_overrides(cli: &Cli) -> bool {
         || cli.usb_forward.is_some()
         || cli.resolution.is_some()
         || cli.fps.is_some()
+        || cli.bitrate.is_some()
         || cli.codec.is_some()
 }
 
@@ -281,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
             height: cfg.resolution.height,
             framerate: cfg.framerate,
             codec: cfg.codec,
+            bitrate_mbps: cfg.bitrate,
         };
         let conn = transport::connect(&cfg, session_request).await?;
         session::run_session(&sdl, &cfg, conn, cli.stats_file.clone()).await?;
@@ -294,7 +303,7 @@ async fn main() -> anyhow::Result<()> {
     // must not be silently persisted into client.toml.
     if has_session_overrides(&cli) {
         warn!(
-            "Per-session flags (--fps/--resolution/--codec/toggles) are ignored in launcher \
+            "Per-session flags (--fps/--resolution/--bitrate/--codec/toggles) are ignored in launcher \
              mode; use the launcher's settings, or --server for a direct connection"
         );
     }

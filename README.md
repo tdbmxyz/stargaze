@@ -150,6 +150,7 @@ name = "zeus"
 address = "192.168.1.10"   # IP or DNS name
 port = 9000
 framerate = 60
+bitrate = 20            # Mbps; 0 = server default (WiFi clients: 15-25)
 codec = "h265"
 
 [hosts.resolution]
