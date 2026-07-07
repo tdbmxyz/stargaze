@@ -667,6 +667,21 @@ pub fn run_launcher(
     let mut model = Model::new(cfg.clone(), last_error);
     let mut mapper = InputMapper::new();
     let mut pads: Vec<sdl2::controller::GameController> = Vec::new();
+    // SDL announces already-present controllers only once per subsystem
+    // init, and a previous launcher pass or session has consumed those
+    // events — enumerate instead. Duplicate ControllerDeviceAdded events
+    // on the very first pass are deduped by instance id below.
+    if let Ok(count) = controllers.num_joysticks() {
+        for index in 0..count {
+            if controllers.is_game_controller(index)
+                && let Ok(pad) = controllers.open(index)
+                && !pads.iter().any(|p| p.instance_id() == pad.instance_id())
+            {
+                info!("Launcher: controller connected: {}", pad.name());
+                pads.push(pad);
+            }
+        }
+    }
     // In-flight connection attempt: result receiver, abort handle, the
     // session config snapshot it was started with, and a display name.
     struct Connecting {
@@ -701,7 +716,9 @@ pub fn run_launcher(
                     return Ok(LauncherOutcome::Quit);
                 }
                 sdl2::event::Event::ControllerDeviceAdded { which, .. } => {
-                    if let Ok(pad) = controllers.open(*which) {
+                    if let Ok(pad) = controllers.open(*which)
+                        && !pads.iter().any(|p| p.instance_id() == pad.instance_id())
+                    {
                         info!("Launcher: controller connected: {}", pad.name());
                         pads.push(pad);
                     }

@@ -593,6 +593,150 @@ mod tests {
     /// ```bash
     /// cargo test --package stargaze-server -- --ignored test_nvenc_idr_request
     /// ```
+    /// Reproduces the client's "gray flash" bug: after packet loss, the
+    /// recovery IDR is rejected by the hevc decoder with "Duplicate POC
+    /// in a sequence: 0" (the session's first IDR, also POC 0, still
+    /// occupies the DPB) unless the decoder is flushed before feeding a
+    /// keyframe. Encodes a real NVENC stream, drops a range of delta
+    /// frames the way the client's assembler skips lost frames, and
+    /// decodes the survivors both ways.
+    ///
+    /// Run manually with:
+    /// ```bash
+    /// cargo test --package stargaze-server -- --ignored test_decode_recovery --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires NVIDIA GPU with NVENC support"]
+    async fn test_decode_recovery_after_loss() {
+        use stargaze_core::capture::{Frame, PixelFormat};
+        use stargaze_core::encode::{EncodedPacket, EncoderConfig};
+        use tokio::sync::mpsc;
+
+        init_tracing();
+
+        let width = 640u32;
+        let height = 480u32;
+        let num_frames = 90u32;
+        // Deltas skipped by the assembler after network loss; the IDR
+        // requested at 60 is the recovery keyframe.
+        let lost = 20usize..40;
+
+        let (frames_tx, frames_rx) = mpsc::channel::<stargaze_core::capture::CapturedFrame>(4);
+        let encoder_config = EncoderConfig {
+            width,
+            height,
+            framerate: 30,
+            bitrate_mbps: 2,
+            tuning: stargaze_core::config::EncoderTuning::default(),
+        };
+        let (encoder_session, mut packets, idr_tx) =
+            encode::start_encoder(encoder_config, frames_rx)
+                .expect("encoder should initialize with NVIDIA GPU");
+
+        let feed_handle = tokio::spawn(async move {
+            let stride = width * 4;
+            for i in 0..num_frames {
+                if i == 60 {
+                    let _ = idr_tx.send(1);
+                }
+                // Vary content so deltas are non-trivial.
+                let data = vec![((i * 7) % 256) as u8; (stride * height) as usize];
+                let frame = Frame::CpuMapped {
+                    data,
+                    width,
+                    height,
+                    stride,
+                    format: PixelFormat::Bgra8,
+                };
+                if frames_tx.send(frame.into()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut encoded: Vec<EncodedPacket> = Vec::new();
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(30));
+        tokio::pin!(timeout);
+        loop {
+            tokio::select! {
+                pkt = packets.recv() => match pkt {
+                    Some(p) => encoded.push(p),
+                    None => break,
+                },
+                () = &mut timeout => panic!("Timed out — got {} packets", encoded.len()),
+            }
+        }
+        feed_handle.await.expect("frame feed task should not panic");
+        encoder_session.stop().expect("encoder should stop cleanly");
+
+        let recovery_idx = encoded
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, p)| p.is_keyframe)
+            .map(|(i, _)| i)
+            .expect("a recovery keyframe past the first");
+        assert!(
+            recovery_idx >= lost.end,
+            "recovery IDR ({recovery_idx}) must come after the lost range"
+        );
+
+        // The stream the client's decoder would see: complete frames
+        // only, lost ones skipped.
+        let survivors: Vec<&EncodedPacket> = encoded
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !lost.contains(i))
+            .map(|(_, p)| p)
+            .collect();
+
+        fn decode_stream(packets: &[&EncodedPacket], flush_before_keyframe: bool) -> usize {
+            let codec = ffmpeg_next::codec::decoder::find(ffmpeg_next::codec::Id::HEVC)
+                .expect("hevc decoder");
+            let ctx = ffmpeg_next::codec::context::Context::new_with_codec(codec);
+            let mut decoder = ctx.decoder().video().expect("video decoder");
+            let mut output = 0usize;
+            for pkt in packets {
+                if pkt.is_keyframe && flush_before_keyframe {
+                    decoder.flush();
+                }
+                let mut packet = ffmpeg_next::Packet::copy(&pkt.data);
+                packet.set_pts(Some(pkt.pts.cast_signed()));
+                if decoder.send_packet(&packet).is_err() {
+                    continue;
+                }
+                let mut frame = ffmpeg_next::frame::Video::empty();
+                while decoder.receive_frame(&mut frame).is_ok() {
+                    output += 1;
+                }
+            }
+            let _ = decoder.send_eof();
+            let mut frame = ffmpeg_next::frame::Video::empty();
+            while decoder.receive_frame(&mut frame).is_ok() {
+                output += 1;
+            }
+            output
+        }
+
+        let without_flush = decode_stream(&survivors, false);
+        let with_flush = decode_stream(&survivors, true);
+        eprintln!(
+            "survivors={} decoded without flush={without_flush} with flush={with_flush}",
+            survivors.len()
+        );
+
+        // With the flush, every surviving frame must decode — including
+        // the recovery IDR. Without it, the IDR is rejected (Duplicate
+        // POC) and the count comes up short; we only assert the fixed
+        // behavior so the diagnostic keeps passing either way ffmpeg
+        // evolves.
+        assert_eq!(
+            with_flush,
+            survivors.len(),
+            "flushing before keyframes must make every surviving frame decodable"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires NVIDIA GPU with NVENC support"]
     async fn test_nvenc_idr_request() {

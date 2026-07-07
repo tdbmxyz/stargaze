@@ -49,6 +49,52 @@ const READER_POLL_TIMEOUT_MS: i32 = 250;
 /// Valve's USB vendor id (Steam Controller, Steam Deck, dongles).
 const VALVE_VENDOR_ID: u16 = 0x28de;
 
+/// How long Select+Start must be held together to end the session —
+/// the controller-only equivalent of Ctrl+Alt+Shift+Q, for devices
+/// without a keyboard (Steam Deck).
+pub const QUIT_CHORD_HOLD: Duration = Duration::from_secs(1);
+
+/// Tracks the Select+Start "end session" chord on one input device.
+///
+/// The presses themselves are still forwarded to the server (they
+/// can't be retracted once the chord completes); the remote side sees
+/// a Select+Start tap before the session ends.
+#[derive(Debug, Default)]
+pub struct QuitChord {
+    select_since: Option<std::time::Instant>,
+    start_since: Option<std::time::Instant>,
+}
+
+impl QuitChord {
+    pub fn set_select(&mut self, pressed: bool) {
+        Self::set(&mut self.select_since, pressed);
+    }
+
+    pub fn set_start(&mut self, pressed: bool) {
+        Self::set(&mut self.start_since, pressed);
+    }
+
+    fn set(slot: &mut Option<std::time::Instant>, pressed: bool) {
+        if pressed {
+            if slot.is_none() {
+                *slot = Some(std::time::Instant::now());
+            }
+        } else {
+            *slot = None;
+        }
+    }
+
+    /// True once both buttons have been held together for
+    /// [`QUIT_CHORD_HOLD`].
+    #[must_use]
+    pub fn fired(&self) -> bool {
+        match (self.select_since, self.start_since) {
+            (Some(a), Some(b)) => a.max(b).elapsed() >= QUIT_CHORD_HOLD,
+            _ => false,
+        }
+    }
+}
+
 /// Identifies who owns a pad slot: the SDL emulation path (keyed by SDL
 /// joystick instance id) or the evdev pass-through path (keyed by the
 /// device node path).
@@ -87,6 +133,9 @@ pub struct SharedGamepads {
     /// Bumped whenever the grabbed set changes, so the SDL loop can
     /// cheaply detect that a device it emulates was taken over.
     generation: AtomicU64,
+    /// Set when a pass-through reader sees the Select+Start quit chord;
+    /// the render loop polls it and ends the session.
+    quit_requested: AtomicBool,
 }
 
 impl SharedGamepads {
@@ -101,7 +150,20 @@ impl SharedGamepads {
                 lost: HashSet::new(),
             }),
             generation: AtomicU64::new(0),
+            quit_requested: AtomicBool::new(false),
         })
+    }
+
+    /// Signals that the user asked to end the session via the
+    /// controller quit chord.
+    pub fn request_quit(&self) {
+        self.quit_requested.store(true, Ordering::Relaxed);
+    }
+
+    /// True when the controller quit chord fired on any device.
+    #[must_use]
+    pub fn quit_requested(&self) -> bool {
+        self.quit_requested.load(Ordering::Relaxed)
     }
 
     /// Assigns the lowest free slot to `key` and returns it.
@@ -479,6 +541,7 @@ fn read_loop(
     descriptor: &GamepadDescriptor,
     stop: &Arc<AtomicBool>,
 ) {
+    let mut quit_chord = QuitChord::default();
     loop {
         if stop.load(Ordering::Relaxed) {
             info!(
@@ -488,6 +551,16 @@ fn read_loop(
             );
             let _ = device.ungrab();
             break;
+        }
+        // Checked every iteration (events or poll timeout) so a held
+        // chord fires within one poll interval of the hold elapsing.
+        if quit_chord.fired() && !shared.quit_requested() {
+            info!(
+                pad,
+                name = %descriptor.name,
+                "Select+Start held: requesting session end"
+            );
+            shared.request_quit();
         }
         if !wait_readable(&device) {
             continue;
@@ -509,6 +582,15 @@ fn read_loop(
                     .collect();
                 if batch.is_empty() {
                     continue;
+                }
+                for ev in &batch {
+                    if ev.event_type == evdev::EventType::KEY.0 {
+                        if ev.code == KeyCode::BTN_SELECT.code() {
+                            quit_chord.set_select(ev.value != 0);
+                        } else if ev.code == KeyCode::BTN_START.code() {
+                            quit_chord.set_start(ev.value != 0);
+                        }
+                    }
                 }
                 if input_tx
                     .send(InputEvent::GamepadPassthroughEvents { pad, events: batch })
@@ -537,6 +619,38 @@ fn read_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quit_chord_requires_both_buttons_held() {
+        let mut chord = QuitChord::default();
+        assert!(!chord.fired());
+
+        chord.set_select(true);
+        chord.set_start(true);
+        assert!(!chord.fired(), "hold time not elapsed yet");
+
+        // Backdate both presses past the hold requirement.
+        let past = std::time::Instant::now() - QUIT_CHORD_HOLD * 2;
+        chord.select_since = Some(past);
+        chord.start_since = Some(past);
+        assert!(chord.fired());
+
+        // Releasing either button cancels the chord.
+        chord.set_start(false);
+        assert!(!chord.fired());
+
+        // Re-pressing restarts the hold from now.
+        chord.set_start(true);
+        assert!(!chord.fired());
+    }
+
+    #[test]
+    fn quit_flag_starts_clear_and_latches() {
+        let shared = SharedGamepads::new();
+        assert!(!shared.quit_requested());
+        shared.request_quit();
+        assert!(shared.quit_requested());
+    }
 
     #[test]
     fn slots_allocate_lowest_free_and_reuse() {

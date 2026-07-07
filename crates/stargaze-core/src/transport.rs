@@ -198,6 +198,12 @@ pub struct ReassembledFrame {
     pub encode_us: u32,
     /// When the frame finished reassembling on the client.
     pub received_at: std::time::Instant,
+    /// True when this frame was delivered while video continuity was
+    /// broken (a frame before it was lost and no keyframe has arrived
+    /// yet). Decoding it would predict from missing references — ffmpeg
+    /// fabricates gray placeholder frames — so the client drops tainted
+    /// deltas and freezes on the last good picture instead.
+    pub tainted: bool,
 }
 
 /// Errors from the transport subsystem.
@@ -441,6 +447,7 @@ mod tests {
             convert_us: 0,
             encode_us: 0,
             received_at: std::time::Instant::now(),
+            tainted: false,
         };
         assert_eq!(frame.data.len(), 3);
         assert_eq!(frame.pts, 100);

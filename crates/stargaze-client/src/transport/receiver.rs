@@ -313,6 +313,9 @@ impl FrameAssembler {
             convert_us: pending.convert_us,
             encode_us: pending.encode_us,
             received_at: Instant::now(),
+            // Delivered mid-recovery: decoding this delta would predict
+            // from missing references (ffmpeg substitutes gray frames).
+            tainted: self.awaiting_keyframe && !pending.is_keyframe,
         })
     }
 
@@ -502,6 +505,20 @@ pub(crate) async fn receive_loop(
                                 .video_bytes
                                 .fetch_add(frame.data.len() as u64, Ordering::Relaxed);
                             net_stats.video_frames.fetch_add(1, Ordering::Relaxed);
+
+                            // A delta delivered while recovery is pending
+                            // can only decode into gray-smeared garbage
+                            // (its references were lost). Freeze on the
+                            // last good frame instead of displaying it;
+                            // the pending IDR restarts decoding cleanly.
+                            if frame.tainted {
+                                net_stats.video_dropped.fetch_add(1, Ordering::Relaxed);
+                                debug!(
+                                    pts = frame.pts,
+                                    "Dropping tainted video frame (awaiting keyframe)"
+                                );
+                                continue;
+                            }
 
                             // Non-blocking send: if the decoder is behind,
                             // drop the frame rather than stalling datagram
@@ -955,6 +972,32 @@ mod tests {
         let (frames, _) = assembler.process_datagram(&video_header(3, 1, 2, 3, false), vec![1]);
         assert!(frames.is_empty());
         assert_eq!(assembler.next_frame[&STREAM_TYPE_VIDEO], newest + 1);
+    }
+
+    #[test]
+    fn frames_after_gap_are_tainted_until_keyframe() {
+        let mut assembler = FrameAssembler::new();
+
+        // Keyframe 0 delivered clean.
+        let (frames, _) = assembler.process_datagram(&video_header(0, 0, 1, 0, true), vec![1]);
+        assert!(!frames[0].tainted);
+
+        // Frame 1 lost; frames 2 and 3 arrive → gap skipped, both
+        // delivered tainted (their references are gone).
+        assembler.process_datagram(&video_header(2, 0, 1, 2, false), vec![2]);
+        let (frames, _) = assembler.process_datagram(&video_header(3, 0, 1, 3, false), vec![3]);
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|f| f.tainted));
+
+        // Still tainted until a keyframe arrives.
+        let (frames, _) = assembler.process_datagram(&video_header(4, 0, 1, 4, false), vec![4]);
+        assert!(frames[0].tainted);
+
+        // The recovery keyframe itself is clean, and so is what follows.
+        let (frames, _) = assembler.process_datagram(&video_header(5, 0, 1, 5, true), vec![5]);
+        assert!(!frames[0].tainted);
+        let (frames, _) = assembler.process_datagram(&video_header(6, 0, 1, 6, false), vec![6]);
+        assert!(!frames[0].tainted);
     }
 
     #[test]

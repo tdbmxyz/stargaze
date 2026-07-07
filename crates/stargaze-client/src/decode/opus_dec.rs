@@ -203,6 +203,7 @@ mod tests {
                     convert_us: 0,
                     encode_us: 0,
                     received_at: std::time::Instant::now(),
+                    tainted: false,
                 })
                 .await
                 .unwrap();

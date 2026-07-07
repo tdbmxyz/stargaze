@@ -14,7 +14,7 @@ use super::gl::GlRenderer;
 use super::input::{InputTracker, ShortcutAction, shortcut_action};
 use super::stats::{ReportMeta, StatsOverlay, StatsRecorder, draw_overlay};
 use crate::decode::VideoFrame;
-use crate::gamepad::{PadKey, SharedGamepads, guid_vendor_product};
+use crate::gamepad::{PadKey, QuitChord, SharedGamepads, guid_vendor_product};
 use crate::transport::NetStats;
 
 /// Window title shown while input is captured ("inside" mode).
@@ -326,6 +326,15 @@ impl CanvasBackend {
     }
 }
 
+/// Feeds Select (Back) / Start presses into the session quit chord.
+fn track_quit_chord(chord: &mut QuitChord, button: sdl2::controller::Button, pressed: bool) {
+    match button {
+        sdl2::controller::Button::Back => chord.set_select(pressed),
+        sdl2::controller::Button::Start => chord.set_start(pressed),
+        _ => {}
+    }
+}
+
 /// The active presentation path.
 // One instance per session; the size difference doesn't matter.
 #[allow(clippy::large_enum_variant)]
@@ -432,10 +441,26 @@ pub(super) fn run_sdl_loop(
         .event_pump()
         .map_err(|e| anyhow!("event pump failed: {e}"))?;
 
-    // Controllers present at startup arrive as ControllerDeviceAdded events
-    // on the first event pump iterations, so no manual scan is needed.
+    // SDL announces already-present controllers as ControllerDeviceAdded
+    // events only once per subsystem init — and in launcher mode the
+    // launcher's event pump has already consumed them. Enumerate what is
+    // connected instead of waiting for events that will never come
+    // (Controllers::add dedupes, so the direct-mode case where the
+    // events DO still arrive is harmless).
     let mut controllers = Controllers::new();
+    for index in 0..joystick_subsystem.num_joysticks().unwrap_or(0) {
+        if game_controller_subsystem.is_game_controller(index) {
+            controllers.add(
+                &game_controller_subsystem,
+                &joystick_subsystem,
+                index,
+                gamepads,
+                &input_tx,
+            );
+        }
+    }
     let mut pad_generation = gamepads.generation();
+    let mut quit_chord = QuitChord::default();
 
     // Start captured ("inside" mode): all input goes to the remote session.
     let mut captured = true;
@@ -580,6 +605,7 @@ pub(super) fn run_sdl_loop(
                 }
 
                 sdl2::event::Event::ControllerButtonDown { which, button, .. } => {
+                    track_quit_chord(&mut quit_chord, button, true);
                     if let (Some(pad), Some(gb)) =
                         (pad_of(gamepads, which), map_gamepad_button(button))
                     {
@@ -592,6 +618,7 @@ pub(super) fn run_sdl_loop(
                 }
 
                 sdl2::event::Event::ControllerButtonUp { which, button, .. } => {
+                    track_quit_chord(&mut quit_chord, button, false);
                     if let (Some(pad), Some(gb)) =
                         (pad_of(gamepads, which), map_gamepad_button(button))
                     {
@@ -631,6 +658,14 @@ pub(super) fn run_sdl_loop(
                 dx: mouse_dx,
                 dy: mouse_dy,
             });
+        }
+
+        // Controller quit chord: from SDL-emulated pads (tracked here)
+        // or evdev pass-through readers (flag on SharedGamepads). The
+        // keyboard-free way to end a session on the Steam Deck.
+        if quit_chord.fired() || gamepads.quit_requested() {
+            info!("Select+Start held: ending session");
+            break 'main;
         }
 
         // Wait briefly for a decoded frame so the loop doesn't busy-spin;
