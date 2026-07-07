@@ -27,7 +27,7 @@ const HOST_LIST_EXTRA: usize = 3; // Add host, Settings, Quit
 const EDIT_FIELDS: usize = 9; // name, address, port, resolution, fps, bitrate, codec, save, cancel
 
 /// Rows on the settings screen.
-const SETTINGS_ROWS: usize = 5; // 4 toggles + back
+const SETTINGS_ROWS: usize = 6; // 5 toggles + back
 
 /// Row geometry shared by all screens.
 const ROW_TOP: i32 = 150;
@@ -413,6 +413,10 @@ impl Model {
                         self.cfg.mic_forward.enabled = !self.cfg.mic_forward.enabled;
                         true
                     }
+                    4 => {
+                        self.cfg.forward_builtin_controller = !self.cfg.forward_builtin_controller;
+                        true
+                    }
                     _ => false,
                 };
                 if toggled {
@@ -625,7 +629,13 @@ fn draw_settings(model: &Model, focus: &FocusList, ui: &mut Ui) {
         cfg.mic_forward.enabled,
         f == 3,
     );
-    ui.button(rects[4], "Back", f == 4);
+    ui.toggle(
+        rects[4],
+        "Handoff built-in controller (Deck; needs usbip setup)",
+        cfg.forward_builtin_controller,
+        f == 4,
+    );
+    ui.button(rects[5], "Back", f == 5);
     ui.hint_bar("A/Enter toggle   B/Esc back");
 }
 

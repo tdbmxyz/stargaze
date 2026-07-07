@@ -56,8 +56,11 @@ pub async fn run_session(
 
     // USB forwarding: tunnel Valve controller hardware to the server
     // over the session connection (Steam needs the real USB device).
+    // With forward_builtin_controller the Deck's own controller is
+    // included — full handoff, the remote Steam sees the real device.
+    let builtin_handoff = cfg.usb_forward && cfg.forward_builtin_controller;
     if cfg.usb_forward {
-        usb::start(usb_connection);
+        usb::start(usb_connection, cfg.forward_builtin_controller);
     } else {
         drop(usb_connection);
     }
@@ -113,6 +116,7 @@ pub async fn run_session(
     // Everything below must funnel through the shared teardown at the
     // bottom, whatever fails.
     let mut passthrough = None;
+    let mut volume_watch_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
     let result = match bridge {
         Err(e) => Err(anyhow!("Failed to spawn input bridge thread: {e}")),
         Ok(_) => {
@@ -122,6 +126,12 @@ pub async fn run_session(
             // devices present at startup are grabbed before SDL
             // delivers their hotplug events.
             let gamepads = gamepad::SharedGamepads::new();
+            // Escape hatch for the handoff: the tunneled controller
+            // can't carry Select+Start locally, but the volume keys
+            // stay local.
+            if builtin_handoff {
+                volume_watch_stop = Some(gamepad::start_volume_quit_watch(gamepads.clone()));
+            }
             if cfg.gamepad_passthrough {
                 passthrough = Some(gamepad::start_passthrough(
                     gamepads.clone(),
@@ -152,6 +162,9 @@ pub async fn run_session(
     // so an immediate reconnect's scan cannot hit EBUSY.
     if let Some(handle) = passthrough {
         handle.stop();
+    }
+    if let Some(stop) = volume_watch_stop {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(ref mut child) = rsonance_child {
         mic_forward::stop_rsonance(child).await;

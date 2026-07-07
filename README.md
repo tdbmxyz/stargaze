@@ -93,6 +93,8 @@ If the client still fails to start from Steam, check `~/.config/stargaze/client.
 
 #### Steam Deck controls
 
+- **Real Deck controller on the remote (recommended)**: enable the built-in controller handoff — the remote Steam sees an actual Steam Deck Controller (gyro, trackpads, paddles) instead of an emulated Xbox 360 pad. One-time setup: [docs/steam-deck-builtin-controller.md](docs/steam-deck-builtin-controller.md). While a session runs the local controls belong to the remote; hold **Vol+ and Vol− together for one second** to end the session.
+
 - **Ending a session**: hold **View (Select) + Menu (Start)** together for one second — the controller equivalent of `Ctrl+Alt+Shift+Q`. Works for both pass-through and emulated controllers; the launcher itself is fully D-pad/touch navigable.
 - **Mouse on a remote desktop**: in gaming mode every Deck input goes through Steam Input, and the default gamepad layout generates *no mouse events at all* — the remote desktop looks unresponsive even though the controller is forwarded fine. Open the controller settings for stargaze in Steam and pick the official **"Gamepad with Mouse Trackpad"** layout (or map the right trackpad to Mouse yourself). Trackpad motion then arrives as real mouse events, which stargaze forwards to the remote session; the rest of the controller keeps working as a gamepad for remote games.
 

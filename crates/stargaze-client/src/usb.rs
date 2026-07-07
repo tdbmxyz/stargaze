@@ -30,13 +30,16 @@ use tracing::{debug, info, warn};
 /// Steam refuses to see through virtual recreations.
 /// (wired Steam Controller, wireless dongle)
 ///
-/// The Steam Deck's built-in controller (0x28de:0x1205) is deliberately
-/// NOT listed: on a client machine that device can only be the local
-/// Deck's own controls, and tunneling it away would take the trackpads
-/// and buttons from local Steam Input mid-session. Deck input reaches
-/// the server through Steam Input's virtual pad (evdev pass-through)
-/// and synthesized mouse/keyboard events instead.
+/// The Steam Deck's built-in controller (BUILTIN_DECK_CONTROLLER) is
+/// NOT listed by default: on a client machine that device can only be
+/// the local Deck's own controls, and tunneling it away takes the
+/// trackpads and buttons from local Steam Input mid-session. It is
+/// added opt-in (forward_builtin_controller) for the full-handoff
+/// experience: the remote Steam then sees a real Steam Deck Controller.
 const FORWARDED_DEVICES: [(u16, u16); 2] = [(0x28de, 0x1102), (0x28de, 0x1142)];
+
+/// The Steam Deck's built-in controller.
+pub const BUILTIN_DECK_CONTROLLER: (u16, u16) = (0x28de, 0x1205);
 
 /// How often to rescan for forwardable devices (hotplug support).
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
@@ -68,7 +71,7 @@ struct UsbDevice {
 /// Starts the USB forwarder: scans for matching devices and tunnels
 /// each one to the server for as long as the connection lives. Devices
 /// return to this machine when their tunnel ends.
-pub fn start(connection: quinn::Connection) {
+pub fn start(connection: quinn::Connection, include_builtin: bool) {
     tokio::spawn(async move {
         let mut exported: HashSet<String> = HashSet::new();
         let mut skipped: HashSet<String> = HashSet::new();
@@ -84,7 +87,7 @@ pub fn start(connection: quinn::Connection) {
                     skipped.insert(busid);
                 }
             }
-            for device in scan_devices(Path::new(USB_DEVICES)) {
+            for device in scan_devices(Path::new(USB_DEVICES), include_builtin) {
                 if exported.contains(&device.busid) || skipped.contains(&device.busid) {
                     continue;
                 }
@@ -121,7 +124,7 @@ pub fn start(connection: quinn::Connection) {
 }
 
 /// Scans sysfs for devices matching [`FORWARDED_DEVICES`].
-fn scan_devices(root: &Path) -> Vec<UsbDevice> {
+fn scan_devices(root: &Path, include_builtin: bool) -> Vec<UsbDevice> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -131,7 +134,7 @@ fn scan_devices(root: &Path) -> Vec<UsbDevice> {
         if !is_device_busid(&busid) {
             continue;
         }
-        if let Some(device) = read_device(&entry.path(), &busid) {
+        if let Some(device) = read_device(&entry.path(), &busid, include_builtin) {
             devices.push(device);
         }
     }
@@ -150,11 +153,13 @@ fn is_device_busid(name: &str) -> bool {
 }
 
 /// Reads one sysfs device directory; returns it if it matches the
-/// forward list.
-fn read_device(path: &Path, busid: &str) -> Option<UsbDevice> {
+/// forward list (plus the built-in Deck controller when opted in).
+fn read_device(path: &Path, busid: &str, include_builtin: bool) -> Option<UsbDevice> {
     let vendor = read_hex_u16(&path.join("idVendor"))?;
     let product = read_hex_u16(&path.join("idProduct"))?;
-    if !FORWARDED_DEVICES.contains(&(vendor, product)) {
+    let matches = FORWARDED_DEVICES.contains(&(vendor, product))
+        || (include_builtin && (vendor, product) == BUILTIN_DECK_CONTROLLER);
+    if !matches {
         return None;
     }
     let busnum: u32 = read_trimmed(&path.join("busnum"))?.parse().ok()?;
