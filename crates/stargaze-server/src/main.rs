@@ -263,7 +263,8 @@ async fn main() -> anyhow::Result<()> {
         bitrate_mbps: cfg.bitrate,
         tuning: cfg.encoder.clone(),
     };
-    let (encoder_session, packets, idr_tx) = encode::start_encoder(encoder_config, frames)?;
+    let (encoder_session, packets, idr_tx, bitrate_tx) =
+        encode::start_encoder(encoder_config, frames)?;
     info!("Encoder started");
 
     // Start audio capture pipeline.
@@ -316,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
         packets,
         audio_packets,
         idr_tx,
+        bitrate_tx,
         input_tx,
     )?;
     info!(
@@ -415,7 +417,7 @@ mod tests {
             bitrate_mbps: 10,
             tuning: stargaze_core::config::EncoderTuning::default(),
         };
-        let (encoder_session, mut packets, _idr_tx) =
+        let (encoder_session, mut packets, _idr_tx, _bitrate_tx) =
             encode::start_encoder(encoder_config, frames).expect("encoder should start");
 
         // Receive packets for up to 3 seconds.
@@ -492,7 +494,7 @@ mod tests {
         };
 
         // Start encoder — this initializes CUDA + NVENC on a dedicated thread.
-        let (encoder_session, mut packets, idr_tx) =
+        let (encoder_session, mut packets, idr_tx, _bitrate_tx) =
             encode::start_encoder(encoder_config, frames_rx)
                 .expect("encoder should initialize with NVIDIA GPU");
 
@@ -629,7 +631,7 @@ mod tests {
             bitrate_mbps: 2,
             tuning: stargaze_core::config::EncoderTuning::default(),
         };
-        let (encoder_session, mut packets, idr_tx) =
+        let (encoder_session, mut packets, idr_tx, _bitrate_tx) =
             encode::start_encoder(encoder_config, frames_rx)
                 .expect("encoder should initialize with NVIDIA GPU");
 
@@ -737,6 +739,92 @@ mod tests {
         );
     }
 
+    /// Verifies the per-session bitrate rebuild: changing the bitrate
+    /// watch mid-stream must recreate the encoder (a fresh IDR appears)
+    /// and packets keep flowing.
+    ///
+    /// Run manually with:
+    /// ```bash
+    /// cargo test --package stargaze-server -- --ignored test_nvenc_bitrate --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires NVIDIA GPU with NVENC support"]
+    async fn test_nvenc_bitrate_reconfig() {
+        use stargaze_core::capture::{Frame, PixelFormat};
+        use stargaze_core::encode::EncoderConfig;
+        use tokio::sync::mpsc;
+
+        init_tracing();
+
+        let width = 640u32;
+        let height = 480u32;
+        let num_frames = 60u32;
+
+        let (frames_tx, frames_rx) = mpsc::channel::<stargaze_core::capture::CapturedFrame>(4);
+        let encoder_config = EncoderConfig {
+            width,
+            height,
+            framerate: 30,
+            bitrate_mbps: 2,
+            tuning: stargaze_core::config::EncoderTuning::default(),
+        };
+        let (encoder_session, mut packets, _idr_tx, bitrate_tx) =
+            encode::start_encoder(encoder_config, frames_rx)
+                .expect("encoder should initialize with NVIDIA GPU");
+
+        let feed_handle = tokio::spawn(async move {
+            let stride = width * 4;
+            for i in 0..num_frames {
+                if i == 30 {
+                    // Session handshake requests a different bitrate.
+                    let _ = bitrate_tx.send(8);
+                }
+                let data = vec![((i * 5) % 256) as u8; (stride * height) as usize];
+                let frame = Frame::CpuMapped {
+                    data,
+                    width,
+                    height,
+                    stride,
+                    format: PixelFormat::Bgra8,
+                };
+                if frames_tx.send(frame.into()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut keyframes = Vec::new();
+        let mut total = 0u32;
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(30));
+        tokio::pin!(timeout);
+        loop {
+            tokio::select! {
+                pkt = packets.recv() => match pkt {
+                    Some(p) => {
+                        if p.is_keyframe {
+                            keyframes.push(total);
+                        }
+                        total += 1;
+                    }
+                    None => break,
+                },
+                () = &mut timeout => panic!("Timed out — got {total} packets"),
+            }
+        }
+        feed_handle.await.expect("frame feed task should not panic");
+        encoder_session.stop().expect("encoder should stop cleanly");
+
+        eprintln!("total={total} keyframes at {keyframes:?}");
+        assert!(
+            total >= 50,
+            "packets must keep flowing across the rebuild, got {total}"
+        );
+        assert!(
+            keyframes.len() >= 2,
+            "the rebuilt encoder must start with a fresh IDR, keyframes at {keyframes:?}"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires NVIDIA GPU with NVENC support"]
     async fn test_nvenc_idr_request() {
@@ -763,7 +851,7 @@ mod tests {
             tuning: stargaze_core::config::EncoderTuning::default(),
         };
 
-        let (encoder_session, mut packets, idr_tx) =
+        let (encoder_session, mut packets, idr_tx, _bitrate_tx) =
             encode::start_encoder(encoder_config, frames_rx)
                 .expect("encoder should initialize with NVIDIA GPU");
 

@@ -55,6 +55,7 @@ pub(crate) async fn perform_handshake(
         height: request.height,
         framerate: request.framerate,
         codec: request.codec,
+        bitrate_mbps: request.bitrate_mbps,
     };
     let req_bytes = serialize_control_message(&req_msg)?;
     send_stream

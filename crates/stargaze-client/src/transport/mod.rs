@@ -48,6 +48,8 @@ pub struct SessionRequest {
     pub framerate: u32,
     /// Desired codec.
     pub codec: Codec,
+    /// Desired bitrate in Mbps (0 = server default).
+    pub bitrate_mbps: u32,
 }
 
 /// Callback returning the current QUIC round-trip time estimate.

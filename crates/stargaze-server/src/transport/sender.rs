@@ -13,6 +13,10 @@ use stargaze_core::transport::{
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
+/// Bounds for a client-requested bitrate (Mbps).
+const MIN_BITRATE_MBPS: u32 = 1;
+const MAX_BITRATE_MBPS: u32 = 500;
+
 /// Performs the session handshake with the client.
 ///
 /// Reads `SessionRequest` from the control stream, validates it,
@@ -28,6 +32,7 @@ pub(crate) async fn handle_session_handshake(
     connection: &quinn::Connection,
     send_stream: &mut quinn::SendStream,
     recv_stream: &mut quinn::RecvStream,
+    bitrate_tx: &tokio::sync::watch::Sender<u32>,
 ) -> Result<(u32, u32, u32, u32), TransportError> {
     // Read length prefix.
     let mut len_buf = [0u8; 4];
@@ -50,15 +55,18 @@ pub(crate) async fn handle_session_handshake(
         .await
         .map_err(|e| TransportError::SessionError(format!("read request body: {e}")))?;
 
-    let request = deserialize_control_message(&body)?;
+    // Compat parse: pre-v1.3.0 clients send the request without a
+    // bitrate field.
+    let request = stargaze_core::transport::deserialize_session_request_compat(&body)?;
 
-    let (width, height, framerate, codec) = match request {
+    let (width, height, framerate, codec, requested_bitrate) = match request {
         ControlMessage::SessionRequest {
             width,
             height,
             framerate,
             codec,
-        } => (width, height, framerate, codec),
+            bitrate_mbps,
+        } => (width, height, framerate, codec, bitrate_mbps),
         other => {
             return Err(TransportError::SessionError(format!(
                 "expected SessionRequest, got {other:?}"
@@ -67,11 +75,23 @@ pub(crate) async fn handle_session_handshake(
     };
 
     info!(
-        "Session request: {}x{} @ {}fps, {:?}",
-        width, height, framerate, codec
+        "Session request: {}x{} @ {}fps, {:?}, {} Mbps",
+        width, height, framerate, codec, requested_bitrate
     );
 
-    // For MVP, use server's configured parameters.
+    // Resolution/framerate/codec still follow the server's configuration
+    // (the capture pipeline is bound to the display), but the bitrate is
+    // a pure encoder parameter and follows the client's request: the
+    // right value depends on the CLIENT's link (WiFi Deck vs wired).
+    let bitrate = if requested_bitrate == 0 {
+        config.bitrate
+    } else {
+        requested_bitrate.clamp(MIN_BITRATE_MBPS, MAX_BITRATE_MBPS)
+    };
+    if bitrate_tx.send(bitrate).is_err() {
+        warn!("Encoder bitrate channel closed; keeping current bitrate");
+    }
+
     let max_datagram_size = connection.max_datagram_size().unwrap_or(0);
     let max_datagram_size_u16 = u16::try_from(max_datagram_size).unwrap_or(u16::MAX);
 
@@ -81,7 +101,7 @@ pub(crate) async fn handle_session_handshake(
         width: config.resolution.width,
         height: config.resolution.height,
         framerate: config.framerate,
-        bitrate_mbps: config.bitrate,
+        bitrate_mbps: bitrate,
         codec: config.codec,
         max_datagram_size: max_datagram_size_u16,
         cursor_embedded: config.cursor.show_cursor,
@@ -98,7 +118,7 @@ pub(crate) async fn handle_session_handshake(
         config.resolution.width,
         config.resolution.height,
         config.framerate,
-        config.bitrate,
+        bitrate,
     ))
 }
 
