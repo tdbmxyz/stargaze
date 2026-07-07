@@ -173,7 +173,7 @@
         binName = "stargaze-client";
         libs = clientLibs;
         inherit extraWrapFlags;
-        runSnippet = stripSteamEnvSnippet;
+        steamEnvGuard = true;
         drv = rustPlatform.buildRustPackage (commonPackageAttrs
           // {
             pname = "stargaze-client";
@@ -205,53 +205,72 @@
           });
       };
 
-    # Shell snippet run by the client wrapper before exec: Steam launches
-    # non-Steam games with its scout runtime in LD_LIBRARY_PATH and the
-    # overlay in LD_PRELOAD. LD_LIBRARY_PATH outranks the DT_RUNPATH Nix
-    # binaries resolve their libraries with, so Steam's ancient libs
-    # shadow the bundled ones and the client dies on startup (launching
-    # from a file manager works, from Steam does not). Strip exactly the
-    # Steam entries and keep everything else (e.g. nixGL).
-    stripSteamEnvSnippet = ''
-      strip_steam_entries() {
-        local out="" p IFS=': '
-        for p in $1; do
-          case "$p" in
-            *steam-runtime* | *gameoverlay* | */Steam/ubuntu12_32* | */Steam/ubuntu12_64*) ;;
-            *) out="''${out:+$out:}$p" ;;
-          esac
-        done
-        printf '%s' "$out"
-      }
-      if [ -n "''${LD_LIBRARY_PATH-}" ]; then
-        LD_LIBRARY_PATH="$(strip_steam_entries "$LD_LIBRARY_PATH")"
-      fi
-      if [ -n "''${LD_PRELOAD-}" ]; then
-        LD_PRELOAD="$(strip_steam_entries "$LD_PRELOAD")"
-      fi
-    '';
-
     # Helper: wrap a binary so it finds .so files at runtime.
+    #
+    # steamEnvGuard additionally puts a stage-0 `#!/bin/sh` script in
+    # front of the (Nix-bash) wrapper. Steam launches non-Steam games
+    # with its scout runtime in LD_LIBRARY_PATH and the overlay in
+    # LD_PRELOAD; LD_LIBRARY_PATH outranks the DT_RUNPATH Nix binaries
+    # resolve their libraries with, so Steam's ancient libs shadow the
+    # bundled ones — and that kills the wrapper's OWN bash before any
+    # in-script stripping could run ("bash: error while loading shared
+    # libraries: libGL.so.1", observed on the Deck in gaming mode). The
+    # stage-0 script runs under the HOST /bin/sh (host-linked, immune to
+    # the poison — Steam itself runs /bin/sh in this exact environment
+    # for launch options), strips exactly the Steam entries (keeping
+    # e.g. nixGL paths), and only then execs the Nix wrapper. The host
+    # /bin/sh is visible even inside the AppImage: its AppRun overlays
+    # only /nix.
     wrapBin = {
       drv,
       binName,
       libs,
       extraWrapFlags ? [],
-      runSnippet ? null,
+      steamEnvGuard ? false,
     }: let
       libPath = pkgs.lib.makeLibraryPath libs;
-      runFlag =
-        if runSnippet == null
-        then ""
-        else "--run ${pkgs.lib.escapeShellArg runSnippet}";
+      stage0Script = pkgs.writeScript "stage0-steam-env-guard" ''
+        #!/bin/sh
+        # Strip Steam's runtime entries from the dynamic-loader
+        # environment; everything Nix-linked (including the stage-2
+        # wrapper's bash) breaks under them. POSIX sh only.
+        sanitize() {
+          _acc=""
+          IFS=': '
+          for _p in $1; do
+            case "$_p" in
+              *steam-runtime* | *gameoverlay* | */Steam/ubuntu12_32* | */Steam/ubuntu12_64*) ;;
+              *) _acc="''${_acc:+$_acc:}$_p" ;;
+            esac
+          done
+          unset IFS
+          printf '%s' "$_acc"
+        }
+        if [ -n "''${LD_LIBRARY_PATH-}" ]; then
+          LD_LIBRARY_PATH=$(sanitize "$LD_LIBRARY_PATH")
+          export LD_LIBRARY_PATH
+        fi
+        if [ -n "''${LD_PRELOAD-}" ]; then
+          LD_PRELOAD=$(sanitize "$LD_PRELOAD")
+          export LD_PRELOAD
+        fi
+        exec "@stage2@" "$@"
+      '';
+      stage0 = ''
+        mv $out/bin/${binName} $out/bin/.${binName}-stage2
+        cp ${stage0Script} $out/bin/${binName}
+        sed -i "s|@stage2@|$out/bin/.${binName}-stage2|" $out/bin/${binName}
+        chmod 555 $out/bin/${binName}
+      '';
     in
       drv.overrideAttrs (old: {
         postFixup =
           (old.postFixup or "")
           + ''
             wrapProgram $out/bin/${binName} \
-              --prefix LD_LIBRARY_PATH : "${libPath}" ${runFlag} ${pkgs.lib.concatStringsSep " " extraWrapFlags}
-          '';
+              --prefix LD_LIBRARY_PATH : "${libPath}" ${pkgs.lib.concatStringsSep " " extraWrapFlags}
+          ''
+          + pkgs.lib.optionalString steamEnvGuard stage0;
       });
   in {
     # ── Dev shells ─────────────────────────────────────────────────
