@@ -411,6 +411,13 @@ pub(super) fn run_sdl_loop(
         .video()
         .map_err(|e| anyhow!("SDL2 video init failed: {e}"))?;
 
+    // SDL starts with text input ACTIVE by default, and Steam Deck
+    // gaming mode summons its on-screen keyboard over any focused
+    // window with active text input — with the controller handed off
+    // to the server there is no local way to dismiss it. Sessions
+    // never take local text input (keys are forwarded as scancodes).
+    video.text_input().stop();
+
     let game_controller_subsystem = sdl
         .game_controller()
         .map_err(|e| anyhow!("SDL2 game controller init failed: {e}"))?;
