@@ -399,6 +399,17 @@ pub(crate) fn run_decode_loop(
             packet_bytes: u32::try_from(frame.data.len()).unwrap_or(u32::MAX),
         };
 
+        // Keyframes only ever arrive at session start or as loss
+        // recovery (infinite GOP), and each carries its parameter sets
+        // (the server prepends extradata). Flushing first clears any
+        // stale DPB state — without it, a recovery IDR can be rejected
+        // with "Duplicate POC in a sequence: 0" when a gray placeholder
+        // or the original POC-0 picture still occupies the buffer, and
+        // the corruption then persists past the keyframe.
+        if frame.is_keyframe && packet_counter > 0 {
+            decoder.decoder.flush();
+        }
+
         let mut packet = ffmpeg_next::Packet::copy(&frame.data);
         packet.set_pts(Some(frame.pts.cast_signed()));
 
