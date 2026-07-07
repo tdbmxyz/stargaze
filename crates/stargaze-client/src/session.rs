@@ -132,7 +132,16 @@ pub async fn run_session(
             if builtin_handoff {
                 volume_watch_stop = Some(gamepad::start_volume_quit_watch(gamepads.clone()));
             }
-            if cfg.gamepad_passthrough {
+            if builtin_handoff {
+                // Full handoff: the controls travel as a real USB device;
+                // emulating Steam's (now orphaned) local virtual gamepad
+                // on top would put ghost controllers next to the genuine
+                // one on the server.
+                info!(
+                    "Built-in controller handoff: skipping gamepad \
+                     pass-through and Xbox 360 emulation"
+                );
+            } else if cfg.gamepad_passthrough {
                 passthrough = Some(gamepad::start_passthrough(
                     gamepads.clone(),
                     sdl_input_tx.clone(),
@@ -152,6 +161,7 @@ pub async fn run_session(
                 net_stats,
                 stats_file,
                 &gamepads,
+                !builtin_handoff,
             )
         }
     };
@@ -194,6 +204,7 @@ fn run_decoders_and_renderer(
     net_stats: std::sync::Arc<crate::transport::NetStats>,
     stats_file: Option<std::path::PathBuf>,
     gamepads: &gamepad::SharedGamepads,
+    emulate_gamepads: bool,
 ) -> anyhow::Result<()> {
     // Use the server-confirmed parameters for decoding and rendering:
     // the server may override the resolution (e.g. its display's
@@ -245,6 +256,7 @@ fn run_decoders_and_renderer(
             &zero_copy,
             gamepads,
             &decoder_idr_tx,
+            emulate_gamepads,
         )
     });
 

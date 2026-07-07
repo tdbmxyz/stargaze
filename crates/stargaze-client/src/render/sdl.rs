@@ -395,6 +395,7 @@ pub(super) fn run_sdl_loop(
     zero_copy: &AtomicBool,
     gamepads: &SharedGamepads,
     idr_tx: &tokio::sync::mpsc::Sender<()>,
+    emulate_gamepads: bool,
 ) -> Result<(), anyhow::Error> {
     let audio_queue: AudioQueue<f32> = create_audio_queue(sdl)?;
 
@@ -456,7 +457,7 @@ pub(super) fn run_sdl_loop(
     // events DO still arrive is harmless).
     let mut controllers = Controllers::new();
     for index in 0..joystick_subsystem.num_joysticks().unwrap_or(0) {
-        if game_controller_subsystem.is_game_controller(index) {
+        if emulate_gamepads && game_controller_subsystem.is_game_controller(index) {
             controllers.add(
                 &game_controller_subsystem,
                 &joystick_subsystem,
@@ -640,7 +641,9 @@ pub(super) fn run_sdl_loop(
                 sdl2::event::Event::ControllerDeviceAdded {
                     which: joystick_index,
                     ..
-                } if game_controller_subsystem.is_game_controller(joystick_index) => {
+                } if emulate_gamepads
+                    && game_controller_subsystem.is_game_controller(joystick_index) =>
+                {
                     controllers.add(
                         &game_controller_subsystem,
                         &joystick_subsystem,
