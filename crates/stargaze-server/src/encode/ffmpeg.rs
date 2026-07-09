@@ -372,7 +372,11 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
 ///
 /// Returns `EncodeError` if a fatal encoding error occurs. Non-fatal errors
 /// (e.g., a single frame upload failure) are logged and skipped.
-#[allow(clippy::unnecessary_wraps, clippy::too_many_arguments)]
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 pub(crate) fn run_encode_loop(
     encoder: &mut FfmpegEncoder,
     config: &EncoderConfig,
@@ -386,6 +390,7 @@ pub(crate) fn run_encode_loop(
     let mut last_idr_value: u64 = 0;
     let mut current_bitrate = config.bitrate_mbps;
     let mut packet = ffmpeg_next::Packet::empty();
+    let mut consecutive_panics: u32 = 0;
 
     info!("Encoder loop started, waiting for frames from capture pipeline");
 
@@ -449,28 +454,60 @@ pub(crate) fn run_encode_loop(
         }
         let prep_start = std::time::Instant::now();
         let capture_us = saturating_us(prep_start.saturating_duration_since(captured.captured_at));
-        match upload_and_encode(encoder, &frame, frame_counter, force_idr) {
-            Ok(()) => {}
-            Err(e) => {
+
+        // Panic boundary. A bug in the conversion/upload/drain path (an
+        // odd-dimension assert in `convert`, a scaler init `.expect`, a band
+        // worker panicking under `thread::scope`) would otherwise unwind and
+        // kill this dedicated thread, leaving the server up but permanently
+        // unable to produce video with nothing surfaced beyond client
+        // disconnects. Catch it, skip the frame, and force the next frame to
+        // an IDR so the decoder resyncs. Sustained panics are treated as
+        // fatal so the thread exits and a supervisor can restart it, rather
+        // than spinning on a frame it can never encode.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            upload_and_encode(encoder, &frame, frame_counter, force_idr)?;
+            // Frame preparation: pixel conversion + GPU upload + send_frame.
+            let convert_us = saturating_us(prep_start.elapsed());
+            drain_packets(
+                &mut encoder.encoder,
+                &mut packet,
+                packets_tx,
+                frame_counter,
+                &encoder.extradata,
+                capture_us,
+                convert_us,
+                std::time::Instant::now(),
+            );
+            Ok::<(), EncodeError>(())
+        }));
+
+        match outcome {
+            Ok(Ok(())) => consecutive_panics = 0,
+            Ok(Err(e)) => {
                 warn!(frame = frame_counter, "Skipping frame: {e}");
                 frame_counter += 1;
                 continue;
             }
+            Err(panic) => {
+                consecutive_panics += 1;
+                let msg = panic_message(panic.as_ref());
+                error!(
+                    frame = frame_counter,
+                    consecutive_panics, "Encode path panicked, skipping frame: {msg}"
+                );
+                if consecutive_panics >= MAX_CONSECUTIVE_ENCODE_PANICS {
+                    return Err(EncodeError::FfmpegError(format!(
+                        "encode path panicked on {consecutive_panics} consecutive frames; \
+                         last panic: {msg}"
+                    )));
+                }
+                // Force the next frame to an IDR so the decoder resyncs after
+                // the gap (differs last_idr_value from the unchanged watch).
+                last_idr_value = last_idr_value.wrapping_sub(1);
+                frame_counter += 1;
+                continue;
+            }
         }
-        // Frame preparation: pixel conversion + GPU upload + send_frame.
-        let convert_us = saturating_us(prep_start.elapsed());
-
-        // Receive encoded packets.
-        drain_packets(
-            &mut encoder.encoder,
-            &mut packet,
-            packets_tx,
-            frame_counter,
-            &encoder.extradata,
-            capture_us,
-            convert_us,
-            std::time::Instant::now(),
-        );
 
         frame_counter += 1;
         if frame_counter == 1
@@ -490,6 +527,23 @@ pub(crate) fn run_encode_loop(
 
     info!(total_frames = frame_counter, "Encoder loop finished");
     Ok(())
+}
+
+/// Number of consecutive per-frame panics tolerated before the encode loop
+/// gives up and returns an error (so the thread exits cleanly and a
+/// supervisor can restart, rather than spinning on an unencodable frame).
+const MAX_CONSECUTIVE_ENCODE_PANICS: u32 = 10;
+
+/// Best-effort extraction of a human-readable message from a caught panic
+/// payload (`catch_unwind`'s `Err`).
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
 }
 
 /// Maps our capture `PixelFormat` to the corresponding `FFmpeg` pixel format.
