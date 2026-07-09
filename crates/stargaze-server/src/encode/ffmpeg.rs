@@ -546,6 +546,43 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// RAII guard for a CUDA context pushed as current on the calling thread.
+///
+/// Pushing on construction and popping on `Drop` keeps the thread's CUDA
+/// context stack balanced across every exit path — a normal return, an
+/// early `?`, or a panic unwinding through the encode path. The encode
+/// loop's `catch_unwind` boundary would otherwise swallow a panic while
+/// leaving the context pushed, imbalancing the stack for later frames.
+struct CudaCtxGuard;
+
+impl CudaCtxGuard {
+    /// Pushes `ctx` as the current CUDA context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EncodeFrameError` if `cuCtxPushCurrent` fails; no guard is
+    /// created in that case, so nothing is popped.
+    fn push(ctx: cudarc::driver::sys::CUcontext, pts: u64) -> Result<Self, EncodeError> {
+        let res = unsafe { cudarc::driver::sys::cuCtxPushCurrent_v2(ctx) };
+        if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(EncodeError::EncodeFrameError {
+                frame: pts,
+                reason: format!("cuCtxPushCurrent failed: {res:?}"),
+            });
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for CudaCtxGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let mut old: cudarc::driver::sys::CUcontext = ptr::null_mut();
+            cudarc::driver::sys::cuCtxPopCurrent_v2(&raw mut old);
+        }
+    }
+}
+
 /// Maps our capture `PixelFormat` to the corresponding `FFmpeg` pixel format.
 fn capture_format_to_ffmpeg(fmt: PixelFormat) -> ffmpeg_next::format::Pixel {
     match fmt {
@@ -746,17 +783,11 @@ fn gpu_convert_and_encode(
 ) -> Result<(), EncodeError> {
     use cudarc::driver::sys as cu;
 
-    unsafe {
-        let res = cu::cuCtxPushCurrent_v2(encoder.cuda_ctx);
-        if res != cu::CUresult::CUDA_SUCCESS {
-            return Err(EncodeError::EncodeFrameError {
-                frame: pts,
-                reason: format!("cuCtxPushCurrent failed: {res:?}"),
-            });
-        }
-    }
+    // Guard pops the CUDA context on every exit path, including a panic
+    // unwinding through the converter/convert code below.
+    let _ctx = CudaCtxGuard::push(encoder.cuda_ctx, pts)?;
 
-    let result = (|| {
+    (|| {
         if encoder.gpu_converter.is_none() {
             match super::egl_cuda::GpuNv12Converter::new(width, height) {
                 Ok(conv) => encoder.gpu_converter = Some(conv),
@@ -803,13 +834,8 @@ fn gpu_convert_and_encode(
         }
 
         send_hw_frame(encoder, &mut hw_frame, pts, force_idr)
-    })();
-
-    unsafe {
-        let mut old: cu::CUcontext = ptr::null_mut();
-        cu::cuCtxPopCurrent_v2(&raw mut old);
-    }
-    result
+    })()
+    // `_ctx` pops the CUDA context here, including on a panic unwind.
 }
 
 /// Stamps pts / forced-IDR on a hardware frame and submits it to NVENC.
@@ -891,29 +917,18 @@ fn upload_dmabuf_and_encode(
     pts: u64,
     force_idr: bool,
 ) -> Result<(), EncodeError> {
-    use cudarc::driver::sys as cu;
-
-    unsafe {
-        let res = cu::cuCtxPushCurrent_v2(encoder.cuda_ctx);
-        if res != cu::CUresult::CUDA_SUCCESS {
-            return Err(EncodeError::EncodeFrameError {
-                frame: pts,
-                reason: format!("cuCtxPushCurrent failed: {res:?}"),
-            });
-        }
-    }
+    // Guard pops the CUDA context on every exit path, including a panic
+    // unwinding through the import/convert code below. Where a pop must
+    // precede a nested call that re-pushes the context, it is dropped
+    // explicitly (`drop(ctx)`).
+    let ctx = CudaCtxGuard::push(encoder.cuda_ctx, pts)?;
 
     if encoder.egl_bridge.is_none() {
-        match super::egl_cuda::EglCudaBridge::new(info.width, info.height, encoder.cuda_ctx) {
-            Ok(bridge) => encoder.egl_bridge = Some(bridge),
-            Err(e) => {
-                unsafe {
-                    let mut old: cu::CUcontext = ptr::null_mut();
-                    cu::cuCtxPopCurrent_v2(&raw mut old);
-                }
-                return Err(e);
-            }
-        }
+        // `?` here still pops the context: `ctx`'s guard drops on the early
+        // return.
+        let bridge =
+            super::egl_cuda::EglCudaBridge::new(info.width, info.height, encoder.cuda_ctx)?;
+        encoder.egl_bridge = Some(bridge);
     }
 
     // Fully-GPU path: EGL → GL → CUDA kernel → NV12 hw frame, no CPU
@@ -927,10 +942,6 @@ fn upload_dmabuf_and_encode(
         match gpu_import_and_encode(encoder, info, pts, force_idr) {
             Ok(()) => {
                 encoder.gpu_path_failures = 0;
-                unsafe {
-                    let mut old: cu::CUcontext = ptr::null_mut();
-                    cu::cuCtxPopCurrent_v2(&raw mut old);
-                }
                 return Ok(());
             }
             Err(e) => {
@@ -953,10 +964,9 @@ fn upload_dmabuf_and_encode(
     let cpu_buf = match bridge.import_dmabuf_to_cpu(info) {
         Ok(buf) => buf,
         Err(e) => {
-            unsafe {
-                let mut old: cu::CUcontext = ptr::null_mut();
-                cu::cuCtxPopCurrent_v2(&raw mut old);
-            }
+            // The mmap fallback runs without our context pushed (matching
+            // the original hand-balanced pop at this point).
+            drop(ctx);
             if pts < 3 {
                 warn!(
                     frame = pts,
@@ -973,10 +983,9 @@ fn upload_dmabuf_and_encode(
         }
     };
 
-    unsafe {
-        let mut old: cu::CUcontext = ptr::null_mut();
-        cu::cuCtxPopCurrent_v2(&raw mut old);
-    }
+    // The nested CPU encode re-pushes the context itself; drop our push
+    // first so the same context isn't stacked twice.
+    drop(ctx);
 
     // EGL→GL shader blit always outputs RGBA (glReadPixels with gl::RGBA),
     // regardless of the original DMA-BUF pixel format.
