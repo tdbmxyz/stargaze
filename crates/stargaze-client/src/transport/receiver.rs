@@ -566,8 +566,9 @@ pub(crate) async fn receive_loop(
                             // is a brief glitch the decoder recovers from on
                             // the next packet — no IDR needed.
                             match audio_tx.try_send(frame) {
-                                Ok(()) => Ok(()),
-                                Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+                                // Sent, or dropped because the decoder is
+                                // behind — both are fine for audio.
+                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
                                     Err(mpsc::error::SendError(()))
                                 }
@@ -680,14 +681,30 @@ mod tests {
     }
 
     #[test]
-    fn malformed_out_of_range_fragment_index_rejected() {
-        // fragment_index >= fragment_count can never index into the buffer.
+    fn malformed_datagram_does_not_anchor_delivery() {
+        // Malformed headers must be rejected *before* they seed in-order
+        // tracking. Without the guard, an out-of-range fragment_index (or a
+        // zero fragment_count) with a high frame_index would seed
+        // `next_frame` to that index, causing a later legitimate frame 0 to
+        // be dropped as "late".
         let mut assembler = FrameAssembler::new();
-        let header = video_header(0, 3, 3, 100, false);
 
-        let (frames, need_idr) = assembler.process_datagram(&header, vec![9]);
-
+        // High frame_index, fragment_index >= fragment_count.
+        let bad = video_header(10_000, 3, 3, 100, false);
+        let (frames, _) = assembler.process_datagram(&bad, vec![9]);
         assert!(frames.is_empty());
+
+        // High frame_index, zero fragment_count.
+        let bad2 = video_header(10_001, 0, 0, 100, true);
+        let (frames, _) = assembler.process_datagram(&bad2, vec![1, 2, 3]);
+        assert!(frames.is_empty());
+
+        // A legitimate frame 0 must still be delivered — proving neither
+        // malformed datagram anchored delivery at their high indices.
+        let good = video_header(0, 0, 1, 200, true);
+        let (frames, need_idr) = assembler.process_datagram(&good, vec![1, 2, 3]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, vec![1, 2, 3]);
         assert!(!need_idr);
     }
 
