@@ -68,19 +68,50 @@ struct UsbDevice {
     name: String,
 }
 
+/// Handle to a running USB forwarder. Dropping it detaches the forwarder
+/// (it stops with the connection); prefer [`UsbForwarder::shutdown`] at
+/// session teardown so tunneled devices are provably released first.
+pub struct UsbForwarder {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl UsbForwarder {
+    /// Waits (bounded) for the forwarder to release every tunneled device
+    /// back to this machine, then returns.
+    ///
+    /// Call **after** closing the session connection: closing ends each
+    /// device's tunnel, which rebinds it to its normal driver
+    /// ([`StubGuard`]'s `Drop`). Without this await the runtime can be torn
+    /// down before those rebinds run, stranding a Valve/Deck controller on
+    /// the `usbip-host` stub (unusable locally until replug).
+    pub async fn shutdown(self) {
+        const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+        if tokio::time::timeout(DRAIN_TIMEOUT, self.handle)
+            .await
+            .is_err()
+        {
+            warn!("USB forwarder did not release all devices within {DRAIN_TIMEOUT:?}");
+        }
+    }
+}
+
 /// Starts the USB forwarder: scans for matching devices and tunnels
 /// each one to the server for as long as the connection lives. Devices
 /// return to this machine when their tunnel ends.
-pub fn start(connection: quinn::Connection, include_builtin: bool) {
-    tokio::spawn(async move {
+///
+/// Keep the returned [`UsbForwarder`] and call [`UsbForwarder::shutdown`]
+/// at teardown; dropping it detaches the forwarder (devices are still
+/// released, just not awaited).
+#[must_use]
+pub fn start(connection: quinn::Connection, include_builtin: bool) -> UsbForwarder {
+    let handle = tokio::spawn(async move {
         let mut exported: HashSet<String> = HashSet::new();
         let mut skipped: HashSet<String> = HashSet::new();
         let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<(String, bool)>();
+        // Per-device tunnels live in a JoinSet so teardown can wait for
+        // their StubGuard rebinds to run before the runtime goes away.
+        let mut tunnels: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
-            if connection.close_reason().is_some() {
-                debug!("Connection closed, USB forwarder exiting");
-                return;
-            }
             while let Ok((busid, gave_up)) = done_rx.try_recv() {
                 exported.remove(&busid);
                 if gave_up {
@@ -94,7 +125,7 @@ pub fn start(connection: quinn::Connection, include_builtin: bool) {
                 exported.insert(device.busid.clone());
                 let connection = connection.clone();
                 let done_tx = done_tx.clone();
-                tokio::spawn(async move {
+                tunnels.spawn(async move {
                     let busid = device.busid.clone();
                     let started = std::time::Instant::now();
                     let failed = match export_device(&connection, device).await {
@@ -112,15 +143,32 @@ pub fn start(connection: quinn::Connection, include_builtin: bool) {
                             "Not retrying this device for the rest of the session \
                              (fix the setup and reconnect)"
                         );
-                    } else {
+                    } else if connection.close_reason().is_none() {
+                        // The device is already released (StubGuard dropped
+                        // in export_device); only wait out the re-export
+                        // backoff while the session is still alive.
                         tokio::time::sleep(REEXPORT_BACKOFF).await;
                     }
                     let _ = done_tx.send((busid, failed));
                 });
             }
-            tokio::time::sleep(SCAN_INTERVAL).await;
+            tokio::select! {
+                // Reap finished tunnels promptly so the exported set stays
+                // accurate for hotplug re-exports within a live session.
+                Some(_) = tunnels.join_next() => {}
+                () = tokio::time::sleep(SCAN_INTERVAL) => {}
+                reason = connection.closed() => {
+                    debug!("Connection closed ({reason}), USB forwarder draining tunnels");
+                    break;
+                }
+            }
         }
+        // Connection is closing: wait for every in-flight tunnel to end and
+        // rebind its device to the normal driver before returning.
+        while tunnels.join_next().await.is_some() {}
+        debug!("USB forwarder released all devices");
     });
+    UsbForwarder { handle }
 }
 
 /// Scans sysfs for devices matching [`FORWARDED_DEVICES`].

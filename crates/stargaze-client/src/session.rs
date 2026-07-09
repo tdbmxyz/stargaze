@@ -59,11 +59,12 @@ pub async fn run_session(
     // With forward_builtin_controller the Deck's own controller is
     // included — full handoff, the remote Steam sees the real device.
     let builtin_handoff = cfg.usb_forward && cfg.forward_builtin_controller;
-    if cfg.usb_forward {
-        usb::start(usb_connection, cfg.forward_builtin_controller);
+    let usb_forwarder = if cfg.usb_forward {
+        Some(usb::start(usb_connection, cfg.forward_builtin_controller))
     } else {
         drop(usb_connection);
-    }
+        None
+    };
 
     info!(
         "Connected, session: {}x{} @ {}fps, {} Mbps, codec {}",
@@ -180,8 +181,14 @@ pub async fn run_session(
         mic_forward::stop_rsonance(child).await;
     }
     // Closing the connection (not just aborting the receive task) ends
-    // the USB forwarder and releases tunneled devices locally.
+    // the USB forwarder and releases tunneled devices locally. Wait for
+    // that release to finish before returning, so an immediate reconnect
+    // (or process exit tearing down the runtime) can't strand a tunneled
+    // controller on the usbip-host stub.
     connection.close(0u32.into(), b"session ended");
+    if let Some(forwarder) = usb_forwarder {
+        forwarder.shutdown().await;
+    }
     client_transport.abort();
 
     result?;

@@ -754,6 +754,18 @@ pub fn run_launcher(
                     // Also covers SIGTERM (e.g. Steam's "Stop" button):
                     // SDL converts it into a Quit event.
                     info!("Launcher: quit (window close or SIGTERM)");
+                    // Tear down any in-flight connection attempt so it does
+                    // not outlive the launcher: the connect task and an
+                    // already-arrived session each hold a live QUIC
+                    // connection that would otherwise linger to the server's
+                    // idle timeout.
+                    if let Some(attempt) = connecting.take() {
+                        attempt.task.abort();
+                        if let Ok(Ok(conn)) = attempt.rx.try_recv() {
+                            conn.usb_connection.close(0u32.into(), b"cancelled");
+                            conn.transport.abort();
+                        }
+                    }
                     save(cfg, &model, config_path);
                     return Ok(LauncherOutcome::Quit);
                 }
