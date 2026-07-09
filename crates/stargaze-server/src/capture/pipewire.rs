@@ -120,7 +120,6 @@ fn build_format_params(config: &CaptureConfig) -> Vec<Vec<u8>> {
 ///
 /// The `VideoModifier` property uses `MANDATORY` with `DRM_FORMAT_MOD_INVALID`
 /// so the portal can offer its preferred modifier.
-#[allow(dead_code)] // Retained for future DMA-BUF import support.
 fn build_dmabuf_format_pod(
     config: &CaptureConfig,
     video_format: pipewire::spa::param::video::VideoFormat,
