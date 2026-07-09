@@ -214,9 +214,21 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
         (*raw_ctx).hw_frames_ctx = ffmpeg_sys_next::av_buffer_ref(hw_frames_ctx);
     }
 
-    let mut encoder = ctx.encoder().video().map_err(|e| {
-        EncodeError::InitError(format!("failed to create video encoder context: {e}"))
-    })?;
+    let mut encoder = match ctx.encoder().video() {
+        Ok(encoder) => encoder,
+        Err(e) => {
+            // `ctx` (and its attached ref copies) is dropped here, but the
+            // originals allocated above are ours to free.
+            unsafe {
+                let mut hw_frames_ptr = hw_frames_ctx;
+                ffmpeg_sys_next::av_buffer_unref(&raw mut hw_frames_ptr);
+                ffmpeg_sys_next::av_buffer_unref(&raw mut hw_device_ctx);
+            }
+            return Err(EncodeError::InitError(format!(
+                "failed to create video encoder context: {e}"
+            )));
+        }
+    };
 
     // Configure codec context.
     encoder.set_width(config.width);
@@ -273,9 +285,21 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
     opts.set("forced-idr", "1");
     opts.set("zerolatency", "1");
 
-    let opened = encoder
-        .open_with(opts)
-        .map_err(|e| EncodeError::InitError(format!("failed to open hevc_nvenc encoder: {e}")))?;
+    let opened = match encoder.open_with(opts) {
+        Ok(opened) => opened,
+        Err(e) => {
+            // `encoder` (and its attached ref copies) is dropped here, but the
+            // originals allocated above are ours to free.
+            unsafe {
+                let mut hw_frames_ptr = hw_frames_ctx;
+                ffmpeg_sys_next::av_buffer_unref(&raw mut hw_frames_ptr);
+                ffmpeg_sys_next::av_buffer_unref(&raw mut hw_device_ctx);
+            }
+            return Err(EncodeError::InitError(format!(
+                "failed to open hevc_nvenc encoder: {e}"
+            )));
+        }
+    };
 
     // Extract VPS/SPS/PPS from encoder extradata (NVENC stores parameter sets
     // here rather than inline in the bitstream).
@@ -424,7 +448,7 @@ pub(crate) fn run_encode_loop(
             info!("First frame received from capture pipeline, uploading to encoder");
         }
         let prep_start = std::time::Instant::now();
-        let capture_us = saturating_us(prep_start - captured.captured_at);
+        let capture_us = saturating_us(prep_start.saturating_duration_since(captured.captured_at));
         match upload_and_encode(encoder, &frame, frame_counter, force_idr) {
             Ok(()) => {}
             Err(e) => {
