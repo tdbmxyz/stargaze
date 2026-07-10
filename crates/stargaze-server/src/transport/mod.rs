@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 /// Handle to a running server transport session.
 pub struct ServerTransport {
     /// Join handle for the transport task.
-    task_handle: tokio::task::JoinHandle<()>,
+    task_handle: tokio::task::JoinHandle<Result<(), TransportError>>,
     /// Address the QUIC endpoint is bound to.
     local_addr: std::net::SocketAddr,
 }
@@ -33,11 +33,12 @@ impl ServerTransport {
     ///
     /// # Errors
     ///
-    /// Returns `TransportError` if the transport task panicked or was aborted.
+    /// Returns `TransportError` if the transport loop failed (e.g.
+    /// [`TransportError::PipelineClosed`]), panicked, or was aborted.
     pub async fn join(&mut self) -> Result<(), TransportError> {
         (&mut self.task_handle)
             .await
-            .map_err(|e| TransportError::ConnectionError(format!("transport task panicked: {e}")))
+            .map_err(|e| TransportError::ConnectionError(format!("transport task panicked: {e}")))?
     }
 
     /// Aborts the transport task. Await [`join`](Self::join) afterwards to
@@ -84,7 +85,7 @@ pub fn start_server_transport(
 
     let config = config.clone();
     let task_handle = tokio::spawn(async move {
-        if let Err(e) = run_server_loop(
+        let result = run_server_loop(
             endpoint,
             config,
             video_packets,
@@ -93,10 +94,11 @@ pub fn start_server_transport(
             bitrate_tx,
             input_tx,
         )
-        .await
-        {
+        .await;
+        if let Err(ref e) = result {
             error!("Server transport error: {e}");
         }
+        result
     });
 
     Ok(ServerTransport {
@@ -121,7 +123,11 @@ async fn run_server_loop(
         // While waiting for a client, keep draining the encoder outputs:
         // nothing consumes them otherwise, so the audio pipeline would
         // back up all the way to the PipeWire capture thread, which then
-        // drops frames and logs "Audio encoder behind" forever.
+        // drops frames and logs "Audio encoder behind" forever. A closed
+        // packet channel means the pipeline is dead — exit with an error
+        // (and a non-zero process exit) so the supervisor restarts the
+        // whole pipeline instead of the server accepting connections it
+        // can only instantly drop.
         let incoming = tokio::select! {
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else {
@@ -130,8 +136,22 @@ async fn run_server_loop(
                 };
                 incoming
             }
-            Some(_) = video_packets.recv() => continue,
-            Some(_) = audio_packets.recv() => continue,
+            packet = video_packets.recv() => {
+                if packet.is_none() {
+                    return Err(TransportError::PipelineClosed(
+                        "video packet channel closed".to_string(),
+                    ));
+                }
+                continue;
+            }
+            packet = audio_packets.recv() => {
+                if packet.is_none() {
+                    return Err(TransportError::PipelineClosed(
+                        "audio packet channel closed".to_string(),
+                    ));
+                }
+                continue;
+            }
         };
 
         let connection = match incoming.await {
@@ -147,7 +167,7 @@ async fn run_server_loop(
             "Client connected"
         );
 
-        if let Err(e) = run_session(
+        let session_result = run_session(
             &config,
             &connection,
             &mut video_packets,
@@ -156,9 +176,16 @@ async fn run_server_loop(
             &bitrate_tx,
             &input_tx,
         )
-        .await
-        {
-            warn!("Session ended: {e}");
+        .await;
+
+        match session_result {
+            // The pipeline is dead — no future session can work either.
+            Err(e @ TransportError::PipelineClosed(_)) => {
+                connection.close(quinn::VarInt::from_u32(1), b"server pipeline died");
+                return Err(e);
+            }
+            Err(e) => warn!("Session ended: {e}"),
+            Ok(()) => {}
         }
 
         connection.close(quinn::VarInt::from_u32(0), b"session over");
@@ -214,13 +241,17 @@ async fn run_session(
             }
         }
         result = sender::send_packets(connection, video_packets, STREAM_TYPE_VIDEO) => {
-            if let Err(e) = result {
-                warn!("Video send error: {e}");
+            match result {
+                Err(e @ TransportError::PipelineClosed(_)) => return Err(e),
+                Err(e) => warn!("Video send error: {e}"),
+                Ok(()) => {}
             }
         }
         result = sender::send_packets(connection, audio_packets, STREAM_TYPE_AUDIO) => {
-            if let Err(e) = result {
-                warn!("Audio send error: {e}");
+            match result {
+                Err(e @ TransportError::PipelineClosed(_)) => return Err(e),
+                Err(e) => warn!("Audio send error: {e}"),
+                Ok(()) => {}
             }
         }
         // Accepts USB tunnel streams (never completes on its own; when
@@ -384,5 +415,84 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), run)
             .await
             .expect("reconnect test timed out");
+    }
+
+    /// Regression test: when the encode pipeline dies (packet channels
+    /// close), the transport must exit with an error instead of accepting
+    /// connections it can only instantly drop — the process exit lets the
+    /// supervisor restart the whole pipeline (observed live: a monitor
+    /// hotplug killed capture and every reconnect was kicked until the
+    /// service was restarted by hand).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transport_exits_when_pipeline_dies_while_idle() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let config = ServerConfig {
+            bind_address: "127.0.0.1".to_string(),
+            port: 0,
+            ..ServerConfig::default()
+        };
+
+        let (video_tx, video_rx) = mpsc::channel::<EncodedPacket>(4);
+        let (audio_tx, audio_rx) = mpsc::channel::<EncodedPacket>(4);
+        let (idr_tx, _idr_rx) = tokio::sync::watch::channel(0u64);
+        let (bitrate_tx, _bitrate_rx) = tokio::sync::watch::channel(20u32);
+        let (input_tx, _input_rx) = mpsc::channel::<InputEvent>(8);
+
+        let mut transport =
+            start_server_transport(&config, video_rx, audio_rx, idr_tx, bitrate_tx, input_tx)
+                .expect("transport should start");
+
+        // Simulate the encoder dying: its packet senders drop.
+        drop(video_tx);
+        drop(audio_tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), transport.join())
+            .await
+            .expect("transport should exit when the pipeline dies, not keep accepting");
+        assert!(
+            matches!(result, Err(TransportError::PipelineClosed(_))),
+            "expected PipelineClosed, got {result:?}"
+        );
+    }
+
+    /// Same as above, but with a client mid-session when the pipeline dies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transport_exits_when_pipeline_dies_mid_session() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let config = ServerConfig {
+            bind_address: "127.0.0.1".to_string(),
+            port: 0,
+            ..ServerConfig::default()
+        };
+
+        let (video_tx, video_rx) = mpsc::channel::<EncodedPacket>(4);
+        let (audio_tx, audio_rx) = mpsc::channel::<EncodedPacket>(4);
+        let (idr_tx, _idr_rx) = tokio::sync::watch::channel(0u64);
+        let (bitrate_tx, _bitrate_rx) = tokio::sync::watch::channel(20u32);
+        let (input_tx, _input_rx) = mpsc::channel::<InputEvent>(8);
+
+        let mut transport =
+            start_server_transport(&config, video_rx, audio_rx, idr_tx, bitrate_tx, input_tx)
+                .expect("transport should start");
+        let addr = transport.local_addr();
+
+        let (_endpoint, _conn) = connect_and_handshake(addr).await;
+
+        drop(video_tx);
+        drop(audio_tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), transport.join())
+            .await
+            .expect("transport should exit when the pipeline dies mid-session");
+        assert!(
+            matches!(result, Err(TransportError::PipelineClosed(_))),
+            "expected PipelineClosed, got {result:?}"
+        );
     }
 }
