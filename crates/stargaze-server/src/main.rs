@@ -326,10 +326,16 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Wait for transport to finish (client disconnect or error) or Ctrl+C.
+    // A transport error (e.g. the encode pipeline died after the capture
+    // stream was killed by an output change) must survive the shutdown
+    // below and become a non-zero exit, so a supervisor (systemd
+    // Restart=on-failure) restarts the whole pipeline.
+    let mut pipeline_error: Option<anyhow::Error> = None;
     tokio::select! {
         result = server_transport.join() => {
             if let Err(e) = result {
                 tracing::warn!("Transport error: {e}");
+                pipeline_error = Some(e.into());
             }
             info!("Transport finished");
         }
@@ -360,7 +366,10 @@ async fn main() -> anyhow::Result<()> {
         .stop()
         .map_err(|e| anyhow::anyhow!("input session shutdown: {e}"))?;
 
-    Ok(())
+    match pipeline_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

@@ -186,6 +186,15 @@ impl FrameAssembler {
         let mut completed = Vec::new();
         let mut need_idr = false;
 
+        // Reject malformed headers off the untrusted network before they
+        // touch any state: a zero `fragment_count` would create an
+        // instantly-"complete" empty frame (and, if keyframe-flagged,
+        // falsely clear recovery state), and an out-of-range
+        // `fragment_index` can never index into the fragment buffer.
+        if header.fragment_count == 0 || header.fragment_index >= header.fragment_count {
+            return (completed, false);
+        }
+
         // Start in-order tracking from the first frame seen on this stream
         // (the client may join mid-stream).
         let next = *self
@@ -549,7 +558,21 @@ pub(crate) async fn receive_loop(
                             }
                         }
                         STREAM_TYPE_AUDIO => {
-                            audio_tx.send(frame).await.map_err(|_| mpsc::error::SendError(()))
+                            // Non-blocking, like the video path above:
+                            // awaiting on a full audio channel would
+                            // backpressure this datagram select loop and
+                            // stall *video* reads, causing cascading
+                            // unreliable-datagram loss. A dropped Opus frame
+                            // is a brief glitch the decoder recovers from on
+                            // the next packet — no IDR needed.
+                            match audio_tx.try_send(frame) {
+                                // Sent, or dropped because the decoder is
+                                // behind — both are fine for audio.
+                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    Err(mpsc::error::SendError(()))
+                                }
+                            }
                         }
                         other => {
                             warn!(stream_type = other, "Unknown stream type, dropping frame");
@@ -641,6 +664,48 @@ mod tests {
         assert_eq!(frames[0].pts, 100);
         assert!(frames[0].is_keyframe);
         assert_eq!(frames[0].stream_type, STREAM_TYPE_VIDEO);
+    }
+
+    #[test]
+    fn malformed_zero_fragment_count_rejected() {
+        // A zero fragment_count off the network must not create an
+        // instantly-"complete" empty frame, nor (when keyframe-flagged)
+        // clear recovery state.
+        let mut assembler = FrameAssembler::new();
+        let header = video_header(0, 0, 0, 100, true);
+
+        let (frames, need_idr) = assembler.process_datagram(&header, vec![1, 2, 3]);
+
+        assert!(frames.is_empty());
+        assert!(!need_idr);
+    }
+
+    #[test]
+    fn malformed_datagram_does_not_anchor_delivery() {
+        // Malformed headers must be rejected *before* they seed in-order
+        // tracking. Without the guard, an out-of-range fragment_index (or a
+        // zero fragment_count) with a high frame_index would seed
+        // `next_frame` to that index, causing a later legitimate frame 0 to
+        // be dropped as "late".
+        let mut assembler = FrameAssembler::new();
+
+        // High frame_index, fragment_index >= fragment_count.
+        let bad = video_header(10_000, 3, 3, 100, false);
+        let (frames, _) = assembler.process_datagram(&bad, vec![9]);
+        assert!(frames.is_empty());
+
+        // High frame_index, zero fragment_count.
+        let bad2 = video_header(10_001, 0, 0, 100, true);
+        let (frames, _) = assembler.process_datagram(&bad2, vec![1, 2, 3]);
+        assert!(frames.is_empty());
+
+        // A legitimate frame 0 must still be delivered — proving neither
+        // malformed datagram anchored delivery at their high indices.
+        let good = video_header(0, 0, 1, 200, true);
+        let (frames, need_idr) = assembler.process_datagram(&good, vec![1, 2, 3]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, vec![1, 2, 3]);
+        assert!(!need_idr);
     }
 
     #[test]

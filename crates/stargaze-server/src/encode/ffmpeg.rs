@@ -214,9 +214,21 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
         (*raw_ctx).hw_frames_ctx = ffmpeg_sys_next::av_buffer_ref(hw_frames_ctx);
     }
 
-    let mut encoder = ctx.encoder().video().map_err(|e| {
-        EncodeError::InitError(format!("failed to create video encoder context: {e}"))
-    })?;
+    let mut encoder = match ctx.encoder().video() {
+        Ok(encoder) => encoder,
+        Err(e) => {
+            // `ctx` (and its attached ref copies) is dropped here, but the
+            // originals allocated above are ours to free.
+            unsafe {
+                let mut hw_frames_ptr = hw_frames_ctx;
+                ffmpeg_sys_next::av_buffer_unref(&raw mut hw_frames_ptr);
+                ffmpeg_sys_next::av_buffer_unref(&raw mut hw_device_ctx);
+            }
+            return Err(EncodeError::InitError(format!(
+                "failed to create video encoder context: {e}"
+            )));
+        }
+    };
 
     // Configure codec context.
     encoder.set_width(config.width);
@@ -273,9 +285,21 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
     opts.set("forced-idr", "1");
     opts.set("zerolatency", "1");
 
-    let opened = encoder
-        .open_with(opts)
-        .map_err(|e| EncodeError::InitError(format!("failed to open hevc_nvenc encoder: {e}")))?;
+    let opened = match encoder.open_with(opts) {
+        Ok(opened) => opened,
+        Err(e) => {
+            // `encoder` (and its attached ref copies) is dropped here, but the
+            // originals allocated above are ours to free.
+            unsafe {
+                let mut hw_frames_ptr = hw_frames_ctx;
+                ffmpeg_sys_next::av_buffer_unref(&raw mut hw_frames_ptr);
+                ffmpeg_sys_next::av_buffer_unref(&raw mut hw_device_ctx);
+            }
+            return Err(EncodeError::InitError(format!(
+                "failed to open hevc_nvenc encoder: {e}"
+            )));
+        }
+    };
 
     // Extract VPS/SPS/PPS from encoder extradata (NVENC stores parameter sets
     // here rather than inline in the bitstream).
@@ -348,7 +372,11 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
 ///
 /// Returns `EncodeError` if a fatal encoding error occurs. Non-fatal errors
 /// (e.g., a single frame upload failure) are logged and skipped.
-#[allow(clippy::unnecessary_wraps, clippy::too_many_arguments)]
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 pub(crate) fn run_encode_loop(
     encoder: &mut FfmpegEncoder,
     config: &EncoderConfig,
@@ -362,6 +390,7 @@ pub(crate) fn run_encode_loop(
     let mut last_idr_value: u64 = 0;
     let mut current_bitrate = config.bitrate_mbps;
     let mut packet = ffmpeg_next::Packet::empty();
+    let mut consecutive_panics: u32 = 0;
 
     info!("Encoder loop started, waiting for frames from capture pipeline");
 
@@ -424,29 +453,61 @@ pub(crate) fn run_encode_loop(
             info!("First frame received from capture pipeline, uploading to encoder");
         }
         let prep_start = std::time::Instant::now();
-        let capture_us = saturating_us(prep_start - captured.captured_at);
-        match upload_and_encode(encoder, &frame, frame_counter, force_idr) {
-            Ok(()) => {}
-            Err(e) => {
+        let capture_us = saturating_us(prep_start.saturating_duration_since(captured.captured_at));
+
+        // Panic boundary. A bug in the conversion/upload/drain path (an
+        // odd-dimension assert in `convert`, a scaler init `.expect`, a band
+        // worker panicking under `thread::scope`) would otherwise unwind and
+        // kill this dedicated thread, leaving the server up but permanently
+        // unable to produce video with nothing surfaced beyond client
+        // disconnects. Catch it, skip the frame, and force the next frame to
+        // an IDR so the decoder resyncs. Sustained panics are treated as
+        // fatal so the thread exits and a supervisor can restart it, rather
+        // than spinning on a frame it can never encode.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            upload_and_encode(encoder, &frame, frame_counter, force_idr)?;
+            // Frame preparation: pixel conversion + GPU upload + send_frame.
+            let convert_us = saturating_us(prep_start.elapsed());
+            drain_packets(
+                &mut encoder.encoder,
+                &mut packet,
+                packets_tx,
+                frame_counter,
+                &encoder.extradata,
+                capture_us,
+                convert_us,
+                std::time::Instant::now(),
+            );
+            Ok::<(), EncodeError>(())
+        }));
+
+        match outcome {
+            Ok(Ok(())) => consecutive_panics = 0,
+            Ok(Err(e)) => {
                 warn!(frame = frame_counter, "Skipping frame: {e}");
                 frame_counter += 1;
                 continue;
             }
+            Err(panic) => {
+                consecutive_panics += 1;
+                let msg = panic_message(panic.as_ref());
+                error!(
+                    frame = frame_counter,
+                    consecutive_panics, "Encode path panicked, skipping frame: {msg}"
+                );
+                if consecutive_panics >= MAX_CONSECUTIVE_ENCODE_PANICS {
+                    return Err(EncodeError::FfmpegError(format!(
+                        "encode path panicked on {consecutive_panics} consecutive frames; \
+                         last panic: {msg}"
+                    )));
+                }
+                // Force the next frame to an IDR so the decoder resyncs after
+                // the gap (differs last_idr_value from the unchanged watch).
+                last_idr_value = last_idr_value.wrapping_sub(1);
+                frame_counter += 1;
+                continue;
+            }
         }
-        // Frame preparation: pixel conversion + GPU upload + send_frame.
-        let convert_us = saturating_us(prep_start.elapsed());
-
-        // Receive encoded packets.
-        drain_packets(
-            &mut encoder.encoder,
-            &mut packet,
-            packets_tx,
-            frame_counter,
-            &encoder.extradata,
-            capture_us,
-            convert_us,
-            std::time::Instant::now(),
-        );
 
         frame_counter += 1;
         if frame_counter == 1
@@ -466,6 +527,60 @@ pub(crate) fn run_encode_loop(
 
     info!(total_frames = frame_counter, "Encoder loop finished");
     Ok(())
+}
+
+/// Number of consecutive per-frame panics tolerated before the encode loop
+/// gives up and returns an error (so the thread exits cleanly and a
+/// supervisor can restart, rather than spinning on an unencodable frame).
+const MAX_CONSECUTIVE_ENCODE_PANICS: u32 = 10;
+
+/// Best-effort extraction of a human-readable message from a caught panic
+/// payload (`catch_unwind`'s `Err`).
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+/// RAII guard for a CUDA context pushed as current on the calling thread.
+///
+/// Pushing on construction and popping on `Drop` keeps the thread's CUDA
+/// context stack balanced across every exit path — a normal return, an
+/// early `?`, or a panic unwinding through the encode path. The encode
+/// loop's `catch_unwind` boundary would otherwise swallow a panic while
+/// leaving the context pushed, imbalancing the stack for later frames.
+struct CudaCtxGuard;
+
+impl CudaCtxGuard {
+    /// Pushes `ctx` as the current CUDA context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EncodeFrameError` if `cuCtxPushCurrent` fails; no guard is
+    /// created in that case, so nothing is popped.
+    fn push(ctx: cudarc::driver::sys::CUcontext, pts: u64) -> Result<Self, EncodeError> {
+        let res = unsafe { cudarc::driver::sys::cuCtxPushCurrent_v2(ctx) };
+        if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(EncodeError::EncodeFrameError {
+                frame: pts,
+                reason: format!("cuCtxPushCurrent failed: {res:?}"),
+            });
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for CudaCtxGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let mut old: cudarc::driver::sys::CUcontext = ptr::null_mut();
+            cudarc::driver::sys::cuCtxPopCurrent_v2(&raw mut old);
+        }
+    }
 }
 
 /// Maps our capture `PixelFormat` to the corresponding `FFmpeg` pixel format.
@@ -668,17 +783,11 @@ fn gpu_convert_and_encode(
 ) -> Result<(), EncodeError> {
     use cudarc::driver::sys as cu;
 
-    unsafe {
-        let res = cu::cuCtxPushCurrent_v2(encoder.cuda_ctx);
-        if res != cu::CUresult::CUDA_SUCCESS {
-            return Err(EncodeError::EncodeFrameError {
-                frame: pts,
-                reason: format!("cuCtxPushCurrent failed: {res:?}"),
-            });
-        }
-    }
+    // Guard pops the CUDA context on every exit path, including a panic
+    // unwinding through the converter/convert code below.
+    let _ctx = CudaCtxGuard::push(encoder.cuda_ctx, pts)?;
 
-    let result = (|| {
+    (|| {
         if encoder.gpu_converter.is_none() {
             match super::egl_cuda::GpuNv12Converter::new(width, height) {
                 Ok(conv) => encoder.gpu_converter = Some(conv),
@@ -725,13 +834,8 @@ fn gpu_convert_and_encode(
         }
 
         send_hw_frame(encoder, &mut hw_frame, pts, force_idr)
-    })();
-
-    unsafe {
-        let mut old: cu::CUcontext = ptr::null_mut();
-        cu::cuCtxPopCurrent_v2(&raw mut old);
-    }
-    result
+    })()
+    // `_ctx` pops the CUDA context here, including on a panic unwind.
 }
 
 /// Stamps pts / forced-IDR on a hardware frame and submits it to NVENC.
@@ -813,29 +917,18 @@ fn upload_dmabuf_and_encode(
     pts: u64,
     force_idr: bool,
 ) -> Result<(), EncodeError> {
-    use cudarc::driver::sys as cu;
-
-    unsafe {
-        let res = cu::cuCtxPushCurrent_v2(encoder.cuda_ctx);
-        if res != cu::CUresult::CUDA_SUCCESS {
-            return Err(EncodeError::EncodeFrameError {
-                frame: pts,
-                reason: format!("cuCtxPushCurrent failed: {res:?}"),
-            });
-        }
-    }
+    // Guard pops the CUDA context on every exit path, including a panic
+    // unwinding through the import/convert code below. Where a pop must
+    // precede a nested call that re-pushes the context, it is dropped
+    // explicitly (`drop(ctx)`).
+    let ctx = CudaCtxGuard::push(encoder.cuda_ctx, pts)?;
 
     if encoder.egl_bridge.is_none() {
-        match super::egl_cuda::EglCudaBridge::new(info.width, info.height, encoder.cuda_ctx) {
-            Ok(bridge) => encoder.egl_bridge = Some(bridge),
-            Err(e) => {
-                unsafe {
-                    let mut old: cu::CUcontext = ptr::null_mut();
-                    cu::cuCtxPopCurrent_v2(&raw mut old);
-                }
-                return Err(e);
-            }
-        }
+        // `?` here still pops the context: `ctx`'s guard drops on the early
+        // return.
+        let bridge =
+            super::egl_cuda::EglCudaBridge::new(info.width, info.height, encoder.cuda_ctx)?;
+        encoder.egl_bridge = Some(bridge);
     }
 
     // Fully-GPU path: EGL → GL → CUDA kernel → NV12 hw frame, no CPU
@@ -849,10 +942,6 @@ fn upload_dmabuf_and_encode(
         match gpu_import_and_encode(encoder, info, pts, force_idr) {
             Ok(()) => {
                 encoder.gpu_path_failures = 0;
-                unsafe {
-                    let mut old: cu::CUcontext = ptr::null_mut();
-                    cu::cuCtxPopCurrent_v2(&raw mut old);
-                }
                 return Ok(());
             }
             Err(e) => {
@@ -875,10 +964,9 @@ fn upload_dmabuf_and_encode(
     let cpu_buf = match bridge.import_dmabuf_to_cpu(info) {
         Ok(buf) => buf,
         Err(e) => {
-            unsafe {
-                let mut old: cu::CUcontext = ptr::null_mut();
-                cu::cuCtxPopCurrent_v2(&raw mut old);
-            }
+            // The mmap fallback runs without our context pushed (matching
+            // the original hand-balanced pop at this point).
+            drop(ctx);
             if pts < 3 {
                 warn!(
                     frame = pts,
@@ -895,10 +983,9 @@ fn upload_dmabuf_and_encode(
         }
     };
 
-    unsafe {
-        let mut old: cu::CUcontext = ptr::null_mut();
-        cu::cuCtxPopCurrent_v2(&raw mut old);
-    }
+    // The nested CPU encode re-pushes the context itself; drop our push
+    // first so the same context isn't stacked twice.
+    drop(ctx);
 
     // EGL→GL shader blit always outputs RGBA (glReadPixels with gl::RGBA),
     // regardless of the original DMA-BUF pixel format.

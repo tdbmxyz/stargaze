@@ -406,7 +406,7 @@ pub(crate) fn run_decode_loop(
         // with "Duplicate POC in a sequence: 0" when a gray placeholder
         // or the original POC-0 picture still occupies the buffer, and
         // the corruption then persists past the keyframe.
-        if frame.is_keyframe && packet_counter > 0 {
+        if frame.is_keyframe {
             decoder.decoder.flush();
         }
 

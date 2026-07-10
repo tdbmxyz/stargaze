@@ -4,7 +4,7 @@ This file provides guidance to LLM Code Assistants when working with code in thi
 
 ## Environment
 
-- **NixOS** — The development environment is provided by `flake.nix` using [fenix](https://github.com/nix-community/fenix) for the Rust nightly toolchain. `cargo`/`rustc` are **not** on the host `PATH`: run all Rust commands through the dev shell, either interactively (`nix develop`) or one-shot (`nix develop -c cargo test --workspace`).
+- **NixOS** — The development environment is provided by `flake.nix` using [fenix](https://github.com/nix-community/fenix) for the Rust nightly toolchain. `cargo`/`rustc` are **not** on the host `PATH`: run all Rust commands through the dev shell, either interactively (`nix develop`) or one-shot (`nix develop -c cargo nextest run --workspace`).
 - **CUDA dev shell** — `nix develop .#cuda` extends the default shell with a CUDA-enabled FFmpeg and the CUDA toolkit, needed for NVENC-related tests on an NVIDIA host.
 - **Devcontainer alternative** — A `.devcontainer/` setup exists for Docker/GPU environments (Debian Trixie + CUDA). Either environment works.
 - **Already in the correct directory** — do NOT prefix commands with `cd workspace-folder` or similar. All commands run from the project root by default.
@@ -90,7 +90,7 @@ Run all of these inside the dev shell before considering any change done:
 
 - **Formatting**: `cargo fmt`
 - **Linting**: `cargo clippy --workspace --all-targets -- -W clippy::pedantic` — `--all-targets` is required: tests and integration tests have repeatedly accumulated lint errors that the default lib/bin-only run never sees. Fix new warnings; don't let them ride.
-- **Testing**: `cargo test --workspace`
+- **Testing**: `cargo nextest run --workspace`
 - **Checking**: `cargo check --workspace` for fast feedback
 
 Hardware-dependent tests (`NVENC`, `uinput`, live compositor) are `#[ignore]`d and listed in each test's doc comment with the command to run them manually. They do not run in CI/sandboxes — do not interpret a green suite as hardware verification.
@@ -147,7 +147,7 @@ This project uses **Cargo** with nightly Rust. Enter the dev shell first:
 nix develop   # Provides rustc, cargo, clippy, rustfmt, and all native deps
 
 cargo build
-cargo test --workspace
+cargo nextest run --workspace
 cargo clippy --workspace --all-targets -- -W clippy::pedantic
 cargo fmt --check
 ```

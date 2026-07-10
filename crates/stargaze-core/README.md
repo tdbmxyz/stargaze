@@ -26,7 +26,7 @@ This crate is intentionally free of heavy native dependencies (no FFmpeg, SDL, P
 ## Tests
 
 ```bash
-cargo test -p stargaze-core
+cargo nextest run -p stargaze-core
 ```
 
 Round-trip serialization tests cover every `ControlMessage` variant and the datagram header; config tests cover TOML parsing, defaults, and partial files.

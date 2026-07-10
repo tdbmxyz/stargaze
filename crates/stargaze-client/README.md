@@ -50,7 +50,7 @@ Check which decoder engaged at startup (`RUST_LOG=info`): look for `H.265 VAAPI 
 ## Tests
 
 ```bash
-cargo test -p stargaze-client
+cargo nextest run -p stargaze-client
 ```
 
 Includes unit tests for the `FrameAssembler` (ordering, gap skipping, IDR triggering) and a localhost QUIC integration test exercising fragmentation → reassembly end-to-end.

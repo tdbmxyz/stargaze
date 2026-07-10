@@ -96,7 +96,7 @@
     # metadata and build environment across the two package derivations.
     commonPackageAttrs = {
       pname = "stargaze";
-      version = "1.3.3";
+      version = "1.3.4";
       src = self;
 
       cargoLock.lockFile = ./Cargo.lock;
@@ -113,7 +113,7 @@
 
       # Tests require runtime resources unavailable in the Nix sandbox
       # (PipeWire, display server, NVIDIA GPU, /dev/uinput).  Run tests
-      # via `nix develop -c cargo test` instead.
+      # via `nix develop -c cargo nextest run` instead.
       doCheck = false;
 
       # build.rs in each crate calls pkg-config at build time.
@@ -282,6 +282,7 @@
           commonNativeBuildInputs
           ++ [
             fenix.packages.${system}.rust-analyzer
+            pkgs.cargo-nextest
           ];
 
         buildInputs = commonBuildInputs;
@@ -302,6 +303,7 @@
           ++ [
             fenix.packages.${system}.rust-analyzer
             pkgsCuda.cudaPackages.cuda_nvcc
+            pkgsCuda.cargo-nextest
           ];
 
         buildInputs =
