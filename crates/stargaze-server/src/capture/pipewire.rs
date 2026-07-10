@@ -490,7 +490,7 @@ pub fn run_capture_stream(
                 }
             }
         })
-        .param_changed(|stream, data, id, param| {
+        .param_changed(move |stream, data, id, param| {
             let Some(param) = param else {
                 info!(param_id = id, "param_changed with null param");
                 return;
@@ -510,10 +510,39 @@ pub fn run_capture_stream(
             let mut video_info = pipewire::spa::param::video::VideoInfoRaw::new();
             if video_info.parse(param).is_ok() {
                 let size = video_info.size();
+
+                // A renegotiation to a different frame layout after the
+                // first negotiation (the captured output was reconfigured,
+                // e.g. a monitor was plugged in and changed its mode): the
+                // encoder is fixed to the original dimensions, so feeding
+                // it the new frames wedges the whole pipeline with
+                // per-frame size errors. Stop capture instead — the
+                // process exits with an error and the supervisor restarts
+                // the pipeline at the output's current mode.
+                let new_format = spa_format_to_pixel_format(video_info.format().as_raw());
+                let renegotiated = data.resolution_tx.is_none()
+                    && (size.width != data.width
+                        || size.height != data.height
+                        || video_info.modifier() != data.modifier
+                        || new_format.is_some_and(|pf| pf != data.format));
+                if renegotiated {
+                    error!(
+                        old_width = data.width,
+                        old_height = data.height,
+                        new_width = size.width,
+                        new_height = size.height,
+                        "Capture format changed mid-stream (output reconfigured), stopping capture for a pipeline restart"
+                    );
+                    unsafe {
+                        pipewire_sys::pw_main_loop_quit(mainloop_ptr);
+                    }
+                    return;
+                }
+
                 data.width = size.width;
                 data.height = size.height;
 
-                if let Some(pf) = spa_format_to_pixel_format(video_info.format().as_raw()) {
+                if let Some(pf) = new_format {
                     data.format = pf;
                 }
 

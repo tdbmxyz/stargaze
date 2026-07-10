@@ -190,11 +190,14 @@ pub(crate) async fn handle_control_messages(
 
 /// Sends encoded packets as fragmented `QUIC` datagrams.
 ///
-/// Runs until the packet channel closes.
+/// Runs until the connection is lost (`Ok`) or the packet channel closes
+/// ([`TransportError::PipelineClosed`] — the encoder is dead, so the whole
+/// process must restart before any client can be served again).
 ///
 /// # Errors
 ///
-/// Returns [`TransportError::SendError`] on datagram send failures.
+/// Returns [`TransportError::SendError`] on datagram send failures and
+/// [`TransportError::PipelineClosed`] when the packet channel closes.
 pub(crate) async fn send_packets(
     connection: &quinn::Connection,
     packets: &mut mpsc::Receiver<EncodedPacket>,
@@ -285,6 +288,12 @@ pub(crate) async fn send_packets(
         frame_index = frame_index.wrapping_add(1);
     }
 
-    info!("Packet channel closed, transport sender exiting");
-    Ok(())
+    let stream_name = if stream_type == stargaze_core::transport::STREAM_TYPE_AUDIO {
+        "audio"
+    } else {
+        "video"
+    };
+    Err(TransportError::PipelineClosed(format!(
+        "{stream_name} packet channel closed"
+    )))
 }

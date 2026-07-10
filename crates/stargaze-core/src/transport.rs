@@ -240,6 +240,11 @@ pub enum TransportError {
     /// Serialization or deserialization failed.
     #[error("serialization error: {0}")]
     SerializationError(String),
+
+    /// An encode pipeline packet channel closed: the pipeline is dead
+    /// and no session can be served until the process restarts.
+    #[error("pipeline closed: {0}")]
+    PipelineClosed(String),
 }
 
 /// Serializes a [`DatagramHeader`] to bytes using `postcard`.
