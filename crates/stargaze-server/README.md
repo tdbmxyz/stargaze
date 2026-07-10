@@ -45,11 +45,11 @@ Configuration file: `~/.config/stargaze/server.toml` (CLI flags override file va
 ## Tests
 
 ```bash
-cargo test -p stargaze-server
+cargo nextest run -p stargaze-server
 ```
 
 GPU- and uinput-dependent tests are `#[ignore]`d; run them manually on real hardware, e.g.:
 
 ```bash
-cargo test -p stargaze-server -- --ignored test_nvenc_encode_synthetic_frames
+cargo nextest run -p stargaze-server --run-ignored ignored-only -E 'test(test_nvenc_encode_synthetic_frames)'
 ```

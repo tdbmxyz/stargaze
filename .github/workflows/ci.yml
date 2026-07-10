@@ -50,5 +50,8 @@ jobs:
       - name: cargo clippy
         run: nix develop -c cargo clippy --workspace --all-targets -- -W clippy::pedantic
 
-      - name: cargo test
-        run: nix develop -c cargo test --workspace
+      # nextest over cargo test for process-per-test isolation (a native
+      # crash in one ffmpeg-adjacent test can't mask the rest of the suite)
+      # despite being ~1s slower on this suite of many tiny tests.
+      - name: cargo nextest
+        run: nix develop -c cargo nextest run --workspace
