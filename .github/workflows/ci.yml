@@ -20,6 +20,30 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@v16
 
+      # Persist the Nix store across runs: without this every job
+      # re-downloads the whole dev-shell closure (toolchain, ffmpeg, …)
+      # from cache.nixos.org — several minutes before any step runs.
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-check-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix') }}
+          restore-prefixes-first-match: nix-check-${{ runner.os }}-
+          gc-max-store-size-linux: 6G
+          purge: true
+          purge-prefixes: nix-check-${{ runner.os }}-
+          purge-created: 0
+          purge-primary-key: never
+
+      # Persist cargo deps + build artifacts so clippy/test only
+      # recompile the crates that actually changed.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
       - name: cargo fmt
         run: nix develop -c cargo fmt --check
 
