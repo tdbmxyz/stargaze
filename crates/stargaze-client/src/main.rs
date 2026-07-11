@@ -221,29 +221,64 @@ fn has_session_overrides(cli: &Cli) -> bool {
         || cli.codec.is_some()
 }
 
-/// Prefers SDL's x11 video driver whenever an X display is reachable
-/// and the user hasn't chosen a driver explicitly.
+/// Picks the SDL video driver for the host session, unless the user
+/// chose one explicitly.
 ///
 /// Gamescope (Steam Deck gaming mode) only displays clients that come
-/// in through XWayland — native Wayland surfaces need gamescope's
-/// --expose-wayland and are otherwise never shown — while SDL3 (under
-/// sdl2-compat) picks Wayland whenever WAYLAND_DISPLAY is set, so the
-/// launcher ran invisibly. Detecting gamescope by environment proved
-/// unreliable (Steam doesn't pass XDG_CURRENT_DESKTOP=gamescope to the
-/// game), so key on DISPLAY instead: X11 works wherever it is set
-/// (gaming mode, desktop Wayland sessions via XWayland, plain X11),
-/// and pure-Wayland hosts without XWayland leave it unset and keep
-/// SDL's default.
-fn prefer_x11_video_driver() {
-    fn env_nonempty(name: &str) -> bool {
-        std::env::var_os(name).is_some_and(|v| !v.is_empty())
+/// in through `XWayland` — native Wayland surfaces need gamescope's
+/// --expose-wayland and are otherwise never shown — so under gamescope
+/// the x11 driver is mandatory. Gamescope is detected by its Wayland
+/// socket name: `wlserver.cpp` hardcodes `gamescope-%d`, and that name
+/// is exactly what it puts in `WAYLAND_DISPLAY` (broader environment
+/// signals like `XDG_CURRENT_DESKTOP` proved unreliable — Steam doesn't
+/// pass them to the game).
+///
+/// On a desktop Wayland session the opposite holds: the client must
+/// run natively, NOT through `XWayland`, because input capture relies on
+/// `set_keyboard_grab` becoming a `zwp_keyboard_shortcuts_inhibit` hold —
+/// an X-level grab can't stop the compositor's own bindings, so Meta+N
+/// workspace switches and launcher keys kept acting on the local
+/// desktop. SDL's default driver order already prefers Wayland (and
+/// falls back to x11 if the socket is dead), so nothing is forced.
+///
+/// No `WAYLAND_DISPLAY` at all means a plain X11 session: force x11 as
+/// before.
+fn choose_video_driver() {
+    fn env_str(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.is_empty())
     }
-    let explicit = env_nonempty("SDL_VIDEODRIVER") || env_nonempty("SDL_VIDEO_DRIVER");
-    if !explicit && env_nonempty("DISPLAY") {
-        info!("X display available: preferring the x11 SDL video driver");
+    let explicit = env_str("SDL_VIDEODRIVER").is_some() || env_str("SDL_VIDEO_DRIVER").is_some();
+    if explicit {
+        return;
+    }
+    if let Some(driver) = forced_video_driver(
+        env_str("WAYLAND_DISPLAY").as_deref(),
+        env_str("DISPLAY").as_deref(),
+    ) {
+        info!(driver, "Forcing SDL video driver for this session type");
         // Old and new hint names; sdl2-compat forwards both to SDL3.
-        sdl2::hint::set("SDL_VIDEODRIVER", "x11");
-        sdl2::hint::set("SDL_VIDEO_DRIVER", "x11");
+        sdl2::hint::set("SDL_VIDEODRIVER", driver);
+        sdl2::hint::set("SDL_VIDEO_DRIVER", driver);
+    } else {
+        info!("Desktop Wayland session: using SDL's native Wayland driver");
+    }
+}
+
+/// Decides whether a video driver must be forced given the session's
+/// display environment. `None` keeps SDL's default order (Wayland
+/// first), which is required on desktop Wayland sessions for keyboard
+/// capture to inhibit compositor shortcuts.
+fn forced_video_driver(
+    wayland_display: Option<&str>,
+    x11_display: Option<&str>,
+) -> Option<&'static str> {
+    match wayland_display {
+        // WAYLAND_DISPLAY may be a bare socket name or an absolute path.
+        Some(wl) => {
+            let name = wl.rsplit('/').next().unwrap_or(wl);
+            name.starts_with("gamescope").then_some("x11")
+        }
+        None => x11_display.map(|_| "x11"),
     }
 }
 
@@ -268,7 +303,7 @@ async fn main() -> anyhow::Result<()> {
     let direct = cli.server.is_some()
         || (!cli.gui && !cfg.server_address.is_empty() && cfg.hosts.is_empty());
 
-    prefer_x11_video_driver();
+    choose_video_driver();
 
     // SDL2 must be initialized on the main thread.
     let sdl = sdl2::init().map_err(|e| anyhow!("SDL2 init failed: {e}"))?;
@@ -336,4 +371,48 @@ async fn main() -> anyhow::Result<()> {
     info!("Client shut down");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forced_video_driver;
+
+    /// Gaming mode: gamescope's nested compositor never shows native
+    /// Wayland surfaces, so x11 (XWayland) is mandatory.
+    #[test]
+    fn gamescope_socket_forces_x11() {
+        assert_eq!(
+            forced_video_driver(Some("gamescope-0"), Some(":0")),
+            Some("x11")
+        );
+        assert_eq!(
+            forced_video_driver(Some("/run/user/1000/gamescope-1"), Some(":1")),
+            Some("x11")
+        );
+    }
+
+    /// Desktop Wayland (KDE on the Deck, Hyprland, …): must stay on the
+    /// native Wayland driver so `set_keyboard_grab` inhibits compositor
+    /// shortcuts — forcing x11 here made Meta+N act on the local desktop.
+    #[test]
+    fn desktop_wayland_keeps_sdl_default() {
+        assert_eq!(forced_video_driver(Some("wayland-0"), Some(":0")), None);
+        assert_eq!(forced_video_driver(Some("wayland-1"), None), None);
+        assert_eq!(
+            forced_video_driver(Some("/run/user/1000/wayland-1"), Some(":0")),
+            None
+        );
+    }
+
+    /// Plain X11 session: no Wayland socket, force x11 as before.
+    #[test]
+    fn x11_only_session_forces_x11() {
+        assert_eq!(forced_video_driver(None, Some(":0")), Some("x11"));
+    }
+
+    /// Nothing set (headless/SSH): leave SDL alone.
+    #[test]
+    fn no_display_leaves_default() {
+        assert_eq!(forced_video_driver(None, None), None);
+    }
 }
