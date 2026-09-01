@@ -104,6 +104,7 @@ Let clap handle default value display. Do **not** manually write `[default: X]` 
 Hard-won, non-obvious constraints. Check this list before "simplifying" anything that looks redundant.
 
 - **FFmpeg hardware decode needs a `get_format` callback.** Attaching `hw_device_ctx` to a decoder context is *not* enough: FFmpeg's default `get_format` skips hardware pixel formats and silently decodes in software. The callback must explicitly select `AV_PIX_FMT_VAAPI` (see client `decode/ffmpeg.rs::select_vaapi_format`). Probe support first with `avcodec_get_hw_config`.
+- **Mesa's loader and driver must come from the same nixpkgs revision.** A client consumed as a flake input can carry Stargaze's `libva`/`libGL` while NixOS exposes a different Mesa under `/run/opengl-driver`; mixing them made VAAPI fail with a missing `__vaDriverInit` symbol and silently fall back to software on the AMD client. Keep the client wrapper's `LIBVA_DRIVERS_PATH`, `LIBGL_DRIVERS_PATH`, and `__EGL_VENDOR_LIBRARY_DIRS` pinned to the packaged Mesa.
 - **SDL2 must be initialized and pumped on the main thread.** The render loop doubles as the input event pump; don't move it to a worker.
 - **No vsync, but no busy-spin either.** The render loop deliberately avoids `present_vsync()` (adds up to a frame of input latency) and instead blocks on the decoded-frame channel with a ~2 ms timeout. Don't reintroduce either extreme.
 - **NVIDIA GL driver can't bind linear DMA-BUF EGL images to `GL_TEXTURE_2D`** — use `GL_TEXTURE_EXTERNAL_OES` (see `encode/egl_cuda.rs`).
