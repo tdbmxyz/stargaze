@@ -117,6 +117,10 @@ pub enum ControlMessage {
         /// Server command line, sanitized of addresses and ports
         /// (for the client's session diagnostics).
         server_command: String,
+        /// Number of audio channels the server encodes (1, 2, 6, or 8).
+        /// Appended for surround support — pre-surround servers omit it and
+        /// [`deserialize_session_response_compat`] defaults it to 2 (stereo).
+        audio_channels: u16,
     },
     /// Client -> Server: request an IDR keyframe (after packet loss).
     IdrRequest,
@@ -310,6 +314,69 @@ enum LegacyControlMessageV1 {
     },
 }
 
+/// The `SessionResponse` shape shipped before surround audio (no
+/// `audio_channels`). Variant order mirrors [`ControlMessage`] so the postcard
+/// tag for `SessionResponse` (index 1) decodes into this variant; the leading
+/// `SessionRequest` variant only exists to preserve that index.
+#[derive(Serialize, Deserialize)]
+enum LegacyControlMessageV2 {
+    #[allow(dead_code)]
+    SessionRequest {
+        width: u32,
+        height: u32,
+        framerate: u32,
+        codec: Codec,
+        bitrate_mbps: u32,
+    },
+    SessionResponse {
+        width: u32,
+        height: u32,
+        framerate: u32,
+        bitrate_mbps: u32,
+        codec: Codec,
+        max_datagram_size: u16,
+        cursor_embedded: bool,
+        server_command: String,
+    },
+}
+
+/// Deserializes a `SessionResponse`, accepting both the current shape and the
+/// pre-surround one (which lacks `audio_channels`; it comes back as 2 = stereo,
+/// the only layout those servers produce).
+///
+/// # Errors
+///
+/// Returns [`TransportError::SerializationError`] if the body is not a session
+/// response in either shape.
+pub fn deserialize_session_response_compat(body: &[u8]) -> Result<ControlMessage, TransportError> {
+    match deserialize_control_message(body) {
+        Ok(msg) => Ok(msg),
+        Err(modern_err) => match postcard::from_bytes::<LegacyControlMessageV2>(body) {
+            Ok(LegacyControlMessageV2::SessionResponse {
+                width,
+                height,
+                framerate,
+                bitrate_mbps,
+                codec,
+                max_datagram_size,
+                cursor_embedded,
+                server_command,
+            }) => Ok(ControlMessage::SessionResponse {
+                width,
+                height,
+                framerate,
+                bitrate_mbps,
+                codec,
+                max_datagram_size,
+                cursor_embedded,
+                server_command,
+                audio_channels: 2,
+            }),
+            _ => Err(modern_err),
+        },
+    }
+}
+
 /// Deserializes a `SessionRequest`, accepting both the current shape
 /// and the pre-v1.3.0 one (which lacks `bitrate_mbps`; it comes back
 /// as 0 = "server default").
@@ -472,11 +539,115 @@ mod tests {
             max_datagram_size: 1200,
             cursor_embedded: true,
             server_command: "stargaze-server --bitrate 50".to_string(),
+            audio_channels: 6,
         };
         let bytes = serialize_control_message(&msg).unwrap();
         let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
         let decoded = deserialize_control_message(&bytes[4..4 + len]).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn session_response_compat_reads_pre_surround_shape() {
+        // A pre-surround server serializes a SessionResponse without the
+        // trailing audio_channels field; a new client must default it to 2.
+        let legacy = LegacyControlMessageV2::SessionResponse {
+            width: 1920,
+            height: 1080,
+            framerate: 60,
+            bitrate_mbps: 20,
+            codec: Codec::H265,
+            max_datagram_size: 1200,
+            cursor_embedded: true,
+            server_command: "stargaze-server".to_string(),
+        };
+        let body = postcard::to_allocvec(&legacy).unwrap();
+        let decoded = deserialize_session_response_compat(&body).unwrap();
+        assert_eq!(
+            decoded,
+            ControlMessage::SessionResponse {
+                width: 1920,
+                height: 1080,
+                framerate: 60,
+                bitrate_mbps: 20,
+                codec: Codec::H265,
+                max_datagram_size: 1200,
+                cursor_embedded: true,
+                server_command: "stargaze-server".to_string(),
+                audio_channels: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn session_response_compat_reads_current_shape() {
+        let msg = ControlMessage::SessionResponse {
+            width: 3440,
+            height: 1440,
+            framerate: 100,
+            bitrate_mbps: 30,
+            codec: Codec::H265,
+            max_datagram_size: 1200,
+            cursor_embedded: false,
+            server_command: String::new(),
+            audio_channels: 8,
+        };
+        let body = postcard::to_allocvec(&msg).unwrap();
+        assert_eq!(deserialize_session_response_compat(&body).unwrap(), msg);
+    }
+
+    /// New server → old client: postcard ignores the appended channel count,
+    /// leaving the pre-surround response fields unchanged.
+    #[test]
+    fn legacy_parser_tolerates_new_response_bytes() {
+        let msg = ControlMessage::SessionResponse {
+            width: 2560,
+            height: 1440,
+            framerate: 120,
+            bitrate_mbps: 50,
+            codec: Codec::H265,
+            max_datagram_size: 1200,
+            cursor_embedded: true,
+            server_command: "stargaze-server --bitrate 50".to_string(),
+            audio_channels: 2,
+        };
+        let body = postcard::to_allocvec(&msg).unwrap();
+        let LegacyControlMessageV2::SessionResponse {
+            width,
+            height,
+            framerate,
+            bitrate_mbps,
+            codec,
+            max_datagram_size,
+            cursor_embedded,
+            server_command,
+        } = postcard::from_bytes::<LegacyControlMessageV2>(&body)
+            .expect("old clients must still parse new responses")
+        else {
+            panic!("expected legacy session response");
+        };
+        assert_eq!(
+            (
+                width,
+                height,
+                framerate,
+                bitrate_mbps,
+                codec,
+                max_datagram_size,
+                cursor_embedded,
+                server_command.as_str(),
+            ),
+            (
+                2560,
+                1440,
+                120,
+                50,
+                Codec::H265,
+                1200,
+                true,
+                "stargaze-server --bitrate 50",
+            )
+        );
     }
 
     #[test]
@@ -499,6 +670,7 @@ mod tests {
             max_datagram_size: 1200,
             cursor_embedded: false,
             server_command: String::new(),
+            audio_channels: 2,
         };
         let bytes = serialize_control_message(&msg).unwrap();
         let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;

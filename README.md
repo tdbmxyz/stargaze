@@ -10,7 +10,7 @@ Stargaze streams a Wayland desktop from a host machine (the **server**) to anoth
 ## Features
 
 - **Video**: PipeWire screen capture (DMA-BUF zero-copy or CPU path) → NVENC H.265 → QUIC → VAAPI or multi-threaded software decode → SDL2
-- **Audio**: PipeWire capture → Opus (stereo, 48 kHz) → SDL2 playback
+- **Audio**: PipeWire capture → Opus (stereo by default; mono/5.1/7.1 selectable, 48 kHz) → SDL2 playback. Surround is opt-in on the server (`audio_channels`) and advertised to the client in the handshake — see [docs/surround-audio.md](docs/surround-audio.md)
 - **Input**: keyboard, mouse, and game controller events forwarded from the client and injected on the server via uinput. Controllers are passed through at the evdev level — the host sees the real device (name, vendor/product ids, exact button/axis layout) — with automatic per-device fallback to Xbox 360 pad emulation (`--gamepad-passthrough false` forces emulation). Valve controller hardware (Steam Controller, dongle, Steam Deck) is forwarded wholesale as a USB device — USB/IP tunneled through the session connection — because Steam only accepts it with its real USB topology; needs a one-time permission setup, see [docs/steam-controller-usbip.md](docs/steam-controller-usbip.md)
 - **Mic forwarding** (optional): client microphone streamed back to the server via an [rsonance](https://github.com/tdbmxyz/rsonance) subprocess
 - **Loss recovery**: unreliable QUIC datagrams for media with in-order frame reassembly; lost frames trigger rate-limited IDR keyframe requests so the picture recovers in a few frames instead of seconds
@@ -130,6 +130,7 @@ port = 9000
 framerate = 60
 bitrate = 20            # Mbps
 codec = "h265"
+audio_channels = 2      # 1 = mono, 2 = stereo, 6 = 5.1, 8 = 7.1
 
 [resolution]
 width = 2560
