@@ -386,6 +386,7 @@ pub(super) fn run_sdl_loop(
     config: &DecoderConfig,
     decoded_rx: std::sync::mpsc::Receiver<VideoFrame>,
     audio_pcm_rx: std::sync::mpsc::Receiver<Vec<f32>>,
+    audio_channels: u16,
     fullscreen: bool,
     input_tx: std::sync::mpsc::Sender<InputEvent>,
     rtt_probe: super::RttProbe,
@@ -397,7 +398,9 @@ pub(super) fn run_sdl_loop(
     idr_tx: &tokio::sync::mpsc::Sender<()>,
     emulate_gamepads: bool,
 ) -> Result<(), anyhow::Error> {
-    let audio_queue: AudioQueue<f32> = create_audio_queue(sdl)?;
+    let audio_queue: AudioQueue<f32> = create_audio_queue(sdl, audio_channels)?;
+    let max_queued_audio_bytes = super::audio::max_queued_audio_bytes(audio_channels);
+    let audio_bytes_per_ms = super::audio::audio_bytes_per_ms(audio_channels);
 
     // The stream is BT.709 limited range (the server's converter and the
     // encoder both advertise it). SDL's automatic mode picks BT.601 —
@@ -705,7 +708,7 @@ pub(super) fn run_sdl_loop(
         // backlog above the cap so playback stays in sync with the video.
         let mut dropped_audio_bytes: u64 = 0;
         while let Ok(pcm) = audio_pcm_rx.try_recv() {
-            if audio_queue.size() > super::audio::MAX_QUEUED_AUDIO_BYTES {
+            if audio_queue.size() > max_queued_audio_bytes {
                 dropped_audio_bytes += u64::from(audio_queue.size());
                 audio_queue.clear();
             }
@@ -716,7 +719,7 @@ pub(super) fn run_sdl_loop(
         }
         if dropped_audio_bytes > 0 {
             info!(
-                dropped_ms = dropped_audio_bytes / u64::from(super::audio::AUDIO_BYTES_PER_MS),
+                dropped_ms = dropped_audio_bytes / u64::from(audio_bytes_per_ms),
                 "Dropped audio backlog to resync with video"
             );
         }

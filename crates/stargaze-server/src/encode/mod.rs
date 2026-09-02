@@ -240,6 +240,11 @@ pub fn start_audio_encoder(
 
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), AudioError>>();
 
+    // Resolve the multistream layout up front so a bad channel count fails at
+    // startup instead of on the encoder thread.
+    let channels = config.channels;
+    let streams = stargaze_core::audio::opus_channel_layout(channels)?.streams;
+
     let thread_handle = thread::Builder::new()
         .name("stargaze-audio-encoder".to_string())
         .spawn(move || {
@@ -259,6 +264,8 @@ pub fn start_audio_encoder(
 
             if let Err(e) = opus_enc::run_opus_encode_loop(
                 &mut encoder,
+                channels,
+                streams,
                 &mut frames,
                 &packets_tx,
                 &shutdown_clone,

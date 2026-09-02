@@ -29,7 +29,7 @@ The project is **licensed AGPL-3.0-or-later** (see `LICENSE`), chosen for GPL-3.
 - **Server**: Linux Wayland (Hyprland), headless, NVIDIA GPU (modern — NVENC-capable)
 - **Client**: Linux Wayland (Hyprland), AMD CPU, no discrete GPU (software or VAAPI decoding)
 - **Video**: Low-latency H.265 encoding (NVENC) / VAAPI or software decoding (FFmpeg)
-- **Audio**: Opus codec, stereo, 48 kHz
+- **Audio**: Opus codec, 48 kHz; stereo by default, mono/5.1/7.1 via `audio_channels` (multistream — see `docs/surround-audio.md`)
 - **Input**: Keyboard, mouse, and gamepad forwarded from client to server (evdev/uinput)
 - **Mic**: Optional mic forwarding via rsonance subprocess
 - **Cursor**: Compositor-embedded cursor (configurable)

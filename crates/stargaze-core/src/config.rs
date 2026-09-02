@@ -197,6 +197,10 @@ pub struct ServerConfig {
     pub mic_forward: MicForwardConfig,
     /// Cursor rendering configuration.
     pub cursor: CursorConfig,
+    /// Number of audio channels to capture and encode: 1 (mono), 2 (stereo),
+    /// 6 (5.1), or 8 (7.1). Surround is captured from the default sink's
+    /// monitor and up/downmixed by `PipeWire` when the sink layout differs.
+    pub audio_channels: u16,
 }
 
 impl Default for ServerConfig {
@@ -211,6 +215,7 @@ impl Default for ServerConfig {
             encoder: EncoderTuning::default(),
             mic_forward: MicForwardConfig::default(),
             cursor: CursorConfig::default(),
+            audio_channels: 2,
         }
     }
 }
@@ -493,6 +498,7 @@ mod tests {
         assert_eq!(config.mic_forward.port, 9001);
         assert_eq!(config.mic_forward.rsonance_binary, "rsonance");
         assert!(config.cursor.show_cursor);
+        assert_eq!(config.audio_channels, 2);
         assert_eq!(config.encoder.preset, "p1");
         assert_eq!(config.encoder.multipass, "disabled");
     }
@@ -538,6 +544,7 @@ mod tests {
             framerate = 30
             bitrate = 50
             codec = "av1"
+            audio_channels = 6
 
             [resolution]
             width = 2560
@@ -556,6 +563,7 @@ mod tests {
         assert_eq!(config.framerate, 30);
         assert_eq!(config.bitrate, 50);
         assert_eq!(config.codec, Codec::Av1);
+        assert_eq!(config.audio_channels, 6);
     }
 
     #[test]
@@ -585,6 +593,7 @@ mod tests {
         assert_eq!(config.framerate, 60);
         assert!(!config.mic_forward.enabled);
         assert!(config.cursor.show_cursor);
+        assert_eq!(config.audio_channels, 2);
     }
 
     #[test]
