@@ -505,7 +505,7 @@ pub(crate) async fn receive_loop(
                         || total_frames == 1
                         || (stargaze_core::logging::progress_logging() && total_frames % 300 == 1)
                     {
-                        info!(
+                        debug!(
                             frame = total_frames,
                             pts = frame.pts,
                             size = frame.data.len(),
