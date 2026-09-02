@@ -6,8 +6,8 @@ use pipewire::context::ContextBox;
 use pipewire::core::Core;
 use pipewire::main_loop::MainLoopBox;
 use pipewire::properties::properties;
+use pipewire::spa::pod;
 use pipewire::spa::pod::serialize::PodSerializer;
-use pipewire::spa::pod::{self, object, property};
 use pipewire::spa::utils::{Direction, SpaTypes};
 use pipewire::stream::{StreamBox, StreamFlags, StreamState};
 use stargaze_core::audio::{AudioCaptureConfig, AudioError, AudioFrame};
@@ -30,46 +30,75 @@ struct AudioCallbackData {
     dropped_count: u64,
 }
 
+// SPA channel-position ids (`spa_audio_channel`), in SPA/WAV interleave order.
+// Alias the generated bindings instead of duplicating their numeric ABI values.
+const SPA_CHAN_MONO: u32 = pipewire::spa::sys::SPA_AUDIO_CHANNEL_MONO;
+const SPA_CHAN_FL: u32 = pipewire::spa::sys::SPA_AUDIO_CHANNEL_FL;
+const SPA_CHAN_FR: u32 = pipewire::spa::sys::SPA_AUDIO_CHANNEL_FR;
+const SPA_CHAN_FC: u32 = pipewire::spa::sys::SPA_AUDIO_CHANNEL_FC;
+const SPA_CHAN_LFE: u32 = pipewire::spa::sys::SPA_AUDIO_CHANNEL_LFE;
+const SPA_CHAN_SL: u32 = pipewire::spa::sys::SPA_AUDIO_CHANNEL_SL;
+const SPA_CHAN_SR: u32 = pipewire::spa::sys::SPA_AUDIO_CHANNEL_SR;
+const SPA_CHAN_RL: u32 = pipewire::spa::sys::SPA_AUDIO_CHANNEL_RL;
+const SPA_CHAN_RR: u32 = pipewire::spa::sys::SPA_AUDIO_CHANNEL_RR;
+
+/// SPA channel positions for a supported layout, matching the interleave
+/// order in `docs/surround-audio.md` (and SDL's playback order).
+///
+/// Returns `None` for an unsupported channel count.
+fn spa_channel_positions(channels: u16) -> Option<&'static [u32]> {
+    Some(match channels {
+        1 => &[SPA_CHAN_MONO],
+        2 => &[SPA_CHAN_FL, SPA_CHAN_FR],
+        6 => &[
+            SPA_CHAN_FL,
+            SPA_CHAN_FR,
+            SPA_CHAN_FC,
+            SPA_CHAN_LFE,
+            SPA_CHAN_RL,
+            SPA_CHAN_RR,
+        ],
+        8 => &[
+            SPA_CHAN_FL,
+            SPA_CHAN_FR,
+            SPA_CHAN_FC,
+            SPA_CHAN_LFE,
+            SPA_CHAN_RL,
+            SPA_CHAN_RR,
+            SPA_CHAN_SL,
+            SPA_CHAN_SR,
+        ],
+        _ => return None,
+    })
+}
+
 /// Builds the SPA format pod for audio stream negotiation.
 ///
-/// Requests `Audio/Raw` with f32le format at the given sample rate and channels.
+/// Requests `Audio/Raw` with f32le format at the given sample rate and channel
+/// count, with explicit channel positions so `PipeWire`'s mixer routes (and,
+/// when the sink layout differs, up/downmixes) to the requested surround layout.
 fn build_audio_format_params(config: &AudioCaptureConfig) -> Vec<u8> {
     use pipewire::spa::param::audio::{AudioFormat, AudioInfoRaw};
-    use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
 
     let mut audio_info = AudioInfoRaw::new();
     audio_info.set_format(AudioFormat::F32LE);
     audio_info.set_rate(config.sample_rate);
     audio_info.set_channels(u32::from(config.channels));
 
-    let format_obj = object! {
-        SpaTypes::ObjectParamFormat,
-        pipewire::spa::param::ParamType::EnumFormat,
-        property!(
-            FormatProperties::MediaType,
-            Id,
-            MediaType::Audio
-        ),
-        property!(
-            FormatProperties::MediaSubtype,
-            Id,
-            MediaSubtype::Raw
-        ),
-        property!(
-            FormatProperties::AudioFormat,
-            Id,
-            AudioFormat::F32LE
-        ),
-        property!(
-            FormatProperties::AudioRate,
-            Int,
-            i32::try_from(config.sample_rate).unwrap_or(48_000_i32)
-        ),
-        property!(
-            FormatProperties::AudioChannels,
-            Int,
-            i32::from(config.channels)
-        ),
+    if let Some(positions) = spa_channel_positions(config.channels) {
+        let mut position = [0u32; 64];
+        position[..positions.len()].copy_from_slice(positions);
+        audio_info.set_position(position);
+    }
+
+    // `AudioInfoRaw` knows how to emit the media type/subtype, format, rate,
+    // channels, and (when positioned) the channel-position array as pod
+    // properties — reuse that instead of hand-listing them.
+    let properties: Vec<pod::Property> = audio_info.into();
+    let format_obj = pod::Object {
+        type_: SpaTypes::ObjectParamFormat.as_raw(),
+        id: pipewire::spa::param::ParamType::EnumFormat.as_raw(),
+        properties,
     };
 
     let pod_value = pod::Value::Object(format_obj);
@@ -463,6 +492,43 @@ pub(crate) fn run_audio_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_pod_round_trips_channels_and_positions() {
+        use pipewire::spa::param::audio::AudioInfoRaw;
+
+        // The serialized format pod must parse back (libspa's own parser,
+        // the same one PipeWire applies during negotiation) with the exact
+        // channel count, rate, and channel positions we requested.
+        for &channels in &[1u16, 2, 6, 8] {
+            let config = AudioCaptureConfig {
+                sample_rate: 48_000,
+                channels,
+            };
+            let bytes = build_audio_format_params(&config);
+            let pod_ref = pod::Pod::from_bytes(&bytes).expect("pod bytes should be well-formed");
+
+            let mut info = AudioInfoRaw::new();
+            info.parse(pod_ref)
+                .unwrap_or_else(|e| panic!("{channels}ch pod should parse: {e:?}"));
+
+            assert_eq!(info.rate(), 48_000, "{channels}ch rate");
+            assert_eq!(info.channels(), u32::from(channels), "{channels}ch count");
+            let expected = spa_channel_positions(channels).unwrap();
+            assert_eq!(
+                &info.position()[..expected.len()],
+                expected,
+                "{channels}ch positions"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_positions_unsupported_counts_are_none() {
+        for &channels in &[0u16, 3, 4, 5, 7, 9] {
+            assert!(spa_channel_positions(channels).is_none());
+        }
+    }
 
     #[test]
     fn parses_node_name_from_metadata_json() {

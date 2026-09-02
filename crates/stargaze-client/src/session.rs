@@ -224,7 +224,7 @@ fn run_decoders_and_renderer(
 
     let audio_decoder_config = AudioDecoderConfig {
         sample_rate: 48_000,
-        channels: 2,
+        channels: session_params.audio_channels,
     };
 
     // Start the audio decoder thread — sends decoded PCM to a channel.
@@ -254,6 +254,7 @@ fn run_decoders_and_renderer(
             &decoder_config,
             decoded_rx,
             audio_pcm_rx,
+            session_params.audio_channels,
             cfg.fullscreen,
             sdl_input_tx,
             rtt_probe,

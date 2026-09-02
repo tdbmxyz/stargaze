@@ -10,30 +10,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use stargaze_core::audio::{AudioApplication, AudioEncoderConfig, AudioError, AudioFrame};
 use stargaze_core::encode::EncodedPacket;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Number of PCM samples per channel per Opus frame at 48 kHz (10 ms).
 const OPUS_FRAME_SAMPLES: usize = 480;
 
-/// Maximum encoded Opus packet size in bytes.
-const OPUS_MAX_PACKET_SIZE: usize = 4000;
+/// Per-Opus-stream ceiling for an encoded packet (libopus recommends
+/// budgeting up to this many bytes per stream).
+const OPUS_MAX_BYTES_PER_STREAM: usize = 1275;
 
-/// Initializes the Opus encoder from the given configuration.
+/// Initializes the Opus multistream encoder from the given configuration.
+///
+/// Uses the shared channel layout ([`stargaze_core::audio::opus_channel_layout`])
+/// so the encoder and the client's decoder agree without transmitting the
+/// mapping table.
 ///
 /// # Errors
 ///
 /// Returns [`AudioError::EncoderInit`] if the encoder cannot be created or
-/// configured (unsupported channel count, invalid sample rate, etc.).
-pub(crate) fn init_opus_encoder(config: &AudioEncoderConfig) -> Result<opus::Encoder, AudioError> {
-    let channels = match config.channels {
-        1 => opus::Channels::Mono,
-        2 => opus::Channels::Stereo,
-        n => {
-            return Err(AudioError::EncoderInit(format!(
-                "unsupported channel count {n}: Opus supports only 1 or 2 channels"
-            )));
-        }
-    };
+/// configured, or [`AudioError::UnsupportedChannels`] for an unsupported count.
+pub(crate) fn init_opus_encoder(
+    config: &AudioEncoderConfig,
+) -> Result<opus::MSEncoder, AudioError> {
+    let layout = stargaze_core::audio::opus_channel_layout(config.channels)?;
 
     let application = match config.application {
         AudioApplication::Audio => opus::Application::Audio,
@@ -41,8 +40,14 @@ pub(crate) fn init_opus_encoder(config: &AudioEncoderConfig) -> Result<opus::Enc
         AudioApplication::LowDelay => opus::Application::LowDelay,
     };
 
-    let mut encoder = opus::Encoder::new(config.sample_rate, channels, application)
-        .map_err(|e| AudioError::EncoderInit(format!("opus_encoder_create failed: {e}")))?;
+    let mut encoder = opus::MSEncoder::new(
+        config.sample_rate,
+        layout.streams,
+        layout.coupled_streams,
+        &layout.mapping,
+        application,
+    )
+    .map_err(|e| AudioError::EncoderInit(format!("opus_multistream_encoder_create failed: {e}")))?;
 
     encoder
         .set_bitrate(opus::Bitrate::Bits(
@@ -84,16 +89,18 @@ pub(crate) fn init_opus_encoder(config: &AudioEncoderConfig) -> Result<opus::Enc
 /// Non-fatal per-frame errors are logged and skipped.
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn run_opus_encode_loop(
-    encoder: &mut opus::Encoder,
+    encoder: &mut opus::MSEncoder,
+    channels: u16,
+    streams: u8,
     frames: &mut mpsc::Receiver<AudioFrame>,
     packets_tx: &mpsc::Sender<EncodedPacket>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<(), AudioError> {
-    let mut output_buf = vec![0u8; OPUS_MAX_PACKET_SIZE];
+    let mut output_buf = vec![0u8; OPUS_MAX_BYTES_PER_STREAM * usize::from(streams)];
     let mut frame_counter: u64 = 0;
     let mut sample_buf: VecDeque<f32> = VecDeque::new();
     let mut samples_consumed: u64 = 0;
-    let mut channels: u16 = 0;
+    let mut channel_mismatch_logged = false;
 
     loop {
         // Check shutdown flag before blocking.
@@ -114,8 +121,21 @@ pub(crate) fn run_opus_encode_loop(
             break;
         }
 
-        if channels == 0 {
-            channels = frame.channels;
+        // Capture negotiated a different channel count than the encoder was
+        // built for (PipeWire could not honor the request). Drop the frame
+        // rather than feed the multistream encoder a wrong-width buffer.
+        if frame.channels != channels {
+            if !channel_mismatch_logged {
+                error!(
+                    expected = channels,
+                    got = frame.channels,
+                    "Audio capture negotiated a different channel count than the \
+                     encoder; the stream will be SILENT. Set `audio_channels` to a \
+                     layout the PipeWire graph supports"
+                );
+                channel_mismatch_logged = true;
+            }
+            continue;
         }
 
         sample_buf.extend(&frame.data);

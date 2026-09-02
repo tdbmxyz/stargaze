@@ -117,6 +117,15 @@ struct Cli {
     #[arg(long)]
     mic_forward_port: Option<u16>,
 
+    /// Audio channels: 1 (mono), 2 (stereo), 6 (5.1), 8 (7.1) [default: 2].
+    ///
+    /// Captured from the default sink's monitor. True surround needs the
+    /// sink itself to be 5.1/7.1; otherwise `PipeWire` upmixes stereo to the
+    /// requested layout. The client follows the server-advertised count, so
+    /// a surround server needs a surround-capable client.
+    #[arg(long, verbatim_doc_comment)]
+    audio_channels: Option<u16>,
+
     /// Show the cursor in the captured stream.
     ///
     /// - true:  the compositor embeds the cursor into captured frames.
@@ -207,6 +216,12 @@ fn build_config(cli: &Cli) -> anyhow::Result<ServerConfig> {
         cfg.mic_forward.port = port;
     }
     cfg.cursor.show_cursor = cli.show_cursor;
+    if let Some(channels) = cli.audio_channels {
+        cfg.audio_channels = channels;
+    }
+
+    // Fail fast on an unsupported channel count rather than deep in capture.
+    stargaze_core::audio::opus_channel_layout(cfg.audio_channels)?;
 
     Ok(cfg)
 }
@@ -268,18 +283,26 @@ async fn main() -> anyhow::Result<()> {
     info!("Encoder started");
 
     // Start audio capture pipeline.
+    let audio_channels = cfg.audio_channels;
     let audio_capture_config = AudioCaptureConfig {
         sample_rate: 48_000,
-        channels: 2,
+        channels: audio_channels,
     };
     let (audio_capture_session, audio_frames) = audio::start_audio_capture(audio_capture_config)?;
-    info!("Audio capture started");
+    info!(channels = audio_channels, "Audio capture started");
 
-    // Start audio encoder pipeline.
+    // Start audio encoder pipeline. Surround needs a larger bit budget than
+    // stereo: ~64 kbps per channel keeps discrete channels clean, while
+    // stereo stays at the well-tuned 128 kbps.
+    let audio_bitrate = if audio_channels <= 2 {
+        128_000
+    } else {
+        u32::from(audio_channels) * 64_000
+    };
     let audio_encoder_config = AudioEncoderConfig {
         sample_rate: 48_000,
-        channels: 2,
-        bitrate: 128_000,
+        channels: audio_channels,
+        bitrate: audio_bitrate,
         application: AudioApplication::Audio,
     };
     let (audio_encoder_session, audio_packets) =

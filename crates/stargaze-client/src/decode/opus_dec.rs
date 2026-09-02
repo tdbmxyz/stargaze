@@ -14,24 +14,24 @@ use tracing::{debug, info, warn};
 /// Number of PCM samples per channel per Opus frame at 48 kHz (10 ms).
 const OPUS_FRAME_SAMPLES: usize = 480;
 
-pub(crate) fn init_opus_decoder(config: &AudioDecoderConfig) -> Result<opus::Decoder, AudioError> {
-    let channels = match config.channels {
-        1 => opus::Channels::Mono,
-        2 => opus::Channels::Stereo,
-        n => {
-            return Err(AudioError::DecoderInit(format!(
-                "unsupported channel count {n}: Opus supports only 1 or 2 channels"
-            )));
-        }
-    };
+pub(crate) fn init_opus_decoder(
+    config: &AudioDecoderConfig,
+) -> Result<opus::MSDecoder, AudioError> {
+    let layout = stargaze_core::audio::opus_channel_layout(config.channels)?;
 
-    let decoder = opus::Decoder::new(config.sample_rate, channels)
-        .map_err(|e| AudioError::DecoderInit(format!("opus_decoder_create failed: {e}")))?;
+    let decoder = opus::MSDecoder::new(
+        config.sample_rate,
+        layout.streams,
+        layout.coupled_streams,
+        &layout.mapping,
+    )
+    .map_err(|e| AudioError::DecoderInit(format!("opus_multistream_decoder_create failed: {e}")))?;
 
     info!(
         sample_rate = config.sample_rate,
         channels = config.channels,
-        "Opus decoder initialized"
+        streams = layout.streams,
+        "Opus multistream decoder initialized"
     );
 
     Ok(decoder)
@@ -39,7 +39,7 @@ pub(crate) fn init_opus_decoder(config: &AudioDecoderConfig) -> Result<opus::Dec
 
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn run_opus_decode_loop(
-    decoder: &mut opus::Decoder,
+    decoder: &mut opus::MSDecoder,
     frames_rx: &mut mpsc::Receiver<ReassembledFrame>,
     pcm_tx: &std::sync::mpsc::Sender<Vec<f32>>,
     channels: u16,
@@ -121,55 +121,68 @@ mod tests {
             sample_rate: 48000,
             channels: 3,
         };
-        let result = init_opus_decoder(&config);
-        assert!(result.is_err());
-        match result {
-            Err(AudioError::DecoderInit(msg)) => {
-                assert!(msg.contains("unsupported channel count 3"));
-            }
-            other => panic!("Expected DecoderInit error, got: {other:?}"),
+        assert!(matches!(
+            init_opus_decoder(&config),
+            Err(AudioError::UnsupportedChannels(3))
+        ));
+    }
+
+    /// Builds a multistream Opus encoder mirroring the server for `channels`.
+    fn ms_encoder(channels: u16) -> opus::MSEncoder {
+        let layout = stargaze_core::audio::opus_channel_layout(channels).unwrap();
+        opus::MSEncoder::new(
+            48000,
+            layout.streams,
+            layout.coupled_streams,
+            &layout.mapping,
+            opus::Application::Audio,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn opus_encode_decode_round_trip() {
+        for &channels in &[2u16, 6, 8] {
+            let mut encoder = ms_encoder(channels);
+            let silence = vec![0.0_f32; OPUS_FRAME_SAMPLES * usize::from(channels)];
+            let encoded = encoder.encode_vec_float(&silence, 8192).unwrap();
+            assert!(!encoded.is_empty(), "Encoded packet should not be empty");
+
+            let decoder_config = AudioDecoderConfig {
+                sample_rate: 48000,
+                channels,
+            };
+            let mut decoder = init_opus_decoder(&decoder_config).unwrap();
+            let mut decoded = vec![0.0_f32; OPUS_FRAME_SAMPLES * usize::from(channels)];
+            let samples_per_channel = decoder.decode_float(&encoded, &mut decoded, false).unwrap();
+
+            assert_eq!(
+                samples_per_channel, OPUS_FRAME_SAMPLES,
+                "{channels}ch: expected {OPUS_FRAME_SAMPLES} samples/channel, got {samples_per_channel}"
+            );
         }
     }
 
+    /// The default one-coupled-stream packet must remain a regular stereo
+    /// Opus packet so pre-surround clients can decode new stereo servers.
     #[test]
-    fn opus_encode_decode_round_trip() {
-        let encoder_config = stargaze_core::audio::AudioEncoderConfig {
-            sample_rate: 48000,
-            channels: 2,
-            bitrate: 128_000,
-            application: stargaze_core::audio::AudioApplication::Audio,
-        };
-
-        let mut encoder =
-            opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::Audio).unwrap();
-        encoder
-            .set_bitrate(opus::Bitrate::Bits(
-                i32::try_from(encoder_config.bitrate).unwrap(),
-            ))
-            .unwrap();
-
+    fn multistream_stereo_packet_is_legacy_decoder_compatible() {
+        let mut encoder = ms_encoder(2);
         let silence = vec![0.0_f32; OPUS_FRAME_SAMPLES * 2];
-        let mut encoded = vec![0u8; 4000];
-        let encoded_len = encoder.encode_float(&silence, &mut encoded).unwrap();
-        assert!(encoded_len > 0, "Encoded packet should not be empty");
+        let packet = encoder.encode_vec_float(&silence, 4000).unwrap();
 
-        let decoder_config = AudioDecoderConfig {
-            sample_rate: 48000,
-            channels: 2,
-        };
-        let mut decoder = init_opus_decoder(&decoder_config).unwrap();
+        let mut legacy_decoder = opus::Decoder::new(48_000, opus::Channels::Stereo).unwrap();
         let mut decoded = vec![0.0_f32; OPUS_FRAME_SAMPLES * 2];
-        let samples_per_channel = decoder
-            .decode_float(&encoded[..encoded_len], &mut decoded, false)
+        let samples_per_channel = legacy_decoder
+            .decode_float(&packet, &mut decoded, false)
             .unwrap();
 
-        assert_eq!(
-            samples_per_channel, OPUS_FRAME_SAMPLES,
-            "Expected {OPUS_FRAME_SAMPLES} samples per channel, got {samples_per_channel}"
-        );
+        assert_eq!(samples_per_channel, OPUS_FRAME_SAMPLES);
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn decode_loop_sends_pcm_to_channel() {
         let config = AudioDecoderConfig {
             sample_rate: 48000,
@@ -178,8 +191,7 @@ mod tests {
         let mut decoder = init_opus_decoder(&config).unwrap();
 
         // Encode a test frame.
-        let mut encoder =
-            opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::Audio).unwrap();
+        let mut encoder = ms_encoder(2);
         let silence = vec![0.0_f32; OPUS_FRAME_SAMPLES * 2];
         let mut encoded = vec![0u8; 4000];
         let encoded_len = encoder.encode_float(&silence, &mut encoded).unwrap();

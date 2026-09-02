@@ -47,6 +47,16 @@
     # ~4 GiB closure (every codec, pango, libcaca, ...) into the AppImage.
     ffmpegHeadless = pkgs.ffmpeg_7-headless;
 
+    # Keep Mesa's loader libraries and drivers from the same nixpkgs revision.
+    # Flake consumers often have a different host Mesa under
+    # /run/opengl-driver; mixing that driver with this package's libva/libGL
+    # fails at runtime (observed as a missing __vaDriverInit symbol on AMD).
+    mesaDriverWrapFlags = [
+      "--set-default LIBVA_DRIVERS_PATH ${pkgs.mesa}/lib/dri"
+      "--set-default LIBGL_DRIVERS_PATH ${pkgs.mesa}/lib/dri"
+      "--set-default __EGL_VENDOR_LIBRARY_DIRS ${pkgs.mesa}/share/glvnd/egl_vendor.d"
+    ];
+
     # ── Shared native dependencies ─────────────────────────────────
     # Common to both server and client (compile-time).
     commonBuildInputs = [
@@ -96,7 +106,7 @@
     # metadata and build environment across the two package derivations.
     commonPackageAttrs = {
       pname = "stargaze";
-      version = "1.3.5";
+      version = "1.4.0";
       src = self;
 
       cargoLock.lockFile = ./Cargo.lock;
@@ -401,6 +411,7 @@
       stargaze-client = mkStargazeClient {
         ffmpegPkg = ffmpeg;
         sdl2Pkg = pkgs.SDL2;
+        extraWrapFlags = mesaDriverWrapFlags;
       };
 
       # Same client built against headless FFmpeg and slim SDL2 with a
@@ -413,11 +424,7 @@
       stargaze-client-portable = mkStargazeClient {
         ffmpegPkg = ffmpegHeadless;
         sdl2Pkg = sdl2Slim;
-        extraWrapFlags = [
-          "--set-default LIBVA_DRIVERS_PATH ${pkgs.mesa}/lib/dri"
-          "--set-default LIBGL_DRIVERS_PATH ${pkgs.mesa}/lib/dri"
-          "--set-default __EGL_VENDOR_LIBRARY_DIRS ${pkgs.mesa}/share/glvnd/egl_vendor.d"
-        ];
+        extraWrapFlags = mesaDriverWrapFlags;
       };
 
       default = self.packages.${system}.stargaze-server;

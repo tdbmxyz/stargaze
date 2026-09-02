@@ -9,8 +9,8 @@ use std::time::Instant;
 use stargaze_core::input::InputEvent;
 use stargaze_core::transport::{
     ControlMessage, DatagramHeader, IDR_RATE_LIMIT_MS, IDR_RETRY_MS, MAX_PENDING_FRAMES,
-    ReassembledFrame, STREAM_TYPE_AUDIO, STREAM_TYPE_VIDEO, TransportError,
-    deserialize_control_message, deserialize_header, serialize_control_message,
+    ReassembledFrame, STREAM_TYPE_AUDIO, STREAM_TYPE_VIDEO, TransportError, deserialize_header,
+    deserialize_session_response_compat, serialize_control_message,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -35,6 +35,8 @@ pub struct SessionParams {
     pub max_datagram_size: u16,
     /// Server command line, sanitized of addresses and ports.
     pub server_command: String,
+    /// Number of audio channels the server encodes (1, 2, 6, or 8).
+    pub audio_channels: u16,
 }
 
 /// Performs the session handshake with the server.
@@ -83,7 +85,9 @@ pub(crate) async fn perform_handshake(
         .await
         .map_err(|e| TransportError::SessionError(format!("read response body: {e}")))?;
 
-    let response = deserialize_control_message(&body)?;
+    // Compat parse: pre-surround servers send the response without an
+    // audio_channels field (defaults to 2 = stereo).
+    let response = deserialize_session_response_compat(&body)?;
 
     match response {
         ControlMessage::SessionResponse {
@@ -95,6 +99,7 @@ pub(crate) async fn perform_handshake(
             max_datagram_size,
             cursor_embedded: _,
             server_command,
+            audio_channels,
         } => Ok(SessionParams {
             width,
             height,
@@ -103,6 +108,7 @@ pub(crate) async fn perform_handshake(
             codec,
             max_datagram_size,
             server_command,
+            audio_channels,
         }),
         other => Err(TransportError::SessionError(format!(
             "expected SessionResponse, got {other:?}"
@@ -499,7 +505,7 @@ pub(crate) async fn receive_loop(
                         || total_frames == 1
                         || (stargaze_core::logging::progress_logging() && total_frames % 300 == 1)
                     {
-                        info!(
+                        debug!(
                             frame = total_frames,
                             pts = frame.pts,
                             size = frame.data.len(),
