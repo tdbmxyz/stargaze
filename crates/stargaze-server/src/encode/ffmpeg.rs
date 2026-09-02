@@ -645,6 +645,7 @@ fn upload_and_encode(
                     width = info.width,
                     height = info.height,
                     stride = info.stride,
+                    drm_fourcc = format_args!("0x{:08x}", info.drm_fourcc),
                     modifier = format_args!("0x{:x}", info.modifier),
                     "Encoding DmaBuf frame"
                 );
@@ -1425,6 +1426,7 @@ mod tests {
                 width: self.width,
                 height: self.height,
                 format: PixelFormat::Bgra8,
+                drm_fourcc: GBM_FORMAT_ARGB8888,
                 modifier: unsafe { bo_get_modifier(self.bo) },
                 stride: unsafe { bo_get_stride(self.bo) },
                 offset: 0,

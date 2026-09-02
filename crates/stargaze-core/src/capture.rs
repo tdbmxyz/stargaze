@@ -47,6 +47,8 @@ pub struct DmaBufInfo {
     pub height: u32,
     /// Pixel format.
     pub format: PixelFormat,
+    /// Exact DRM fourcc associated with the negotiated SPA format.
+    pub drm_fourcc: u32,
     /// DRM format modifier (tiling, compression).
     pub modifier: u64,
     /// Bytes per row.
@@ -62,6 +64,7 @@ impl fmt::Debug for DmaBufInfo {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("format", &self.format)
+            .field("drm_fourcc", &format_args!("0x{:08x}", self.drm_fourcc))
             .field("modifier", &format_args!("0x{:x}", self.modifier))
             .field("stride", &self.stride)
             .field("offset", &self.offset)
@@ -221,6 +224,7 @@ mod tests {
             width: 1920,
             height: 1080,
             format: PixelFormat::Bgra8,
+            drm_fourcc: 0x3432_5241,
             modifier: 0,
             stride: 1920 * 4,
             offset: 0,
