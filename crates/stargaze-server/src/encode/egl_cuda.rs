@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::os::unix::io::RawFd;
 use std::ptr;
 
-use stargaze_core::capture::{DmaBufInfo, PixelFormat};
+use stargaze_core::capture::DmaBufInfo;
 use stargaze_core::encode::EncodeError;
 use tracing::{debug, info, warn};
 
@@ -28,6 +28,9 @@ const EGL_DMA_BUF_PLANE0_OFFSET_EXT: khronos_egl::Attrib = 0x3273;
 const EGL_DMA_BUF_PLANE0_PITCH_EXT: khronos_egl::Attrib = 0x3274;
 const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: khronos_egl::Attrib = 0x3443;
 const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: khronos_egl::Attrib = 0x3444;
+
+/// Implicit/unspecified DRM layout sentinel used during modifier fixation.
+const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
 /// `EGL_PLATFORM_DEVICE_EXT` (0x313F) — platform type for headless device display.
 const EGL_PLATFORM_DEVICE_EXT: khronos_egl::Enum = 0x313F;
@@ -50,21 +53,32 @@ type GbmCreateDeviceFn = unsafe extern "C" fn(fd: RawFd) -> *mut GbmDevice;
 /// `gbm_device_destroy(device)` — destroy a GBM device.
 type GbmDeviceDestroyFn = unsafe extern "C" fn(device: *mut GbmDevice);
 
-/// Convert our `PixelFormat` to a DRM fourcc code for EGL import.
-fn pixel_format_to_drm_fourcc(format: PixelFormat) -> u32 {
-    match format {
-        // BGRA8 in memory = DRM_FORMAT_ARGB8888 (DRM names by channel order high→low)
-        PixelFormat::Bgra8 => 0x3432_5241, // fourcc_code('A','R','2','4')
-        // RGBA8 in memory = DRM_FORMAT_ABGR8888
-        PixelFormat::Rgba8 => 0x3432_4241, // fourcc_code('A','B','2','4')
-        // NV12
-        PixelFormat::Nv12 => 0x3231_564E, // fourcc_code('N','V','1','2')
-        // BGRA10 = DRM_FORMAT_XRGB2101010
-        PixelFormat::Bgra10 => 0x3033_5258, // fourcc_code('X','R','3','0')
-        // RGBA10 = DRM_FORMAT_XBGR2101010
-        PixelFormat::Rgba10 => 0x3033_4258, // fourcc_code('X','B','3','0')
-    }
+/// DMA-BUF modifiers accepted by EGL for one DRM format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DmaBufModifierSet {
+    /// DRM fourcc queried from EGL.
+    pub(crate) drm_fourcc: u32,
+    /// Modifiers safe to advertise to the `PipeWire` producer.
+    pub(crate) modifiers: Vec<u64>,
 }
+
+/// `eglQueryDmaBufFormatsEXT` function signature.
+type EglQueryDmaBufFormatsExtFn = unsafe extern "C" fn(
+    display: *mut c_void,
+    max_formats: khronos_egl::Int,
+    formats: *mut khronos_egl::Int,
+    num_formats: *mut khronos_egl::Int,
+) -> khronos_egl::Boolean;
+
+/// `eglQueryDmaBufModifiersEXT` function signature.
+type EglQueryDmaBufModifiersExtFn = unsafe extern "C" fn(
+    display: *mut c_void,
+    format: khronos_egl::Int,
+    max_modifiers: khronos_egl::Int,
+    modifiers: *mut u64,
+    external_only: *mut khronos_egl::Boolean,
+    num_modifiers: *mut khronos_egl::Int,
+) -> khronos_egl::Boolean;
 
 // ── CUDA-GL FFI (not in cudarc — loaded dynamically from libcuda.so) ────
 
@@ -409,6 +423,207 @@ impl Drop for GpuNv12Converter {
             }
         }
     }
+}
+
+// ── EGL DMA-BUF capability query ───────────────────────────────────────
+
+fn egl_count_to_usize(count: khronos_egl::Int, operation: &str) -> Result<usize, EncodeError> {
+    usize::try_from(count)
+        .map_err(|_| EncodeError::InitError(format!("{operation} returned invalid count {count}")))
+}
+
+fn query_egl_dmabuf_formats(
+    display: khronos_egl::Display,
+    query: EglQueryDmaBufFormatsExtFn,
+) -> Result<Vec<u32>, EncodeError> {
+    let mut count: khronos_egl::Int = 0;
+    if unsafe { query(display.as_ptr(), 0, ptr::null_mut(), &raw mut count) } == khronos_egl::FALSE
+        || count <= 0
+    {
+        return Err(EncodeError::InitError(
+            "eglQueryDmaBufFormatsEXT returned no formats".to_string(),
+        ));
+    }
+
+    let capacity = egl_count_to_usize(count, "eglQueryDmaBufFormatsEXT")?;
+    let mut formats = vec![0; capacity];
+    if unsafe {
+        query(
+            display.as_ptr(),
+            count,
+            formats.as_mut_ptr(),
+            &raw mut count,
+        )
+    } == khronos_egl::FALSE
+    {
+        return Err(EncodeError::InitError(
+            "eglQueryDmaBufFormatsEXT(list) failed".to_string(),
+        ));
+    }
+    formats.truncate(egl_count_to_usize(count, "eglQueryDmaBufFormatsEXT(list)")?.min(capacity));
+    Ok(formats.into_iter().map(i32::cast_unsigned).collect())
+}
+
+fn query_egl_format_modifiers(
+    display: khronos_egl::Display,
+    drm_fourcc: u32,
+    query: EglQueryDmaBufModifiersExtFn,
+) -> Result<Vec<u64>, EncodeError> {
+    let mut count: khronos_egl::Int = 0;
+    if unsafe {
+        query(
+            display.as_ptr(),
+            drm_fourcc.cast_signed(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &raw mut count,
+        )
+    } == khronos_egl::FALSE
+        || count <= 0
+    {
+        return Ok(Vec::new());
+    }
+
+    let capacity = egl_count_to_usize(count, "eglQueryDmaBufModifiersEXT")?;
+    let mut modifiers = vec![0; capacity];
+    if unsafe {
+        query(
+            display.as_ptr(),
+            drm_fourcc.cast_signed(),
+            count,
+            modifiers.as_mut_ptr(),
+            ptr::null_mut(),
+            &raw mut count,
+        )
+    } == khronos_egl::FALSE
+    {
+        return Err(EncodeError::InitError(format!(
+            "eglQueryDmaBufModifiersEXT(list) failed for 0x{drm_fourcc:08x}"
+        )));
+    }
+    modifiers
+        .truncate(egl_count_to_usize(count, "eglQueryDmaBufModifiersEXT(list)")?.min(capacity));
+    Ok(modifiers)
+}
+
+fn prepare_pipewire_modifiers(mut modifiers: Vec<u64>) -> Option<Vec<u64>> {
+    modifiers.retain(|&modifier| modifier != 0);
+    let mut unique = Vec::with_capacity(modifiers.len() + 1);
+    for modifier in modifiers {
+        if modifier != DRM_FORMAT_MOD_INVALID && !unique.contains(&modifier) {
+            unique.push(modifier);
+        }
+    }
+    if unique.is_empty() {
+        return None;
+    }
+
+    // Some GBM implementations cannot allocate directly from an explicit
+    // list but can use gbm_bo_create(), then fixate the BO's actual modifier.
+    // Keep INVALID last so only an earlier concrete value can be finalized.
+    unique.push(DRM_FORMAT_MOD_INVALID);
+    Some(unique)
+}
+
+/// Queries explicit non-linear DMA-BUF modifiers accepted by the encoder GPU.
+///
+/// `PipeWire` needs concrete modifier lists to intersect the consumer's EGL
+/// capabilities with the compositor's allocation capabilities. Advertising
+/// only `DRM_FORMAT_MOD_INVALID` lets the NVIDIA portal fixate an implicit
+/// layout (`0`), which cannot be imported reliably on the target driver.
+///
+/// # Errors
+///
+/// Returns an initialization error when EGL/GBM is unavailable or does not
+/// expose the DMA-BUF format/modifier query extensions. Callers should retain
+/// a shared-memory capture fallback.
+pub(crate) fn query_dmabuf_modifiers(
+    desired_fourccs: &[u32],
+) -> Result<Vec<DmaBufModifierSet>, EncodeError> {
+    let egl = unsafe {
+        khronos_egl::DynamicInstance::<khronos_egl::EGL1_5>::load_required_from_filename(
+            "libEGL.so.1",
+        )
+    }
+    .map_err(|e| EncodeError::InitError(format!("Failed to load libEGL.so.1: {e}")))?;
+
+    let (display, gbm_device, gbm_destroy_fn, drm_fd) = EglCudaBridge::get_headless_display(&egl)?;
+
+    let result = (|| {
+        egl.initialize(display)
+            .map_err(|e| EncodeError::InitError(format!("eglInitialize failed: {e}")))?;
+
+        let extensions = egl
+            .query_string(Some(display), khronos_egl::EXTENSIONS)
+            .map_err(|e| EncodeError::InitError(format!("eglQueryString failed: {e}")))?;
+        let extensions = extensions.to_string_lossy();
+        if !extensions.contains("EGL_EXT_image_dma_buf_import_modifiers") {
+            return Err(EncodeError::InitError(
+                "EGL_EXT_image_dma_buf_import_modifiers not supported".to_string(),
+            ));
+        }
+
+        let query_formats: EglQueryDmaBufFormatsExtFn = egl
+            .get_proc_address("eglQueryDmaBufFormatsEXT")
+            .map(|p| unsafe { std::mem::transmute(p) })
+            .ok_or_else(|| {
+                EncodeError::InitError("eglQueryDmaBufFormatsEXT not available".to_string())
+            })?;
+        let query_modifiers: EglQueryDmaBufModifiersExtFn = egl
+            .get_proc_address("eglQueryDmaBufModifiersEXT")
+            .map(|p| unsafe { std::mem::transmute(p) })
+            .ok_or_else(|| {
+                EncodeError::InitError("eglQueryDmaBufModifiersEXT not available".to_string())
+            })?;
+
+        let formats = query_egl_dmabuf_formats(display, query_formats)?;
+        let mut result = Vec::new();
+        for &drm_fourcc in desired_fourccs {
+            if !formats.contains(&drm_fourcc) {
+                debug!(
+                    drm_fourcc = format_args!("0x{drm_fourcc:08x}"),
+                    "EGL does not advertise requested DMA-BUF format"
+                );
+                continue;
+            }
+
+            let raw_modifiers = query_egl_format_modifiers(display, drm_fourcc, query_modifiers)?;
+            let Some(modifiers) = prepare_pipewire_modifiers(raw_modifiers) else {
+                debug!(
+                    drm_fourcc = format_args!("0x{drm_fourcc:08x}"),
+                    "EGL reports no concrete non-linear DMA-BUF modifier; skipping format"
+                );
+                continue;
+            };
+
+            info!(
+                drm_fourcc = format_args!("0x{drm_fourcc:08x}"),
+                modifiers = ?modifiers
+                    .iter()
+                    .map(|modifier| format!("0x{modifier:x}"))
+                    .collect::<Vec<_>>(),
+                "EGL DMA-BUF modifiers available for PipeWire negotiation"
+            );
+            result.push(DmaBufModifierSet {
+                drm_fourcc,
+                modifiers,
+            });
+        }
+        Ok(result)
+    })();
+
+    let _ = egl.terminate(display);
+    if !gbm_device.is_null()
+        && let Some(destroy_fn) = gbm_destroy_fn
+    {
+        unsafe { destroy_fn(gbm_device) };
+    }
+    if drm_fd >= 0 {
+        unsafe { libc::close(drm_fd) };
+    }
+
+    result
 }
 
 // ── EglCudaBridge ───────────────────────────────────────────────────────
@@ -1153,11 +1368,9 @@ impl EglCudaBridge {
     fn create_egl_image(&self, info: &DmaBufInfo) -> Result<khronos_egl::Image, EncodeError> {
         use std::os::unix::io::AsRawFd;
 
-        let drm_fourcc = pixel_format_to_drm_fourcc(info.format);
-
         let mut attribs: Vec<khronos_egl::Attrib> = vec![
             EGL_LINUX_DRM_FOURCC_EXT,
-            drm_fourcc as khronos_egl::Attrib,
+            info.drm_fourcc as khronos_egl::Attrib,
             khronos_egl::WIDTH as khronos_egl::Attrib,
             info.width as khronos_egl::Attrib,
             khronos_egl::HEIGHT as khronos_egl::Attrib,
@@ -1172,7 +1385,6 @@ impl EglCudaBridge {
 
         // DRM_FORMAT_MOD_INVALID means "no explicit modifier" — passing it to
         // eglCreateImage causes EGL_BAD_PARAMETER on NVIDIA.
-        const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
         let has_explicit_modifier =
             self.dmabuf_modifiers_supported && info.modifier != DRM_FORMAT_MOD_INVALID;
         if has_explicit_modifier {
@@ -1463,6 +1675,54 @@ impl Drop for EglCudaBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipewire_modifiers_keep_invalid_last() {
+        let modifiers = prepare_pipewire_modifiers(vec![
+            DRM_FORMAT_MOD_INVALID,
+            0,
+            0x0300_0000_0060_6014,
+            0x0300_0000_0060_6014,
+            0x0300_0000_00e0_8014,
+        ])
+        .expect("concrete modifiers must be retained");
+
+        assert_eq!(
+            modifiers,
+            vec![
+                0x0300_0000_0060_6014,
+                0x0300_0000_00e0_8014,
+                DRM_FORMAT_MOD_INVALID,
+            ]
+        );
+        assert!(prepare_pipewire_modifiers(vec![0, DRM_FORMAT_MOD_INVALID]).is_none());
+    }
+
+    /// Verifies that the encoder GPU exposes a concrete ARGB8888 modifier.
+    ///
+    /// Requires a DRM render node and the target GPU's EGL implementation.
+    /// Run manually with:
+    /// ```bash
+    /// nix develop -c cargo test --package stargaze-server -- --ignored egl_dmabuf_modifiers_available
+    /// ```
+    #[test]
+    #[ignore = "requires a GPU with EGL DMA-BUF modifier support"]
+    fn egl_dmabuf_modifiers_available() {
+        const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+        let sets = query_dmabuf_modifiers(&[DRM_FORMAT_ARGB8888])
+            .expect("EGL DMA-BUF modifier query must succeed");
+        let argb = sets
+            .iter()
+            .find(|set| set.drm_fourcc == DRM_FORMAT_ARGB8888)
+            .expect("ARGB8888 must have explicit modifiers");
+        assert!(
+            argb.modifiers
+                .iter()
+                .any(|&modifier| modifier != DRM_FORMAT_MOD_INVALID)
+        );
+        assert_eq!(argb.modifiers.last(), Some(&DRM_FORMAT_MOD_INVALID));
+        assert!(argb.modifiers.iter().all(|&modifier| modifier != 0));
+    }
 
     /// Verifies the NV12 kernel compiles under NVRTC.
     ///

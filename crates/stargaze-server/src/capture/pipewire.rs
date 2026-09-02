@@ -34,6 +34,8 @@ struct CaptureCallbackData {
     height: u32,
     /// Negotiated pixel format (defaults to `Bgra8`).
     format: PixelFormat,
+    /// Exact DRM fourcc paired with the negotiated SPA format.
+    drm_fourcc: u32,
     /// Negotiated DRM format modifier (e.g. tiling/compression layout).
     modifier: u64,
     /// Oneshot sender for the negotiated resolution — fires once on first
@@ -43,9 +45,10 @@ struct CaptureCallbackData {
     frame_count: u64,
     /// Frames dropped because the encoder was behind (channel full).
     dropped_count: u64,
-    /// Whether `ack_format` has been called for the current format.
-    /// Prevents re-entrant `update_params` → `param_changed` cycling.
-    format_acked: bool,
+    /// Buffer memory type last acknowledged to `PipeWire`.
+    /// Prevents re-entrant `update_params` cycles while allowing DMA-BUF
+    /// fixation to replace an initial shared-memory format callback.
+    acked_dmabuf: Option<bool>,
 }
 
 /// Maps a SPA video format to our internal `PixelFormat`.
@@ -72,57 +75,122 @@ fn spa_format_to_pixel_format(raw: u32) -> Option<PixelFormat> {
     }
 }
 
-const DMABUF_FORMATS: &[pipewire::spa::param::video::VideoFormat] = &[
-    // 8-bit
-    pipewire::spa::param::video::VideoFormat::BGRA,
-    pipewire::spa::param::video::VideoFormat::BGRx,
-    pipewire::spa::param::video::VideoFormat::RGBA,
-    pipewire::spa::param::video::VideoFormat::RGBx,
-    // 10-bit (2:10:10:10) — required for portals on 10-bit displays
-    pipewire::spa::param::video::VideoFormat::xBGR_210LE,
-    pipewire::spa::param::video::VideoFormat::ABGR_210LE,
-    pipewire::spa::param::video::VideoFormat::xRGB_210LE,
-    pipewire::spa::param::video::VideoFormat::ARGB_210LE,
+/// DRM fourcc assembled from four ASCII bytes.
+const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
+}
+
+/// Exact SPA/DRM format pair used for modifier negotiation and EGL import.
+struct DmaBufFormat {
+    spa_format: pipewire::spa::param::video::VideoFormat,
+    drm_fourcc: u32,
+}
+
+const DMABUF_FORMATS: &[DmaBufFormat] = &[
+    // 8-bit packed RGB.
+    DmaBufFormat {
+        spa_format: pipewire::spa::param::video::VideoFormat::BGRA,
+        drm_fourcc: drm_fourcc(b'A', b'R', b'2', b'4'), // DRM_FORMAT_ARGB8888
+    },
+    DmaBufFormat {
+        spa_format: pipewire::spa::param::video::VideoFormat::BGRx,
+        drm_fourcc: drm_fourcc(b'X', b'R', b'2', b'4'), // DRM_FORMAT_XRGB8888
+    },
+    DmaBufFormat {
+        spa_format: pipewire::spa::param::video::VideoFormat::RGBA,
+        drm_fourcc: drm_fourcc(b'A', b'B', b'2', b'4'), // DRM_FORMAT_ABGR8888
+    },
+    DmaBufFormat {
+        spa_format: pipewire::spa::param::video::VideoFormat::RGBx,
+        drm_fourcc: drm_fourcc(b'X', b'B', b'2', b'4'), // DRM_FORMAT_XBGR8888
+    },
+    // 10-bit packed RGB formats exposed by 10-bit compositors.
+    DmaBufFormat {
+        spa_format: pipewire::spa::param::video::VideoFormat::xBGR_210LE,
+        drm_fourcc: drm_fourcc(b'X', b'B', b'3', b'0'), // DRM_FORMAT_XBGR2101010
+    },
+    DmaBufFormat {
+        spa_format: pipewire::spa::param::video::VideoFormat::ABGR_210LE,
+        drm_fourcc: drm_fourcc(b'R', b'A', b'3', b'0'), // DRM_FORMAT_RGBA1010102
+    },
+    DmaBufFormat {
+        spa_format: pipewire::spa::param::video::VideoFormat::xRGB_210LE,
+        drm_fourcc: drm_fourcc(b'X', b'R', b'3', b'0'), // DRM_FORMAT_XRGB2101010
+    },
+    DmaBufFormat {
+        spa_format: pipewire::spa::param::video::VideoFormat::ARGB_210LE,
+        drm_fourcc: drm_fourcc(b'B', b'A', b'3', b'0'), // DRM_FORMAT_BGRA1010102
+    },
 ];
 
-/// `DRM_FORMAT_MOD_INVALID` — accept any modifier the source offers.
-const DRM_FORMAT_MOD_INVALID: i64 = (1 << 56) - 1;
+fn spa_format_to_drm_fourcc(raw: u32) -> Option<u32> {
+    DMABUF_FORMATS
+        .iter()
+        .find(|format| format.spa_format.as_raw() == raw)
+        .map(|format| format.drm_fourcc)
+}
 
 /// Builds SPA format pods for video stream negotiation.
 ///
-/// Creates **one pod per pixel format** with `VideoModifier`
-/// (`MANDATORY | DONT_FIXATE`) for DMA-BUF negotiation, plus a single
-/// **fallback pod** (format enum, no modifier) for SHM/`MemPtr` sources.
-///
-/// This per-format pod pattern matches what Sunshine, xdg-desktop-portal-hyprland,
-/// and `WayVR` use. A single pod with a format enum *and* a modifier fails
-/// intersection because `PipeWire` needs each format paired with its own
-/// modifier list.
+/// Creates one pod per EGL-supported SPA/DRM format with its concrete
+/// modifier list, plus a fallback pod without modifiers for shared memory.
 fn build_format_params(config: &CaptureConfig) -> Vec<Vec<u8>> {
-    let mut pods: Vec<Vec<u8>> = DMABUF_FORMATS
+    let desired_fourccs = DMABUF_FORMATS
         .iter()
-        .map(|fmt| build_dmabuf_format_pod(config, *fmt))
-        .collect();
+        .map(|format| format.drm_fourcc)
+        .collect::<Vec<_>>();
+    let modifier_sets = match crate::encode::egl_cuda::query_dmabuf_modifiers(&desired_fourccs) {
+        Ok(sets) => sets,
+        Err(e) => {
+            warn!(error = %e, "Cannot query EGL DMA-BUF modifiers; using shared-memory capture");
+            Vec::new()
+        }
+    };
+
+    build_format_params_with_modifiers(config, &modifier_sets)
+}
+
+fn build_format_params_with_modifiers(
+    config: &CaptureConfig,
+    modifier_sets: &[crate::encode::egl_cuda::DmaBufModifierSet],
+) -> Vec<Vec<u8>> {
+    let mut pods = Vec::new();
+    for format in DMABUF_FORMATS {
+        let Some(set) = modifier_sets
+            .iter()
+            .find(|set| set.drm_fourcc == format.drm_fourcc)
+        else {
+            continue;
+        };
+        if set.modifiers.is_empty() {
+            continue;
+        }
+        pods.push(build_dmabuf_format_pod(
+            config,
+            format.spa_format,
+            &set.modifiers,
+        ));
+    }
 
     // SHM fallback pod (no modifier) — used if DMA-BUF negotiation fails.
+    let dmabuf_pod_count = pods.len();
     pods.push(build_shm_fallback_pod(config));
 
     info!(
+        dmabuf_pod_count,
         pod_count = pods.len(),
         pod_sizes = ?pods.iter().map(Vec::len).collect::<Vec<_>>(),
-        "Built format negotiation pods (DMA-BUF per-format + SHM fallback)"
+        "Built format negotiation pods (explicit DMA-BUF modifiers + SHM fallback)"
     );
 
     pods
 }
 
-/// Builds a single DMA-BUF format pod for one pixel format.
-///
-/// The `VideoModifier` property uses `MANDATORY` with `DRM_FORMAT_MOD_INVALID`
-/// so the portal can offer its preferred modifier.
+/// Builds a single DMA-BUF format pod with explicit EGL modifiers.
 fn build_dmabuf_format_pod(
     config: &CaptureConfig,
     video_format: pipewire::spa::param::video::VideoFormat,
+    modifiers: &[u64],
 ) -> Vec<u8> {
     use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
     use pipewire::spa::pod::{Property, PropertyFlags, Value};
@@ -140,14 +208,7 @@ fn build_dmabuf_format_pod(
             Id,
             MediaSubtype::Raw
         ),
-        property!(
-            FormatProperties::VideoFormat,
-            Choice,
-            Enum,
-            Id,
-            video_format,
-            video_format,
-        ),
+        property!(FormatProperties::VideoFormat, Id, video_format),
         property!(
             FormatProperties::VideoSize,
             Choice,
@@ -177,28 +238,23 @@ fn build_dmabuf_format_pod(
         ),
     };
 
-    // VideoModifier: MANDATORY | DONT_FIXATE with a Choice::Enum.
-    //
-    // DONT_FIXATE tells PipeWire not to lock onto our offered value but to
-    // let the compositor's video-src-fixate propose the real DRM modifier
-    // (e.g. NVIDIA block-linear tiling). Without DONT_FIXATE, PipeWire keeps
-    // DRM_FORMAT_MOD_INVALID and the compositor sends tiled DMA-BUFs that we
-    // misinterpret as linear — causing horizontal banding artifacts.
-    //
-    // The Choice::Enum contains DRM_FORMAT_MOD_INVALID as both default and
-    // sole alternative, meaning "I accept any modifier." During fixation the
-    // compositor replaces this with its preferred modifier.
-    //
-    // This matches Sunshine's portalgrab.cpp pattern (MANDATORY | DONT_FIXATE
-    // + SPA_CHOICE_Enum of modifiers).
+    // DONT_FIXATE lets the producer choose the best concrete layout from
+    // EGL's list. The first item is the preferred/default choice; PipeWire's
+    // Enum representation also expects it among the alternatives.
+    let modifiers = modifiers
+        .iter()
+        .copied()
+        .map(u64::cast_signed)
+        .collect::<Vec<_>>();
+    let default_modifier = modifiers[0];
     format_obj.properties.push(Property {
         key: FormatProperties::VideoModifier.as_raw(),
         flags: PropertyFlags::MANDATORY | PropertyFlags::DONT_FIXATE,
         value: Value::Choice(pod::ChoiceValue::Long(pipewire::spa::utils::Choice(
             pipewire::spa::utils::ChoiceFlags::empty(),
             pipewire::spa::utils::ChoiceEnum::Enum {
-                default: DRM_FORMAT_MOD_INVALID,
-                alternatives: vec![DRM_FORMAT_MOD_INVALID],
+                default: default_modifier,
+                alternatives: modifiers,
             },
         ))),
     });
@@ -305,6 +361,9 @@ const SPA_META_VIDEO_DAMAGE: u32 = 3;
 /// Size of a single `spa_meta_region` (from libspa bindings: 16 bytes).
 const SPA_META_REGION_SIZE: i32 = 16;
 
+/// Implicit/unspecified DRM layout sentinel.
+const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+
 /// Acknowledge a negotiated format by calling `stream.update_params()` with
 /// buffer-type and meta params. Matches Sunshine's `on_param_changed` exactly:
 /// only `dataType` in Buffers (let the producer own allocation), plus Meta
@@ -314,7 +373,6 @@ fn ack_format(stream: &pipewire::stream::Stream, modifier: u64) {
     use pipewire::spa::pod::{Property, PropertyFlags, Value};
     use pipewire::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
 
-    const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
     let is_dmabuf = modifier != 0 && modifier != DRM_FORMAT_MOD_INVALID;
 
     let buffer_types: i32 = if is_dmabuf {
@@ -465,11 +523,12 @@ pub fn run_capture_stream(
         width: config.width,
         height: config.height,
         format: PixelFormat::Bgra8,
+        drm_fourcc: 0,
         modifier: 0,
         resolution_tx: Some(resolution_tx),
         frame_count: 0,
         dropped_count: 0,
-        format_acked: false,
+        acked_dmabuf: None,
     };
 
     // We need a reference to the mainloop inside callbacks.
@@ -511,27 +570,22 @@ pub fn run_capture_stream(
             if video_info.parse(param).is_ok() {
                 let size = video_info.size();
 
-                // A renegotiation to a different frame layout after the
-                // first negotiation (the captured output was reconfigured,
-                // e.g. a monitor was plugged in and changed its mode): the
-                // encoder is fixed to the original dimensions, so feeding
-                // it the new frames wedges the whole pipeline with
-                // per-frame size errors. Stop capture instead — the
-                // process exits with an error and the supervisor restarts
-                // the pipeline at the output's current mode.
-                let new_format = spa_format_to_pixel_format(video_info.format().as_raw());
-                let renegotiated = data.resolution_tx.is_none()
-                    && (size.width != data.width
-                        || size.height != data.height
-                        || video_info.modifier() != data.modifier
-                        || new_format.is_some_and(|pf| pf != data.format));
-                if renegotiated {
+                // A resolution change after the initial negotiation means
+                // the fixed-size encoder must be rebuilt. Modifier and pixel
+                // format changes are part of normal DMA-BUF fixation before
+                // streaming and are safe to update in-place.
+                let spa_format = video_info.format().as_raw();
+                let new_format = spa_format_to_pixel_format(spa_format);
+                let new_drm_fourcc = spa_format_to_drm_fourcc(spa_format);
+                let resolution_changed = data.resolution_tx.is_none()
+                    && (size.width != data.width || size.height != data.height);
+                if resolution_changed {
                     error!(
                         old_width = data.width,
                         old_height = data.height,
                         new_width = size.width,
                         new_height = size.height,
-                        "Capture format changed mid-stream (output reconfigured), stopping capture for a pipeline restart"
+                        "Capture resolution changed mid-stream, stopping capture for a pipeline restart"
                     );
                     unsafe {
                         pipewire_sys::pw_main_loop_quit(mainloop_ptr);
@@ -546,13 +600,17 @@ pub fn run_capture_stream(
                     data.format = pf;
                 }
 
+                if let Some(drm_fourcc) = new_drm_fourcc {
+                    data.drm_fourcc = drm_fourcc;
+                }
                 data.modifier = video_info.modifier();
 
                 info!(
                     width = data.width,
                     height = data.height,
                     format = %data.format,
-                    modifier = data.modifier,
+                    drm_fourcc = format_args!("0x{:08x}", data.drm_fourcc),
+                    modifier = format_args!("0x{:x}", data.modifier),
                     "PipeWire format negotiated"
                 );
 
@@ -564,12 +622,13 @@ pub fn run_capture_stream(
                     });
                 }
 
-                // ACK the format by telling PipeWire which buffer types we
-                // accept.  Only do this once per negotiation — calling
-                // update_params re-triggers param_changed, causing a
-                // Paused↔Streaming cycle that can corrupt buffer state.
-                if !data.format_acked {
-                    data.format_acked = true;
+                // ACK the selected memory type. DMA-BUF fixation first emits
+                // an implicit format and then a concrete modifier, so update
+                // the ACK once when that transition occurs. Store the state
+                // before update_params because it re-enters param_changed.
+                let is_dmabuf = data.modifier != 0 && data.modifier != DRM_FORMAT_MOD_INVALID;
+                if data.acked_dmabuf != Some(is_dmabuf) {
+                    data.acked_dmabuf = Some(is_dmabuf);
                     ack_format(stream, data.modifier);
                 }
             }
@@ -655,11 +714,17 @@ pub fn run_capture_stream(
                     data.width * 4
                 };
 
+                if data.drm_fourcc == 0 {
+                    warn!("DMA-BUF frame has no DRM fourcc mapping; skipping buffer");
+                    return;
+                }
+
                 Frame::DmaBuf(DmaBufInfo {
                     fd: owned_fd,
                     width: data.width,
                     height: data.height,
                     format: data.format,
+                    drm_fourcc: data.drm_fourcc,
                     modifier: data.modifier,
                     stride,
                     offset: chunk_offset,
@@ -852,4 +917,106 @@ pub fn run_capture_stream(
     drop(param_bytes_list);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use pipewire::spa::param::format::FormatProperties;
+    use pipewire::spa::pod::Value;
+    use pipewire::spa::pod::deserialize::PodDeserializer;
+    use pipewire::spa::utils::ChoiceEnum;
+
+    use super::*;
+
+    fn config() -> CaptureConfig {
+        CaptureConfig {
+            width: 3440,
+            height: 1440,
+            show_cursor: true,
+        }
+    }
+
+    #[test]
+    fn spa_formats_preserve_exact_drm_fourcc() {
+        use pipewire::spa::param::video::VideoFormat;
+
+        assert_eq!(
+            spa_format_to_drm_fourcc(VideoFormat::BGRA.as_raw()),
+            Some(drm_fourcc(b'A', b'R', b'2', b'4'))
+        );
+        assert_eq!(
+            spa_format_to_drm_fourcc(VideoFormat::BGRx.as_raw()),
+            Some(drm_fourcc(b'X', b'R', b'2', b'4'))
+        );
+        assert_eq!(
+            spa_format_to_drm_fourcc(VideoFormat::RGBA.as_raw()),
+            Some(drm_fourcc(b'A', b'B', b'2', b'4'))
+        );
+        assert_eq!(
+            spa_format_to_drm_fourcc(VideoFormat::RGBx.as_raw()),
+            Some(drm_fourcc(b'X', b'B', b'2', b'4'))
+        );
+        assert_eq!(
+            spa_format_to_drm_fourcc(VideoFormat::xBGR_210LE.as_raw()),
+            Some(drm_fourcc(b'X', b'B', b'3', b'0'))
+        );
+        assert_eq!(
+            spa_format_to_drm_fourcc(VideoFormat::ABGR_210LE.as_raw()),
+            Some(drm_fourcc(b'R', b'A', b'3', b'0'))
+        );
+        assert_eq!(
+            spa_format_to_drm_fourcc(VideoFormat::xRGB_210LE.as_raw()),
+            Some(drm_fourcc(b'X', b'R', b'3', b'0'))
+        );
+        assert_eq!(
+            spa_format_to_drm_fourcc(VideoFormat::ARGB_210LE.as_raw()),
+            Some(drm_fourcc(b'B', b'A', b'3', b'0'))
+        );
+    }
+
+    #[test]
+    fn format_params_embed_explicit_modifiers_and_keep_shm_fallback() {
+        let drm_fourcc = drm_fourcc(b'A', b'R', b'2', b'4');
+        let modifiers = [0x0300_0000_0000_0010, 0x0300_0000_0000_0012];
+        let pods = build_format_params_with_modifiers(
+            &config(),
+            &[crate::encode::egl_cuda::DmaBufModifierSet {
+                drm_fourcc,
+                modifiers: modifiers.to_vec(),
+            }],
+        );
+
+        assert_eq!(pods.len(), 2, "one DMA-BUF pod plus SHM fallback");
+        let (_, value) = PodDeserializer::deserialize_any_from(&pods[0]).unwrap();
+        let Value::Object(object) = value else {
+            panic!("format pod must deserialize as an object");
+        };
+        let modifier = object
+            .properties
+            .iter()
+            .find(|property| property.key == FormatProperties::VideoModifier.as_raw())
+            .expect("DMA-BUF pod must contain VideoModifier");
+        let Value::Choice(pod::ChoiceValue::Long(choice)) = &modifier.value else {
+            panic!("VideoModifier must be a long choice");
+        };
+        let ChoiceEnum::Enum {
+            default,
+            alternatives,
+        } = &choice.1
+        else {
+            panic!("VideoModifier must be an enum choice");
+        };
+        assert_eq!(*default, modifiers[0].cast_signed());
+        assert_eq!(
+            alternatives,
+            &modifiers.map(u64::cast_signed),
+            "all concrete EGL modifiers must be offered"
+        );
+    }
+
+    #[test]
+    fn no_egl_modifiers_builds_only_shm_fallback() {
+        let pods = build_format_params_with_modifiers(&config(), &[]);
+        assert_eq!(pods.len(), 1);
+    }
 }
