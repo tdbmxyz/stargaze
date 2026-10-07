@@ -8,4 +8,5 @@ pub mod error;
 pub mod input;
 pub mod logging;
 pub mod mic_forward;
+pub mod status;
 pub mod transport;

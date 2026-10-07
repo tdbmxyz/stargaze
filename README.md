@@ -115,6 +115,14 @@ save hosts (name, address, port, per-host resolution/framerate/codec),
 tweak toggles, and connect. Quitting a session with `Ctrl+Alt+Shift+Q`,
 the controller quit chord, or by closing its window exits the app.
 Unexpected stream endings or session errors return to the launcher.
+Each host row has a colored status indicator and label, refreshed every
+2 seconds: **Starting**, **Started**, **Stopping**, or **Stopped / unreachable**.
+A failed probe can also mean a network/firewall problem or an older server;
+it does not prevent connecting. Brief startup/shutdown states may occur
+between polls. Status probes use **TCP on the configured server port**
+(default 9000), alongside the existing **UDP/QUIC** stream: allow both
+protocols through the server's LAN firewall. The status service is
+unauthenticated, like the current LAN-only streaming setup.
 For scripts, `--server` skips the launcher and connects directly
 as before:
 
