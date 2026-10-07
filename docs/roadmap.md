@@ -16,6 +16,18 @@ Follow-up tasks after the MVP implementation. Ordered roughly by priority.
 
 ## Known Issues & Workarounds
 
+### Stale virtual gamepads after session disconnect
+
+The server can retain an emulated Xbox 360 pad after its client session
+ends: gamepad removal currently relies on a `GamepadDisconnected` event,
+not connection teardown. Observed on zeus during the 2026-10-07 Steam
+Controller live test: an Xbox pad from the earlier session was still
+present before the new USB-forwarding client connected, and no new Xbox
+pad was created during that test. Do not confuse this leftover device
+with the genuinely forwarded Steam Controller. Follow-up: clear
+session-owned gamepads and held input when a connection ends, including
+abrupt disconnects.
+
 ### Zero-copy rendering and nvidia-vaapi-driver
 
 The client's zero-copy path (VAAPI decode → DRM PRIME dma-buf export → EGL

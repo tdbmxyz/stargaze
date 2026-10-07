@@ -2,8 +2,8 @@
 //! decoders, input forwarding, and the renderer until the session ends.
 //!
 //! Extracted from `main` so the launcher UI can run sessions in a loop
-//! (menu → session → back to menu). Everything here is re-runnable and
-//! every exit path (including decoder start failures) runs the same
+//! (returning to the menu on unexpected endings). Everything here is
+//! re-runnable and every exit path (including decoder start failures) runs the same
 //! teardown — the pre-launcher code could rely on process exit to
 //! release controllers, kill rsonance, and close the connection; this
 //! code cannot. Once-only process state (tracing, rustls provider,
@@ -20,7 +20,7 @@ use crate::transport::{ConnectedSession, SessionParams};
 use crate::{decode, gamepad, render, usb};
 
 /// Runs a full session on an established connection, returning when the
-/// renderer exits (window closed, quit shortcut, or transport death).
+/// renderer exits, distinguishing a user quit from an unexpected stream end.
 ///
 /// `cfg` carries the toggles (fullscreen, gamepad passthrough, USB
 /// forward, mic forward); the decode codec comes from the
@@ -35,7 +35,7 @@ pub async fn run_session(
     cfg: &ClientConfig,
     conn: ConnectedSession,
     stats_file: Option<std::path::PathBuf>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<render::SessionOutcome> {
     let ConnectedSession {
         transport: client_transport,
         session_params,
@@ -191,9 +191,9 @@ pub async fn run_session(
     }
     client_transport.abort();
 
-    result?;
-    info!("Session ended");
-    Ok(())
+    let outcome = result?;
+    info!(?outcome, "Session ended");
+    Ok(outcome)
 }
 
 /// Starts both decoders and runs the blocking SDL render loop; stops
@@ -212,7 +212,7 @@ fn run_decoders_and_renderer(
     stats_file: Option<std::path::PathBuf>,
     gamepads: &gamepad::SharedGamepads,
     emulate_gamepads: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<render::SessionOutcome> {
     // Use the server-confirmed parameters for decoding and rendering:
     // the server may override the resolution (e.g. its display's
     // native size) and encodes with its own configured codec.

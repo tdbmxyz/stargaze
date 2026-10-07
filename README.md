@@ -11,7 +11,7 @@ Stargaze streams a Wayland desktop from a host machine (the **server**) to anoth
 
 - **Video**: PipeWire screen capture (DMA-BUF zero-copy or CPU path) → NVENC H.265 → QUIC → VAAPI or multi-threaded software decode → SDL2
 - **Audio**: PipeWire capture → Opus (stereo by default; mono/5.1/7.1 selectable, 48 kHz) → SDL2 playback. Surround is opt-in on the server (`audio_channels`) and advertised to the client in the handshake — see [docs/surround-audio.md](docs/surround-audio.md)
-- **Input**: keyboard, mouse, and game controller events forwarded from the client and injected on the server via uinput. Controllers are passed through at the evdev level — the host sees the real device (name, vendor/product ids, exact button/axis layout) — with automatic per-device fallback to Xbox 360 pad emulation (`--gamepad-passthrough false` forces emulation). Valve controller hardware (Steam Controller, dongle, Steam Deck) is forwarded wholesale as a USB device — USB/IP tunneled through the session connection — because Steam only accepts it with its real USB topology; needs a one-time permission setup, see [docs/steam-controller-usbip.md](docs/steam-controller-usbip.md)
+- **Input**: keyboard, mouse, and game controller events forwarded from the client and injected on the server via uinput. Controllers are passed through at the evdev level — the host sees the real device (name, vendor/product ids, exact button/axis layout) — with automatic per-device fallback to Xbox 360 pad emulation (`--gamepad-passthrough false` forces emulation). Known Valve controller USB hardware (original and 2026 Steam Controllers and receivers, plus opt-in Steam Deck controls) is forwarded wholesale as a USB device — USB/IP tunneled through the session connection — because Steam only accepts it with its real USB topology; needs a one-time permission setup, see [docs/steam-controller-usbip.md](docs/steam-controller-usbip.md)
 - **Mic forwarding** (optional): client microphone streamed back to the server via an [rsonance](https://github.com/tdbmxyz/rsonance) subprocess
 - **Loss recovery**: unreliable QUIC datagrams for media with in-order frame reassembly; lost frames trigger rate-limited IDR keyframe requests so the picture recovers in a few frames instead of seconds
 - **Low latency by design**: no vsync blocking in the render path, bounded channels with drop-oldest backpressure, IDR-on-drop
@@ -112,13 +112,23 @@ stargaze-server --resolution 2560x1440 --framerate 60 --bitrate 20
 On the client machine, just launch `stargaze-client` (from the desktop
 menu or a terminal): a gamepad/touch-friendly launcher opens where you
 save hosts (name, address, port, per-host resolution/framerate/codec),
-tweak toggles, and connect. Sessions return to the launcher when they
-end. For scripts, `--server` skips the launcher and connects directly
+tweak toggles, and connect. Quitting a session with `Ctrl+Alt+Shift+Q`,
+the controller quit chord, or by closing its window exits the app.
+Unexpected stream endings or session errors return to the launcher.
+Each host row has a colored status indicator and label, refreshed every
+2 seconds: **Starting**, **Started**, **Stopping**, or **Stopped / unreachable**.
+A failed probe can also mean a network/firewall problem or an older server;
+it does not prevent connecting. Brief startup/shutdown states may occur
+between polls. Status probes use **TCP on the configured server port**
+(default 9000), alongside the existing **UDP/QUIC** stream: allow both
+protocols through the server's LAN firewall. The status service is
+unauthenticated, like the current LAN-only streaming setup.
+For scripts, `--server` skips the launcher and connects directly
 as before:
 
 ```bash
 stargaze-client --server 192.168.1.10
-# Esc or closing the window ends the session and exits.
+# Ctrl+Alt+Shift+Q or closing the window ends the session and exits.
 ```
 
 Both binaries accept `--help` for the full flag list and read an optional TOML config file (CLI flags override it):

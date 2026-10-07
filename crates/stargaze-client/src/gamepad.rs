@@ -23,8 +23,10 @@
 //! their evdev nodes — an identity clone on the server enumerates but
 //! is invisible to games. Grabbing them is also fragile: hid-steam
 //! removes its evdev node whenever anything (Steam, SDL's HIDAPI)
-//! opens the hidraw side. They take the SDL → Xbox 360 emulation path;
-//! true identity pass-through would require hidraw/uhid forwarding.
+//! opens the hidraw side. Known USB controller hardware instead takes
+//! the whole-device USB/IP path (see [`crate::usb`]); when USB forwarding
+//! is disabled, unavailable, or the device uses Bluetooth, SDL → Xbox 360
+//! emulation remains the fallback.
 
 use std::collections::HashSet;
 use std::os::fd::AsRawFd;
@@ -527,7 +529,8 @@ fn claim_device(
         info!(
             name = %descriptor.name,
             "Valve controller: skipping evdev pass-through (hosts only \
-             support these via Steam/hidraw); using Xbox 360 emulation"
+             support these via Steam/hidraw); native identity needs USB \
+             forwarding, otherwise SDL uses Xbox 360 emulation"
         );
         shared.mark_ignored(path);
         return;

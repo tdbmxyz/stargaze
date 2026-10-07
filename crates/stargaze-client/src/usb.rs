@@ -17,6 +17,10 @@
 //! — see `docs/steam-controller-usbip.md` and the flake's
 //! `nixosModules.usb-client` for the persistent permission setup.
 
+mod devices;
+
+pub use devices::BUILTIN_DECK_CONTROLLER;
+
 use std::collections::HashSet;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -25,21 +29,6 @@ use std::time::Duration;
 
 use stargaze_core::transport::{UsbTunnelHeader, serialize_usb_tunnel_header};
 use tracing::{debug, info, warn};
-
-/// Devices worth forwarding wholesale: Valve controller hardware, which
-/// Steam refuses to see through virtual recreations.
-/// (wired Steam Controller, wireless dongle)
-///
-/// The Steam Deck's built-in controller (BUILTIN_DECK_CONTROLLER) is
-/// NOT listed by default: on a client machine that device can only be
-/// the local Deck's own controls, and tunneling it away takes the
-/// trackpads and buttons from local Steam Input mid-session. It is
-/// added opt-in (forward_builtin_controller) for the full-handoff
-/// experience: the remote Steam then sees a real Steam Deck Controller.
-const FORWARDED_DEVICES: [(u16, u16); 2] = [(0x28de, 0x1102), (0x28de, 0x1142)];
-
-/// The Steam Deck's built-in controller.
-pub const BUILTIN_DECK_CONTROLLER: (u16, u16) = (0x28de, 0x1205);
 
 /// How often to rescan for forwardable devices (hotplug support).
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
@@ -66,6 +55,7 @@ struct UsbDevice {
     devid: u32,
     speed: u32,
     name: String,
+    model: &'static str,
 }
 
 /// Handle to a running USB forwarder. Dropping it detaches the forwarder
@@ -171,7 +161,7 @@ pub fn start(connection: quinn::Connection, include_builtin: bool) -> UsbForward
     UsbForwarder { handle }
 }
 
-/// Scans sysfs for devices matching [`FORWARDED_DEVICES`].
+/// Scans sysfs for known controller USB devices allowed by the handoff policy.
 fn scan_devices(root: &Path, include_builtin: bool) -> Vec<UsbDevice> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
@@ -205,15 +195,13 @@ fn is_device_busid(name: &str) -> bool {
 fn read_device(path: &Path, busid: &str, include_builtin: bool) -> Option<UsbDevice> {
     let vendor = read_hex_u16(&path.join("idVendor"))?;
     let product = read_hex_u16(&path.join("idProduct"))?;
-    let matches = FORWARDED_DEVICES.contains(&(vendor, product))
-        || (include_builtin && (vendor, product) == BUILTIN_DECK_CONTROLLER);
-    if !matches {
-        return None;
-    }
+    let controller = devices::select(vendor, product, include_builtin)?;
     let busnum: u32 = read_trimmed(&path.join("busnum"))?.parse().ok()?;
     let devnum: u32 = read_trimmed(&path.join("devnum"))?.parse().ok()?;
     let speed = speed_code(&read_trimmed(&path.join("speed"))?);
-    let name = read_trimmed(&path.join("product")).unwrap_or_else(|| "USB device".to_string());
+    let name = read_trimmed(&path.join("product"))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| controller.model.to_string());
     Some(UsbDevice {
         busid: busid.to_string(),
         vendor,
@@ -221,6 +209,7 @@ fn read_device(path: &Path, busid: &str, include_builtin: bool) -> Option<UsbDev
         devid: (busnum << 16) | devnum,
         speed,
         name,
+        model: controller.model,
     })
 }
 
@@ -412,6 +401,7 @@ async fn export_device(
     info!(
         busid,
         name = %device.name,
+        model = device.model,
         vendor = format_args!("{:04x}", device.vendor),
         product = format_args!("{:04x}", device.product),
         "USB device forwarded to the server (usable there until the session ends)"
@@ -443,6 +433,89 @@ async fn export_device(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn add_device(root: &Path, busid: &str, vendor: u16, product: u16) -> PathBuf {
+        let path = root.join(busid);
+        std::fs::create_dir_all(&path).unwrap();
+        for (file, value) in [
+            ("idVendor", format!("{vendor:04x}\n")),
+            ("idProduct", format!("{product:04x}\n")),
+            ("product", "Steam Ctrl (USB)\n".into()),
+            ("busnum", "8\n".into()),
+            ("devnum", "38\n".into()),
+            ("speed", "12\n".into()),
+        ] {
+            std::fs::write(path.join(file), value).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn discovers_athena_receiver_as_one_whole_usb_device() {
+        let root = tempfile::tempdir().unwrap();
+        // Identity and layout observed read-only on athena. Interfaces are
+        // not separate devices: Steam must receive the entire seven-interface
+        // receiver, preserving its HID interfaces 2–5.
+        let busid = "8-1.3.3.3";
+        let path = add_device(root.path(), busid, 0x28de, 0x1304);
+        std::fs::write(path.join("bNumInterfaces"), "7\n").unwrap();
+        for index in 0..7 {
+            add_device(root.path(), &format!("{busid}:1.{index}"), 0x28de, 0x1304);
+        }
+        add_device(root.path(), "usb8", 0x28de, 0x1304);
+        let devices = scan_devices(root.path(), false);
+        assert_eq!(devices.len(), 1);
+        let receiver = &devices[0];
+        assert_eq!(receiver.busid, busid);
+        assert_eq!((receiver.vendor, receiver.product), (0x28de, 0x1304));
+        assert_eq!(receiver.devid, 0x0008_0026);
+        assert_eq!(receiver.speed, 2);
+        assert_eq!(receiver.name, "Steam Ctrl (USB)");
+        assert_eq!(receiver.model, "Steam Controller (2026, Proteus puck)");
+    }
+
+    #[test]
+    fn discovery_covers_controller_families_and_preserves_deck_opt_in() {
+        let root = tempfile::tempdir().unwrap();
+        for (index, product) in [0x1102, 0x1142, 0x1302, 0x1304, 0x1305, 0x1205]
+            .into_iter()
+            .enumerate()
+        {
+            add_device(root.path(), &format!("3-{}", index + 1), 0x28de, product);
+        }
+        // Neither enabling Deck handoff nor matching Valve may steal these.
+        add_device(root.path(), "4-1", 0x28de, 0x2432);
+        add_device(root.path(), "4-2", 0x28de, 0x1303);
+        add_device(root.path(), "4-3", 0x045e, 0x1304);
+        let mut products: Vec<_> = scan_devices(root.path(), false)
+            .iter()
+            .map(|device| device.product)
+            .collect();
+        products.sort_unstable();
+        assert_eq!(products, [0x1102, 0x1142, 0x1302, 0x1304, 0x1305]);
+        let mut products: Vec<_> = scan_devices(root.path(), true)
+            .iter()
+            .map(|device| device.product)
+            .collect();
+        products.sort_unstable();
+        assert_eq!(products, [0x1102, 0x1142, 0x1205, 0x1302, 0x1304, 0x1305]);
+    }
+
+    #[test]
+    fn discovery_skips_incomplete_devices_and_names_known_models() {
+        let root = tempfile::tempdir().unwrap();
+        let malformed = add_device(root.path(), "3-1", 0x28de, 0x1304);
+        std::fs::write(malformed.join("idProduct"), "not hex").unwrap();
+        let incomplete = add_device(root.path(), "3-2", 0x28de, 0x1302);
+        std::fs::remove_file(incomplete.join("devnum")).unwrap();
+        let unnamed = add_device(root.path(), "3-3", 0x28de, 0x1305);
+        std::fs::write(unnamed.join("product"), "\n").unwrap();
+        let devices = scan_devices(root.path(), false);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].busid, "3-3");
+        assert_eq!(devices[0].name, "Steam Controller (2026, Nereid receiver)");
+        assert!(scan_devices(&root.path().join("absent"), false).is_empty());
+    }
 
     #[test]
     fn device_busid_filter() {

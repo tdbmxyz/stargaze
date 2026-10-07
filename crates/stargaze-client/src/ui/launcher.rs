@@ -13,10 +13,12 @@ use std::time::Duration;
 use anyhow::anyhow;
 use sdl2::rect::Rect;
 use stargaze_core::config::{self, ClientConfig, Codec, HostEntry, Resolution};
+use stargaze_core::status::ServerStatus;
 use tracing::{info, warn};
 
 use super::InputMapper;
 use super::font::TextRenderer;
+use super::status::{HostStatus, HostStatuses};
 use super::widgets::{self, FocusList, NavEvent, Ui, palette};
 use crate::transport::{self, ConnectedSession};
 
@@ -467,14 +469,14 @@ fn cycle_codec(codec: &mut Codec, forward: bool) {
 
 // --- Drawing ---
 
-fn draw(model: &Model, connecting: Option<&str>, ui: &mut Ui) {
+fn draw(model: &Model, statuses: &HostStatuses, connecting: Option<&str>, ui: &mut Ui) {
     ui.canvas.set_draw_color(palette::BACKGROUND);
     ui.canvas.clear();
 
     ui.text("Stargaze", ROW_MARGIN, 48, 40, palette::TEXT);
 
     match &model.screen {
-        Screen::HostList { focus } => draw_host_list(model, focus, ui),
+        Screen::HostList { focus } => draw_host_list(model, statuses, focus, ui),
         Screen::HostEdit {
             index,
             draft,
@@ -509,7 +511,7 @@ fn draw(model: &Model, connecting: Option<&str>, ui: &mut Ui) {
     ui.canvas.present();
 }
 
-fn draw_host_list(model: &Model, focus: &FocusList, ui: &mut Ui) {
+fn draw_host_list(model: &Model, statuses: &HostStatuses, focus: &FocusList, ui: &mut Ui) {
     let rects = model.host_list_rects();
     let hosts = &model.cfg.hosts;
     ui.text("Hosts", ROW_MARGIN, ROW_TOP - 40, 18, palette::TEXT_DIM);
@@ -518,7 +520,27 @@ fn draw_host_list(model: &Model, focus: &FocusList, ui: &mut Ui) {
         let focused = focus.focus == i;
         ui.widget_box(rect, focused);
         let y = ui.centered_text_y(rect, 22);
-        ui.text(host.display_name(), rect.x() + 16, y, 22, palette::TEXT);
+        let status = statuses.get(host);
+        let color = match status {
+            HostStatus::Checking => palette::TEXT_DIM,
+            HostStatus::Unreachable => sdl2::pixels::Color::RGB(215, 110, 110),
+            HostStatus::Responding(ServerStatus::Starting) => {
+                sdl2::pixels::Color::RGB(235, 195, 90)
+            }
+            HostStatus::Responding(ServerStatus::Started) => palette::ACCENT,
+            HostStatus::Responding(ServerStatus::Stopping) => {
+                sdl2::pixels::Color::RGB(235, 150, 90)
+            }
+        };
+        ui.text("●", rect.x() + 14, y, 22, color);
+        ui.text(
+            host.display_name(),
+            rect.x() + 42,
+            rect.y() + 4,
+            22,
+            palette::TEXT,
+        );
+        ui.text(status.label(), rect.x() + 42, rect.y() + 32, 14, color);
         let details = format!(
             "{}:{}   {} @ {}fps {}",
             host.address, host.port, host.resolution, host.framerate, host.codec
@@ -707,6 +729,8 @@ pub fn run_launcher(
     video.text_input().stop();
 
     let mut model = Model::new(cfg.clone(), last_error);
+    // Owns and cancels all probe tasks on every launcher exit path.
+    let mut statuses = HostStatuses::default();
     let mut mapper = InputMapper::new();
     let mut pads: Vec<sdl2::controller::GameController> = Vec::new();
     // SDL announces already-present controllers only once per subsystem
@@ -877,6 +901,7 @@ pub fn run_launcher(
             }
         }
 
+        statuses.tick(&model.cfg.hosts, rt);
         let connecting_label = connecting.as_ref().map(|c| c.host_name.clone());
         let mut ui = Ui {
             canvas: &mut canvas,
@@ -884,7 +909,7 @@ pub fn run_launcher(
             text: &mut text,
             view,
         };
-        draw(&model, connecting_label.as_deref(), &mut ui);
+        draw(&model, &statuses, connecting_label.as_deref(), &mut ui);
 
         // present_vsync paces us; the sleep only matters on drivers
         // that ignore vsync for occluded windows.

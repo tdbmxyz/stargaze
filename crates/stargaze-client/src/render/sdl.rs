@@ -8,11 +8,11 @@ use stargaze_core::decode::{DecoderConfig, FramePixels};
 use stargaze_core::input::{GamepadAxis, GamepadButton, InputEvent, MouseButton};
 use tracing::{info, warn};
 
-use super::SessionCommands;
 use super::audio::create_audio_queue;
 use super::gl::GlRenderer;
 use super::input::{InputTracker, ShortcutAction, shortcut_action};
 use super::stats::{ReportMeta, StatsOverlay, StatsRecorder, draw_overlay};
+use super::{SessionCommands, SessionOutcome};
 use crate::decode::VideoFrame;
 use crate::gamepad::{PadKey, QuitChord, SharedGamepads, guid_vendor_product};
 use crate::transport::NetStats;
@@ -397,7 +397,7 @@ pub(super) fn run_sdl_loop(
     gamepads: &SharedGamepads,
     idr_tx: &tokio::sync::mpsc::Sender<()>,
     emulate_gamepads: bool,
-) -> Result<(), anyhow::Error> {
+) -> Result<SessionOutcome, anyhow::Error> {
     let audio_queue: AudioQueue<f32> = create_audio_queue(sdl, audio_channels)?;
     let max_queued_audio_bytes = super::audio::max_queued_audio_bytes(audio_channels);
     let audio_bytes_per_ms = super::audio::audio_bytes_per_ms(audio_channels);
@@ -493,7 +493,7 @@ pub(super) fn run_sdl_loop(
 
     backend.clear_black();
 
-    'main: loop {
+    let outcome = 'main: loop {
         // A pass-through thread grabbed (or released) a device: drop any
         // SDL emulation for controllers now owned by pass-through.
         let generation = gamepads.generation();
@@ -510,7 +510,7 @@ pub(super) fn run_sdl_loop(
 
         for event in event_pump.poll_iter() {
             match event {
-                sdl2::event::Event::Quit { .. } => break 'main,
+                sdl2::event::Event::Quit { .. } => break 'main SessionOutcome::UserQuit,
 
                 sdl2::event::Event::KeyDown {
                     scancode: Some(sc),
@@ -525,7 +525,7 @@ pub(super) fn run_sdl_loop(
                             let _ = input_tx.send(ev);
                         }
                         match action {
-                            ShortcutAction::Quit => break 'main,
+                            ShortcutAction::Quit => break 'main SessionOutcome::UserQuit,
                             ShortcutAction::ToggleCapture => {
                                 captured = !captured;
                                 apply_capture_mode(captured, backend.window_mut(), &sdl.mouse());
@@ -677,8 +677,8 @@ pub(super) fn run_sdl_loop(
         // or evdev pass-through readers (flag on SharedGamepads). The
         // keyboard-free way to end a session on the Steam Deck.
         if quit_chord.fired() || gamepads.quit_requested() {
-            info!("Select+Start held: ending session");
-            break 'main;
+            info!("Controller quit requested: ending session");
+            break 'main SessionOutcome::UserQuit;
         }
 
         // Wait briefly for a decoded frame so the loop doesn't busy-spin;
@@ -693,7 +693,7 @@ pub(super) fn run_sdl_loop(
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     info!("Decoded frame channel closed, stopping renderer");
-                    break 'main;
+                    break 'main SessionOutcome::StreamEnded;
                 }
             };
         while let Ok(frame) = decoded_rx.try_recv() {
@@ -747,7 +747,7 @@ pub(super) fn run_sdl_loop(
                 return Err(e);
             }
         }
-    }
+    };
 
     // Release any keys/buttons still held so the remote session isn't left
     // with stuck input (best-effort — the transport may already be gone).
@@ -782,7 +782,7 @@ pub(super) fn run_sdl_loop(
     }
 
     info!("Renderer shutting down");
-    Ok(())
+    Ok(outcome)
 }
 
 fn map_mouse_button(btn: sdl2::mouse::MouseButton) -> Option<MouseButton> {
