@@ -112,13 +112,15 @@ stargaze-server --resolution 2560x1440 --framerate 60 --bitrate 20
 On the client machine, just launch `stargaze-client` (from the desktop
 menu or a terminal): a gamepad/touch-friendly launcher opens where you
 save hosts (name, address, port, per-host resolution/framerate/codec),
-tweak toggles, and connect. Sessions return to the launcher when they
-end. For scripts, `--server` skips the launcher and connects directly
+tweak toggles, and connect. Quitting a session with `Ctrl+Alt+Shift+Q`,
+the controller quit chord, or by closing its window exits the app.
+Unexpected stream endings or session errors return to the launcher.
+For scripts, `--server` skips the launcher and connects directly
 as before:
 
 ```bash
 stargaze-client --server 192.168.1.10
-# Esc or closing the window ends the session and exits.
+# Ctrl+Alt+Shift+Q or closing the window ends the session and exits.
 ```
 
 Both binaries accept `--help` for the full flag list and read an optional TOML config file (CLI flags override it):

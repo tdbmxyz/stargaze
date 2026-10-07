@@ -21,6 +21,17 @@ pub struct SessionCommands {
     pub client: String,
 }
 
+/// Why the streaming session stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOutcome {
+    /// The user explicitly quit via the window, keyboard, or controller.
+    UserQuit,
+    /// The decoded video channel closed without a user quit request.
+    StreamEnded,
+}
+
+/// Runs the renderer until the user quits or the decoded stream ends.
+///
 /// # Errors
 ///
 /// Returns an error if SDL2 initialization, window creation, or rendering fails.
@@ -41,7 +52,7 @@ pub fn start_renderer(
     gamepads: &crate::gamepad::SharedGamepads,
     idr_tx: &tokio::sync::mpsc::Sender<()>,
     emulate_gamepads: bool,
-) -> Result<(), anyhow::Error> {
+) -> Result<SessionOutcome, anyhow::Error> {
     sdl::run_sdl_loop(
         sdl,
         config,
