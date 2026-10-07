@@ -3,6 +3,7 @@ use stargaze_core::audio::{AudioApplication, AudioCaptureConfig, AudioEncoderCon
 use stargaze_core::config::{self, Codec, Resolution, ServerConfig};
 use stargaze_core::encode::EncoderConfig;
 use stargaze_core::mic_forward;
+use stargaze_core::status::{ServerStatus, StatusListener};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -250,6 +251,14 @@ async fn main() -> anyhow::Result<()> {
         }
     );
 
+    // Status is independent of QUIC: bind TCP on the same numeric port
+    // before capture/portal initialization so clients can see Starting.
+    // The handle stays alive through teardown and aborts its task on all
+    // exits, including startup failures.
+    let status_address = format!("{}:{}", cfg.bind_address, cfg.port).parse()?;
+    let status = StatusListener::bind(status_address).await?;
+    info!(address = %status.local_addr(), "TCP status listener started");
+
     // Start capture pipeline.
     let capture_config = CaptureConfig {
         width: cfg.resolution.width,
@@ -348,7 +357,12 @@ async fn main() -> anyhow::Result<()> {
         server_transport.local_addr()
     );
 
-    // Wait for transport to finish (client disconnect or error) or Ctrl+C.
+    status.set_status(ServerStatus::Started);
+
+    // systemd sends SIGTERM, while interactive runs normally use SIGINT.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    // Wait for transport to finish (client disconnect or error) or a shutdown signal.
     // A transport error (e.g. the encode pipeline died after the capture
     // stream was killed by an output change) must survive the shutdown
     // below and become a non-zero exit, so a supervisor (systemd
@@ -362,8 +376,17 @@ async fn main() -> anyhow::Result<()> {
             }
             info!("Transport finished");
         }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received SIGINT, shutting down gracefully");
+        signal = async {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => result,
+                _ = terminate.recv() => Ok(()),
+            }
+        } => {
+            if let Err(e) = signal {
+                tracing::warn!("Shutdown signal handler failed: {e}");
+            }
+            status.set_status(ServerStatus::Stopping);
+            info!("Received shutdown signal, shutting down gracefully");
             // Abort the transport task and wait for it to finish so the
             // packet receivers are dropped before the pipeline is joined —
             // encoder threads parked in blocking_send() unblock on channel
@@ -373,6 +396,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    status.set_status(ServerStatus::Stopping);
     info!("Shutting down pipeline");
     if let Some(ref mut child) = rsonance_child {
         mic_forward::stop_rsonance(child).await;

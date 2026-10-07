@@ -9,6 +9,7 @@
 
 pub mod font;
 pub mod launcher;
+mod status;
 pub mod widgets;
 
 use std::time::{Duration, Instant};
