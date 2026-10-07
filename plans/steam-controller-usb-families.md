@@ -14,7 +14,8 @@
 - BLE `28de:1303` is not a USB device; never forward the entire Bluetooth adapter to emulate native forwarding.
 - Do not match the Valve vendor wholesale. In particular, a `28de:2432` Wi-Fi adapter exists on the development host; VR hardware, bootloaders, virtual controllers, and unknown devices must stay local.
 - Preserve the Deck's explicit handoff opt-in and existing USB/IP cleanup behavior.
-- Detection tests are not proof of Steam adopting the forwarded new controller; that requires a live session with the updated client and sufficiently recent Steam/udev support on the server.
+- Live test on 2026-10-07 (athena → zeus) verified the Proteus puck is forwarded, enumerates as real USB, and is adopted by Steam with the Triton configuration. Graceful shutdown restored the client USB/HID drivers and released the server vhci port; reconnect succeeded. Individual controls/haptics and the other new-model connection modes still need manual hardware verification.
+- A pre-existing emulated Xbox pad survives server session disconnect; the test created no new emulated pad. Recorded as a separate follow-up in `docs/roadmap.md`.
 
 ## Implementation Strategy
 

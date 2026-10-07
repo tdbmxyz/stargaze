@@ -50,8 +50,14 @@ with seven USB interfaces; controller HID interfaces 2–5 match
 [SDL's Triton driver](https://github.com/libsdl-org/SDL/blob/main/src/joystick/hidapi/SDL_hidapi_steam_triton.c).
 The tunnel preserves the whole device, its original identity and interfaces;
 no new controller-specific packet translation is needed on the server.
-Detection is tested, but Steam adoption of the new model still needs a
-live streaming session with the updated client.
+**Live verification (2026-10-07, athena → zeus):** the updated client
+forwarded the `28de:1304` puck, the server enumerated it as genuine USB,
+and Steam opened its HID interfaces, established the wireless connection,
+and loaded the Triton controller configuration. Graceful client exit
+released the server's vhci port and restored the receiver's original
+USB/HID drivers on athena; reconnect successfully forwarded it again.
+Individual buttons, gyro, trackpads, and haptics still need manual testing.
+Wired `1302` and Nereid `1305` selection is unit-tested, not hardware-verified.
 
 **Bluetooth is not native USB forwarding.** For the 2026 controller,
 `28de:1303` is its BLE identity, not a USB device to export. Use the puck
