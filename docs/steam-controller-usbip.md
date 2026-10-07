@@ -56,8 +56,9 @@ and Steam opened its HID interfaces, established the wireless connection,
 and loaded the Triton controller configuration. Graceful client exit
 released the server's vhci port and restored the receiver's original
 USB/HID drivers on athena; reconnect successfully forwarded it again.
-Individual buttons, gyro, trackpads, and haptics still need manual testing.
-Wired `1302` and Nereid `1305` selection is unit-tested, not hardware-verified.
+The user subsequently confirmed gyro and rear-button operation on zeus.
+Haptics were not separately verified during this test. Wired `1302` and
+Nereid `1305` selection is unit-tested, not hardware-verified.
 
 **Bluetooth is not native USB forwarding.** For the 2026 controller,
 `28de:1303` is its BLE identity, not a USB device to export. Use the puck
