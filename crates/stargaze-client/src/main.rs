@@ -6,7 +6,7 @@ use stargaze_core::config::{self, ClientConfig, Codec};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use stargaze_client::{session, transport, ui};
+use stargaze_client::{render, session, transport, ui};
 
 /// Stargaze streaming client — connects to a server, decodes video/audio, and forwards input.
 // Doc comments here are clap help text rendered verbatim; list items align
@@ -282,6 +282,20 @@ fn forced_video_driver(
     }
 }
 
+/// Exits on an explicit user quit; otherwise returns to the launcher.
+fn launcher_after_session(
+    result: anyhow::Result<render::SessionOutcome>,
+) -> std::ops::ControlFlow<(), Option<String>> {
+    match result {
+        Ok(render::SessionOutcome::UserQuit) => std::ops::ControlFlow::Break(()),
+        Ok(render::SessionOutcome::StreamEnded) => std::ops::ControlFlow::Continue(None),
+        Err(e) => {
+            warn!("Session ended with error: {e:#}");
+            std::ops::ControlFlow::Continue(Some(format!("{e:#}")))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Install the ring crypto provider for rustls/quinn before any TLS operation.
@@ -332,7 +346,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Launcher mode: menu → session → back to the menu, until quit.
+    // Launcher mode: return to the menu only on unexpected session endings.
     // One-shot CLI overrides are NOT applied here: the launcher saves
     // its config on every change, and a transient flag like --fps 30
     // must not be silently persisted into client.toml.
@@ -358,11 +372,11 @@ async fn main() -> anyhow::Result<()> {
                 cfg: session_cfg,
                 conn,
             } => {
-                if let Err(e) =
-                    session::run_session(&sdl, &session_cfg, *conn, cli.stats_file.clone()).await
-                {
-                    warn!("Session ended with error: {e:#}");
-                    last_error = Some(format!("{e:#}"));
+                let result =
+                    session::run_session(&sdl, &session_cfg, *conn, cli.stats_file.clone()).await;
+                match launcher_after_session(result) {
+                    std::ops::ControlFlow::Break(()) => break,
+                    std::ops::ControlFlow::Continue(error) => last_error = error,
                 }
             }
         }
@@ -375,7 +389,34 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::forced_video_driver;
+    use super::{forced_video_driver, launcher_after_session};
+    use crate::render::SessionOutcome;
+    use std::ops::ControlFlow;
+
+    #[test]
+    fn user_quit_exits_without_reopening_launcher() {
+        assert_eq!(
+            launcher_after_session(Ok(SessionOutcome::UserQuit)),
+            ControlFlow::Break(())
+        );
+    }
+
+    #[test]
+    fn unexpected_stream_end_reopens_launcher() {
+        assert_eq!(
+            launcher_after_session(Ok(SessionOutcome::StreamEnded)),
+            ControlFlow::Continue(None)
+        );
+    }
+
+    #[test]
+    fn session_error_reopens_launcher_with_error_details() {
+        let error = anyhow::anyhow!("decoder stopped").context("session failed");
+        assert_eq!(
+            launcher_after_session(Err(error)),
+            ControlFlow::Continue(Some("session failed: decoder stopped".into()))
+        );
+    }
 
     /// Gaming mode: gamescope's nested compositor never shows native
     /// Wayland surfaces, so x11 (XWayland) is mandatory.
