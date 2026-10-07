@@ -1989,6 +1989,7 @@ dependencies = [
  "rustls",
  "sdl2",
  "stargaze-core",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
