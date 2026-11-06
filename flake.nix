@@ -326,8 +326,10 @@
             pkgsCuda.cudaPackages.cuda_cudart
             pkgsCuda.cudaPackages.cuda_nvml_dev
             # Runtime kernel compilation (GPU NV12 converter dlopens libnvrtc).
-            # Pinned to CUDA 13 to match cudarc's "cuda-13020" feature.
-            pkgsCuda.cudaPackages_13.cuda_nvrtc
+            # Match cudarc's cuda-13020 AND deployed 595 drivers (CUDA 13.2).
+            # The floating cudaPackages_13 moved to 13.4 and emits PTX the
+            # driver cannot load, silently forcing slow CPU conversion.
+            pkgsCuda.cudaPackages_13_2.cuda_nvrtc
           ];
 
         env =
@@ -350,7 +352,7 @@
               pkgsCuda.libopus
               pkgsCuda.cudaPackages.cuda_cudart
               pkgsCuda.cudaPackages.cuda_nvml_dev
-              pkgsCuda.cudaPackages_13.cuda_nvrtc
+              pkgsCuda.cudaPackages_13_2.cuda_nvrtc
               pkgsCuda.libglvnd
               pkgsCuda.mesa
             ]
@@ -384,7 +386,7 @@
             pkgs.mesa
             pkgsCuda.cudaPackages.cuda_cudart # libcuda_cudart.so
             pkgsCuda.cudaPackages.cuda_nvml_dev # libnvidia-ml.so
-            pkgsCuda.cudaPackages_13.cuda_nvrtc # libnvrtc.so (GPU NV12 converter)
+            pkgsCuda.cudaPackages_13_2.cuda_nvrtc # Match deployed driver PTX support.
           ];
         libPath = pkgs.lib.makeLibraryPath serverBuildInputs';
         drv = rustPlatform.buildRustPackage (commonPackageAttrs
