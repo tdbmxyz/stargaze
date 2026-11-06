@@ -64,13 +64,15 @@ void main() {
 /// BT.709 limited-range YUV → RGB, shared by the YUV fragment shaders.
 const BT709_FN: &str = "\
 vec3 bt709(float luma, float cb, float cr) {
-    float y = 1.16438 * (luma - 0.0625);
-    float u = cb - 0.5;
-    float v = cr - 0.5;
+    // Normalized textures contain code/255, not code/256. Exact digital
+    // offsets keep Y=16 black, Y=235 white and U=V=128 neutral.
+    float y = (luma - 16.0/255.0) * (255.0/219.0);
+    float u = (cb - 128.0/255.0) * (255.0/224.0);
+    float v = (cr - 128.0/255.0) * (255.0/224.0);
     return vec3(
-        y + 1.79274 * v,
-        y - 0.21325 * u - 0.53291 * v,
-        y + 2.11240 * u
+        y + 1.5748 * v,
+        y - 0.187324 * u - 0.468124 * v,
+        y + 1.8556 * u
     );
 }
 ";
@@ -313,6 +315,12 @@ impl GlRenderer {
             );
         }
 
+        info!(
+            presentation = "SDR sRGB/default Wayland surface",
+            native_hdr = false,
+            reason = "SDL2 has no HDR surface color-description API; compositor performs SDR output mapping",
+            "Presentation color mode (no PQ conversion or saturation adjustment)"
+        );
         let egl = init_egl();
 
         Ok(Self {
@@ -1000,6 +1008,115 @@ mod tests {
             height: h,
             pts: 0,
             stats: FrameStats::default(),
+        }
+    }
+
+    /// Checks digital black, reference white and neutral gradients, without
+    /// applying gamma a second time. Run on SDR AND permanently HDR desktops:
+    /// `nix develop -c cargo test -p stargaze-client gl_renderer_neutral -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore = "requires a display (Wayland/X11) and a GPU"]
+    fn gl_renderer_neutral_levels_and_gradient() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+        let (w, h) = (256_u32, 32_u32);
+        let sdl = sdl2::init().expect("SDL init");
+        let video = sdl.video().expect("SDL video");
+        let mut renderer = GlRenderer::new(&video, w, h, false, true).expect("GL renderer");
+        // A swapped window's back buffer is undefined. Use an RGBA8 FBO
+        // for exact code-value checks, independent of window scaling and
+        // the compositor's SDR-to-HDR output mapping.
+        let (mut fbo, mut texture) = (0, 0);
+        unsafe {
+            gl::GenFramebuffers(1, &raw mut fbo);
+            gl::GenTextures(1, &raw mut texture);
+            gl::BindTexture(gl::TEXTURE_2D, texture);
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA8.cast_signed(),
+                w.cast_signed(),
+                h.cast_signed(),
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                std::ptr::null(),
+            );
+            gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+            gl::FramebufferTexture2D(
+                gl::FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                gl::TEXTURE_2D,
+                texture,
+                0,
+            );
+            assert_eq!(
+                gl::CheckFramebufferStatus(gl::FRAMEBUFFER),
+                gl::FRAMEBUFFER_COMPLETE
+            );
+            gl::Viewport(0, 0, w.cast_signed(), h.cast_signed());
+        }
+        for nv12 in [false, true] {
+            let y: Vec<u8> = (0..h)
+                .flat_map(|_| (0..w).map(|x| u8::try_from(16 + (219 * x + 127) / 255).unwrap()))
+                .collect();
+            let pixels = if nv12 {
+                FramePixels::Nv12 {
+                    y,
+                    uv: vec![128; (w * h / 2) as usize],
+                }
+            } else {
+                FramePixels::I420 {
+                    y,
+                    u: vec![128; (w * h / 4) as usize],
+                    v: vec![128; (w * h / 4) as usize],
+                }
+            };
+            let frame = VideoFrame::Cpu(DecodedFrame {
+                pixels,
+                width: w,
+                height: h,
+                pts: 0,
+                stats: FrameStats::default(),
+            });
+            let VideoFrame::Cpu(frame) = frame else {
+                unreachable!()
+            };
+            renderer.draw_cpu(&frame).unwrap();
+            let mut readback = vec![0_u8; (w * h * 4) as usize];
+            unsafe {
+                gl::ReadPixels(
+                    0,
+                    0,
+                    w.cast_signed(),
+                    h.cast_signed(),
+                    gl::RGBA,
+                    gl::UNSIGNED_BYTE,
+                    readback.as_mut_ptr().cast(),
+                );
+            }
+            check_gl_error("gradient readback").unwrap();
+            for x in 0..w {
+                let off = ((h / 2 * w + x) * 4) as usize;
+                let rgb = &readback[off..off + 3];
+                for &channel in rgb {
+                    assert!(
+                        (i32::from(channel) - i32::try_from(x).unwrap()).abs() <= 2,
+                        "NV12={nv12}, gradient {x}: {rgb:?}"
+                    );
+                }
+                assert_eq!(rgb[0], rgb[1]);
+                assert_eq!(rgb[1], rgb[2]);
+            }
+            assert_eq!(&readback[..3], &[0, 0, 0]);
+            let white = ((w - 1) * 4) as usize;
+            assert_eq!(&readback[white..white + 3], &[255, 255, 255]);
+        }
+        unsafe {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            gl::DeleteFramebuffers(1, &raw const fbo);
+            gl::DeleteTextures(1, &raw const texture);
         }
     }
 

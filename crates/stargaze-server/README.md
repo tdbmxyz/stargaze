@@ -40,6 +40,13 @@ stargaze-server --resolution 2560x1440 --framerate 120 --bitrate 40
 stargaze-server --config /path/to/server.toml
 ```
 
+Capture must have a supported color description. Hyprland's audited portal omits
+it: for a **known SDR** 8-bit RGB source, add `--allow-untagged-sdr` to explicitly
+assert the historical full-range sRGB interpretation. Otherwise missing metadata
+fails closed. This flag cannot detect unannounced source HDR transitions and
+never permits explicit HDR or untagged 10-bit. See the [color/HDR audit](../../docs/hdr-streaming.md).
+The client desktop may stay HDR with its calibration unchanged.
+
 Configuration file: `~/.config/stargaze/server.toml` (CLI flags override file values; see the [root README](../../README.md#usage) for the format).
 
 ## Tests

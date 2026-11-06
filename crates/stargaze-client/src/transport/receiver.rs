@@ -6,11 +6,13 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use stargaze_core::color::{ColorCapabilities, ColorDescription};
 use stargaze_core::input::InputEvent;
 use stargaze_core::transport::{
     ControlMessage, DatagramHeader, IDR_RATE_LIMIT_MS, IDR_RETRY_MS, MAX_PENDING_FRAMES,
-    ReassembledFrame, STREAM_TYPE_AUDIO, STREAM_TYPE_VIDEO, TransportError, deserialize_header,
-    deserialize_session_response_compat, serialize_control_message,
+    ReassembledFrame, STREAM_TYPE_AUDIO, STREAM_TYPE_VIDEO, TransportError,
+    deserialize_color_response, deserialize_header, serialize_color_request,
+    serialize_control_message,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -37,6 +39,8 @@ pub struct SessionParams {
     pub server_command: String,
     /// Number of audio channels the server encodes (1, 2, 6, or 8).
     pub audio_channels: u16,
+    /// Actual stream color, or explicitly identified legacy SDR.
+    pub color: ColorDescription,
 }
 
 /// Performs the session handshake with the server.
@@ -59,7 +63,7 @@ pub(crate) async fn perform_handshake(
         codec: request.codec,
         bitrate_mbps: request.bitrate_mbps,
     };
-    let req_bytes = serialize_control_message(&req_msg)?;
+    let req_bytes = serialize_color_request(&req_msg, ColorCapabilities::SDR_ONLY)?;
     send_stream
         .write_all(&req_bytes)
         .await
@@ -85,9 +89,16 @@ pub(crate) async fn perform_handshake(
         .await
         .map_err(|e| TransportError::SessionError(format!("read response body: {e}")))?;
 
-    // Compat parse: pre-surround servers send the response without an
-    // audio_channels field (defaults to 2 = stereo).
-    let response = deserialize_session_response_compat(&body)?;
+    let (response, color) = deserialize_color_response(&body)?;
+    ColorCapabilities::SDR_ONLY
+        .validate(color)
+        .map_err(|reason| TransportError::SessionError(reason.into()))?;
+    info!(
+        ?color,
+        presentation = "SDR sRGB surface (compositor maps to output)",
+        legacy = color == ColorDescription::LEGACY_SDR,
+        "Session color mode; desktop HDR state does not select stream HDR"
+    );
 
     match response {
         ControlMessage::SessionResponse {
@@ -109,6 +120,7 @@ pub(crate) async fn perform_handshake(
             max_datagram_size,
             server_command,
             audio_channels,
+            color,
         }),
         other => Err(TransportError::SessionError(format!(
             "expected SessionResponse, got {other:?}"

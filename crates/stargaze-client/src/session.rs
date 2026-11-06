@@ -74,6 +74,8 @@ pub async fn run_session(
         session_params.bitrate_mbps,
         session_params.codec,
     );
+    info!(stream_color = ?session_params.color, presentation = "SDR sRGB/default surface",
+        "Session color diagnostics: output HDR mapping belongs to the compositor");
     if session_params.codec != cfg.codec {
         warn!(
             "Server encodes {} (its configured codec), not the requested {}; decoding {0}",
@@ -220,6 +222,7 @@ fn run_decoders_and_renderer(
         width: session_params.width,
         height: session_params.height,
         codec: session_params.codec,
+        color: session_params.color,
     };
 
     let audio_decoder_config = AudioDecoderConfig {

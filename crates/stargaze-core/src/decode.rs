@@ -78,6 +78,8 @@ pub struct DecoderConfig {
     pub height: u32,
     /// Codec to decode.
     pub codec: Codec,
+    /// Negotiated color; legacy peers alone may omit VUI color fields.
+    pub color: crate::color::ColorDescription,
 }
 
 /// Errors from the video decoding subsystem.
@@ -205,6 +207,7 @@ mod tests {
             width: 1920,
             height: 1080,
             codec: Codec::H265,
+            color: crate::color::ColorDescription::LEGACY_SDR,
         };
         assert_eq!(cfg.width, 1920);
         assert_eq!(cfg.height, 1080);

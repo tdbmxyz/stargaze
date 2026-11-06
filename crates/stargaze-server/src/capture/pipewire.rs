@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
 use super::CaptureConfig;
+use super::color::SpaColor;
 
 /// User data passed through `PipeWire` stream callbacks.
 ///
@@ -49,6 +50,9 @@ struct CaptureCallbackData {
     /// Prevents re-entrant `update_params` cycles while allowing DMA-BUF
     /// fixation to replace an initial shared-memory format callback.
     acked_dmabuf: Option<bool>,
+    /// None until a supported color description has been validated.
+    color: Option<stargaze_core::color::ColorDescription>,
+    require_color_metadata: bool,
 }
 
 /// Maps a SPA video format to our internal `PixelFormat`.
@@ -63,14 +67,8 @@ fn spa_format_to_pixel_format(raw: u32) -> Option<PixelFormat> {
         VideoFormat::RGBA | VideoFormat::RGBx => Some(PixelFormat::Rgba8),
         VideoFormat::NV12 => Some(PixelFormat::Nv12),
         // 10-bit 2:10:10:10 packed formats exposed by portals on 10-bit displays.
-        VideoFormat::xBGR_210LE
-        | VideoFormat::BGRx_102LE
-        | VideoFormat::ABGR_210LE
-        | VideoFormat::BGRA_102LE => Some(PixelFormat::Bgra10),
-        VideoFormat::xRGB_210LE
-        | VideoFormat::RGBx_102LE
-        | VideoFormat::ARGB_210LE
-        | VideoFormat::RGBA_102LE => Some(PixelFormat::Rgba10),
+        VideoFormat::xBGR_210LE | VideoFormat::ABGR_210LE => Some(PixelFormat::Bgra10),
+        VideoFormat::xRGB_210LE | VideoFormat::ARGB_210LE => Some(PixelFormat::Rgba10),
         _ => None,
     }
 }
@@ -111,7 +109,7 @@ const DMABUF_FORMATS: &[DmaBufFormat] = &[
     },
     DmaBufFormat {
         spa_format: pipewire::spa::param::video::VideoFormat::ABGR_210LE,
-        drm_fourcc: drm_fourcc(b'R', b'A', b'3', b'0'), // DRM_FORMAT_RGBA1010102
+        drm_fourcc: drm_fourcc(b'A', b'B', b'3', b'0'), // DRM_FORMAT_ABGR2101010
     },
     DmaBufFormat {
         spa_format: pipewire::spa::param::video::VideoFormat::xRGB_210LE,
@@ -119,7 +117,7 @@ const DMABUF_FORMATS: &[DmaBufFormat] = &[
     },
     DmaBufFormat {
         spa_format: pipewire::spa::param::video::VideoFormat::ARGB_210LE,
-        drm_fourcc: drm_fourcc(b'B', b'A', b'3', b'0'), // DRM_FORMAT_BGRA1010102
+        drm_fourcc: drm_fourcc(b'A', b'R', b'3', b'0'), // DRM_FORMAT_ARGB2101010
     },
 ];
 
@@ -291,7 +289,6 @@ fn build_shm_fallback_pod(config: &CaptureConfig) -> Vec<u8> {
             pipewire::spa::param::video::VideoFormat::BGRx,
             pipewire::spa::param::video::VideoFormat::RGBA,
             pipewire::spa::param::video::VideoFormat::RGBx,
-            pipewire::spa::param::video::VideoFormat::NV12,
             pipewire::spa::param::video::VideoFormat::xBGR_210LE,
             pipewire::spa::param::video::VideoFormat::ABGR_210LE,
             pipewire::spa::param::video::VideoFormat::xRGB_210LE,
@@ -529,6 +526,8 @@ pub fn run_capture_stream(
         frame_count: 0,
         dropped_count: 0,
         acked_dmabuf: None,
+        color: None,
+        require_color_metadata: config.require_color_metadata,
     };
 
     // We need a reference to the mainloop inside callbacks.
@@ -565,6 +564,9 @@ pub fn run_capture_stream(
                 return;
             }
 
+            // Invalidate first: an unsupported transition must never keep the
+            // previous SDR interpretation, even if another buffer is queued.
+            data.color = None;
             // Try to parse the negotiated video format.
             let mut video_info = pipewire::spa::param::video::VideoInfoRaw::new();
             if video_info.parse(param).is_ok() {
@@ -577,6 +579,28 @@ pub fn run_capture_stream(
                 let spa_format = video_info.format().as_raw();
                 let new_format = spa_format_to_pixel_format(spa_format);
                 let new_drm_fourcc = spa_format_to_drm_fourcc(spa_format);
+                let source_color = SpaColor {
+                    range: video_info.color_range(),
+                    matrix: video_info.color_matrix(),
+                    transfer: video_info.transfer_function(),
+                    primaries: video_info.color_primaries(),
+                };
+                info!(?source_color, spa_format, "Capture source color metadata (SPA enums; zero = absent)");
+                let validated = new_format.ok_or("unsupported capture pixel format")
+                    .and_then(|format| source_color.validate(format, data.require_color_metadata));
+                let (color, assumed) = match validated {
+                    Ok(value) => value,
+                    Err(reason) => {
+                        error!(?source_color, reason, "Unsafe capture color mode; stopping before conversion (no tone/gamut mapping)");
+                        unsafe { pipewire_sys::pw_main_loop_quit(mainloop_ptr); }
+                        return;
+                    }
+                };
+                if assumed {
+                    warn!(?source_color, "Capture color metadata incomplete: --allow-untagged-sdr asserts full-range sRGB for 8-bit RGB; NOT detected HDR/SDR. Unannounced color transitions cannot be detected; keep the source SDR");
+                }
+                info!(source = ?color, stream = ?stargaze_core::color::ColorDescription::SDR_STREAM,
+                    "Validated capture color mode (SDR precision reduction only, never HDR tone mapping)");
                 let resolution_changed = data.resolution_tx.is_none()
                     && (size.width != data.width || size.height != data.height);
                 if resolution_changed {
@@ -593,6 +617,7 @@ pub fn run_capture_stream(
                     return;
                 }
 
+                data.color = Some(color);
                 data.width = size.width;
                 data.height = size.height;
 
@@ -631,6 +656,9 @@ pub fn run_capture_stream(
                     data.acked_dmabuf = Some(is_dmabuf);
                     ack_format(stream, data.modifier);
                 }
+            } else {
+                error!("Cannot parse capture format/color; stopping capture");
+                unsafe { pipewire_sys::pw_main_loop_quit(mainloop_ptr); }
             }
         })
         .process(move |stream, data| {
@@ -644,6 +672,8 @@ pub fn run_capture_stream(
                 }
                 return;
             }
+
+            let Some(color) = data.color else { return; };
 
             // Dequeue a buffer from the stream.
             let Some(mut buffer) = stream.dequeue_buffer() else {
@@ -828,7 +858,9 @@ pub fn run_capture_stream(
             // recycling to the compositor and queues stale frames, adding
             // latency. If the encoder is behind, drop this frame — the next
             // capture is fresher anyway.
-            match data.tx.try_send(frame.into()) {
+            let mut captured = CapturedFrame::from(frame);
+            captured.color = color;
+            match data.tx.try_send(captured) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     data.dropped_count += 1;
@@ -933,6 +965,7 @@ mod tests {
             width: 3440,
             height: 1440,
             show_cursor: true,
+            require_color_metadata: false,
         }
     }
 
@@ -962,7 +995,7 @@ mod tests {
         );
         assert_eq!(
             spa_format_to_drm_fourcc(VideoFormat::ABGR_210LE.as_raw()),
-            Some(drm_fourcc(b'R', b'A', b'3', b'0'))
+            Some(drm_fourcc(b'A', b'B', b'3', b'0'))
         );
         assert_eq!(
             spa_format_to_drm_fourcc(VideoFormat::xRGB_210LE.as_raw()),
@@ -970,7 +1003,7 @@ mod tests {
         );
         assert_eq!(
             spa_format_to_drm_fourcc(VideoFormat::ARGB_210LE.as_raw()),
-            Some(drm_fourcc(b'B', b'A', b'3', b'0'))
+            Some(drm_fourcc(b'A', b'R', b'3', b'0'))
         );
     }
 

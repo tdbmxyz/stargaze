@@ -37,6 +37,9 @@ pub(crate) struct FfmpegDecoder {
     /// interleaved with a delivered frame (nvidia-vaapi-driver's export
     /// breakage looks exactly like that).
     error_score: u32,
+    /// Session contract, re-applied after decoder recreation.
+    color: stargaze_core::color::ColorDescription,
+    color_logged: bool,
 }
 
 /// Decode-failure score at which the zero-copy path is assumed to be
@@ -152,6 +155,12 @@ pub(crate) fn init_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, Deco
         }
     }
 
+    if !config.color.is_supported_stream() {
+        return Err(DecodeError::InitError(format!(
+            "unsupported negotiated color {:?}; no HDR presentation/tone mapping",
+            config.color
+        )));
+    }
     // Try VAAPI first, then fall back to software.
     match init_vaapi_decoder(config) {
         Ok(dec) => {
@@ -229,7 +238,7 @@ fn codec_supports_vaapi(codec: ffmpeg_next::Codec) -> bool {
 }
 
 /// Attempts to initialize a VAAPI-accelerated H.265 decoder.
-fn init_vaapi_decoder(_config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeError> {
+fn init_vaapi_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeError> {
     let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::HEVC)
         .ok_or_else(|| DecodeError::InitError("hevc decoder not found".to_string()))?;
 
@@ -296,6 +305,8 @@ fn init_vaapi_decoder(_config: &DecoderConfig) -> Result<FfmpegDecoder, DecodeEr
         hw_device_ctx,
         hw_accel: true,
         error_score: 0,
+        color: config.color,
+        color_logged: false,
     })
 }
 
@@ -336,6 +347,8 @@ fn init_software_decoder(config: &DecoderConfig) -> Result<FfmpegDecoder, Decode
         hw_device_ctx: ptr::null_mut(),
         hw_accel: false,
         error_score: 0,
+        color: config.color,
+        color_logged: false,
     })
 }
 
@@ -421,7 +434,7 @@ pub(crate) fn run_decode_loop(
             continue;
         }
 
-        drain_decoded_frames(decoder, raw_tx, stats, decode_start, zero_copy, idr_tx);
+        drain_decoded_frames(decoder, raw_tx, stats, decode_start, zero_copy, idr_tx)?;
 
         // A decoder that errors on every packet while zero-copy is active
         // is being poisoned by the surface exports (seen with
@@ -451,7 +464,7 @@ pub(crate) fn run_decode_loop(
             std::time::Instant::now(),
             zero_copy,
             idr_tx,
-        );
+        )?;
     }
 
     info!("Decoder loop finished");
@@ -468,8 +481,6 @@ pub(crate) fn run_extract_loop(
     raw_rx: &std::sync::mpsc::Receiver<DecodeOutput>,
     decoded_tx: &std::sync::mpsc::Sender<VideoFrame>,
 ) {
-    let mut scaler: Option<ffmpeg_next::software::scaling::Context> = None;
-
     while let Ok(output) = raw_rx.recv() {
         let raw = match output {
             DecodeOutput::Raw(raw) => raw,
@@ -490,14 +501,12 @@ pub(crate) fn run_extract_loop(
         } else if format == ffmpeg_next::format::Pixel::YUV420P {
             extract_yuv420p(frame, width, height)
         } else {
-            // Arbitrary format — convert via sws_scale.
-            match scale_to_yuv420p(&mut scaler, frame, width, height) {
-                Ok(yuv_frame) => extract_yuv420p(&yuv_frame, width, height),
-                Err(e) => {
-                    warn!("Frame conversion failed: {e}, skipping frame");
-                    continue;
-                }
-            }
+            // Never truncate P010/10-bit or relabel PQ through swscale.
+            warn!(
+                ?format,
+                "Unsupported decoded precision/layout; stopping extraction"
+            );
+            return;
         };
 
         output.stats = raw.stats;
@@ -546,7 +555,7 @@ fn drain_decoded_frames(
     decode_start: std::time::Instant,
     zero_copy: &AtomicBool,
     idr_tx: &mpsc::Sender<()>,
-) {
+) -> Result<(), DecodeError> {
     loop {
         // A fresh frame each iteration: ownership moves to the extraction
         // thread. receive_frame fills it from the decoder's buffer pool.
@@ -565,6 +574,10 @@ fn drain_decoded_frames(
                 break;
             }
         }
+
+        // Before DMA-BUF export OR CPU transfer: neither fallback may hide
+        // PQ/HLG/wide gamut/range changes or silently truncate Main10.
+        check_session_color(decoder, &decoded_frame)?;
 
         // If this is a hardware frame (VAAPI surface), transfer to CPU.
         let is_vaapi =
@@ -587,7 +600,7 @@ fn drain_decoded_frames(
                         .send(DecodeOutput::Ready(VideoFrame::DmaBuf(frame)))
                         .is_err()
                     {
-                        return;
+                        return Ok(());
                     }
                     continue;
                 }
@@ -613,7 +626,14 @@ fn drain_decoded_frames(
                 warn!("av_hwframe_transfer_data failed (error {ret}), skipping frame");
                 continue;
             }
-            sw_frame.set_pts(decoded_frame.pts());
+            let ret = unsafe {
+                ffmpeg_sys_next::av_frame_copy_props(sw_frame.as_mut_ptr(), decoded_frame.as_ptr())
+            };
+            if ret < 0 {
+                return Err(DecodeError::FfmpegError(format!(
+                    "copy decoded color properties: {ret}"
+                )));
+            }
             sw_frame
         } else {
             decoded_frame
@@ -646,9 +666,10 @@ fn drain_decoded_frames(
         };
 
         if raw_tx.send(DecodeOutput::Raw(raw)).is_err() {
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 /// Returns the stride of plane `index`, or 0 if the frame has fewer planes.
@@ -728,39 +749,98 @@ fn copy_plane(data: &[u8], stride: usize, width: usize, height: usize) -> Vec<u8
     }
 }
 
-/// Uses sws_scale to convert an arbitrary pixel format to YUV420P.
-fn scale_to_yuv420p(
-    cached_scaler: &mut Option<ffmpeg_next::software::scaling::Context>,
-    src: &ffmpeg_next::frame::Video,
-    width: u32,
-    height: u32,
-) -> Result<ffmpeg_next::frame::Video, DecodeError> {
-    let needs_new = cached_scaler
-        .as_ref()
-        .is_none_or(|s| s.input().width != width || s.input().height != height);
-
-    if needs_new {
-        let scaler = ffmpeg_next::software::scaling::Context::get(
-            src.format(),
-            width,
-            height,
-            ffmpeg_next::format::Pixel::YUV420P,
-            width,
-            height,
-            ffmpeg_next::software::scaling::Flags::BILINEAR,
-        )
-        .map_err(|e| DecodeError::FfmpegError(format!("failed to create scaler: {e}")))?;
-        *cached_scaler = Some(scaler);
+fn check_session_color(
+    decoder: &mut FfmpegDecoder,
+    frame: &ffmpeg_next::frame::Video,
+) -> Result<(), DecodeError> {
+    validate_negotiated_color(frame, decoder.color)?;
+    if !decoder.color_logged {
+        info!(stream = ?decoder.color, decoded_format = ?frame.format(),
+            range = ?frame.color_range(), matrix = ?frame.color_space(),
+            primaries = ?frame.color_primaries(), transfer = ?frame.color_transfer_characteristic(),
+            hw_accel = decoder.hw_accel, "Decoded color mode validated before export/transfer");
+        decoder.color_logged = true;
     }
+    Ok(())
+}
 
-    let scaler = cached_scaler.as_mut().expect("scaler just created");
-    let mut yuv =
-        ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
-    scaler
-        .run(src, &mut yuv)
-        .map_err(|e| DecodeError::FfmpegError(format!("scaler run failed: {e}")))?;
-    yuv.set_pts(src.pts());
-    Ok(yuv)
+/// New peers must honor their explicit session contract. Only legacy peers
+/// may omit metadata or use the historical BT.709 transfer label.
+fn validate_negotiated_color(
+    frame: &ffmpeg_next::frame::Video,
+    expected: stargaze_core::color::ColorDescription,
+) -> Result<(), DecodeError> {
+    validate_decoded_color(frame)?;
+    let raw = unsafe { &*frame.as_ptr() };
+    if expected != stargaze_core::color::ColorDescription::LEGACY_SDR
+        && (expected != stargaze_core::color::ColorDescription::SDR_STREAM
+            || raw.color_range != ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_MPEG
+            || raw.colorspace != ffmpeg_sys_next::AVColorSpace::AVCOL_SPC_BT709
+            || raw.color_primaries != ffmpeg_sys_next::AVColorPrimaries::AVCOL_PRI_BT709
+            || raw.color_trc
+                != ffmpeg_sys_next::AVColorTransferCharacteristic::AVCOL_TRC_IEC61966_2_1)
+    {
+        return Err(DecodeError::FfmpegError(format!(
+            "decoded color differs from negotiated {expected:?}; reconnect required"
+        )));
+    }
+    Ok(())
+}
+
+/// Check the original `AVFrame`, since hardware transfer need not copy metadata.
+/// Unspecified fields retain the legacy SDR contract, not inferred HDR.
+#[allow(clippy::cast_ptr_alignment)] // FFmpeg allocates aligned AVHWFramesContext data.
+fn validate_decoded_color(frame: &ffmpeg_next::frame::Video) -> Result<(), DecodeError> {
+    use ffmpeg_sys_next::{
+        AVColorPrimaries as P, AVColorRange as R, AVColorSpace as M,
+        AVColorTransferCharacteristic as T, AVPixelFormat as F,
+    };
+    let raw = unsafe { &*frame.as_ptr() };
+    let mut format = F::from(frame.format());
+    if format == F::AV_PIX_FMT_VAAPI && !raw.hw_frames_ctx.is_null() {
+        let context = unsafe {
+            &*(*raw.hw_frames_ctx)
+                .data
+                .cast::<ffmpeg_sys_next::AVHWFramesContext>()
+        };
+        format = context.sw_format;
+    }
+    let supported = matches!(format, F::AV_PIX_FMT_NV12 | F::AV_PIX_FMT_YUV420P)
+        && matches!(
+            raw.color_range,
+            R::AVCOL_RANGE_UNSPECIFIED | R::AVCOL_RANGE_MPEG
+        )
+        && matches!(
+            raw.colorspace,
+            M::AVCOL_SPC_UNSPECIFIED | M::AVCOL_SPC_BT709
+        )
+        && matches!(
+            raw.color_primaries,
+            P::AVCOL_PRI_UNSPECIFIED | P::AVCOL_PRI_BT709
+        )
+        && matches!(
+            raw.color_trc,
+            T::AVCOL_TRC_UNSPECIFIED | T::AVCOL_TRC_BT709 | T::AVCOL_TRC_IEC61966_2_1
+        );
+    let hdr_metadata = unsafe {
+        !ffmpeg_sys_next::av_frame_get_side_data(
+            frame.as_ptr(),
+            ffmpeg_sys_next::AVFrameSideDataType::AV_FRAME_DATA_MASTERING_DISPLAY_METADATA,
+        )
+        .is_null()
+            || !ffmpeg_sys_next::av_frame_get_side_data(
+                frame.as_ptr(),
+                ffmpeg_sys_next::AVFrameSideDataType::AV_FRAME_DATA_CONTENT_LIGHT_LEVEL,
+            )
+            .is_null()
+    };
+    if !supported || hdr_metadata {
+        return Err(DecodeError::FfmpegError(format!(
+            "unsafe decoded color mode: {format:?}, range={:?}, matrix={:?}, primaries={:?}, transfer={:?}, HDR metadata={hdr_metadata}; SDR-only presentation, no tone/gamut mapping",
+            raw.color_range, raw.colorspace, raw.color_primaries, raw.color_trc,
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -769,11 +849,150 @@ mod tests {
     use stargaze_core::config::Codec;
 
     #[test]
+    fn decoded_color_guard_rejects_unsafe_modes_before_export_or_transfer() {
+        use ffmpeg_sys_next::{
+            AVColorPrimaries as P, AVColorRange as R, AVColorSpace as M,
+            AVColorTransferCharacteristic as T,
+        };
+        let mut frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::NV12, 16, 16);
+        assert!(validate_decoded_color(&frame).is_ok()); // legacy unspecified
+        assert!(
+            validate_negotiated_color(&frame, stargaze_core::color::ColorDescription::SDR_STREAM)
+                .is_err()
+        );
+        unsafe {
+            let raw = frame.as_mut_ptr();
+            (*raw).color_range = R::AVCOL_RANGE_MPEG;
+            (*raw).colorspace = M::AVCOL_SPC_BT709;
+            (*raw).color_primaries = P::AVCOL_PRI_BT709;
+            (*raw).color_trc = T::AVCOL_TRC_IEC61966_2_1;
+        }
+        assert!(validate_decoded_color(&frame).is_ok());
+        validate_negotiated_color(&frame, stargaze_core::color::ColorDescription::SDR_STREAM)
+            .unwrap();
+        for transfer in [
+            T::AVCOL_TRC_SMPTE2084,
+            T::AVCOL_TRC_ARIB_STD_B67,
+            T::AVCOL_TRC_LINEAR,
+        ] {
+            unsafe {
+                (*frame.as_mut_ptr()).color_trc = transfer;
+            }
+            assert!(validate_decoded_color(&frame).is_err());
+        }
+        unsafe {
+            (*frame.as_mut_ptr()).color_trc = T::AVCOL_TRC_BT709;
+            (*frame.as_mut_ptr()).color_range = R::AVCOL_RANGE_JPEG;
+        }
+        assert!(validate_decoded_color(&frame).is_err());
+        unsafe {
+            (*frame.as_mut_ptr()).color_range = R::AVCOL_RANGE_MPEG;
+            (*frame.as_mut_ptr()).color_primaries = P::AVCOL_PRI_BT2020;
+        }
+        assert!(validate_decoded_color(&frame).is_err());
+        unsafe {
+            (*frame.as_mut_ptr()).color_primaries = P::AVCOL_PRI_BT709;
+        }
+        assert!(validate_decoded_color(&frame).is_ok()); // transition back
+        let p010 = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::P010LE, 16, 16);
+        assert!(validate_decoded_color(&p010).is_err()); // no silent truncation
+    }
+
+    /// Decode a one-frame Annex-B fixture on real VAAPI hardware. SDR must
+    /// remain NV12 through export and transfer; HDR must fail the guard.
+    /// `STARGAZE_TEST_HEVC=/tmp/sdr.hevc nix develop -c cargo test -p stargaze-client vaapi_color_fixture -- --ignored --nocapture`.
+    /// For an HDR10 fixture also set `STARGAZE_TEST_EXPECT_HDR=1`.
+    #[test]
+    #[ignore = "requires VAAPI hardware and STARGAZE_TEST_HEVC one-frame fixture"]
+    fn vaapi_color_fixture() {
+        let data =
+            std::fs::read(std::env::var("STARGAZE_TEST_HEVC").expect("fixture path")).unwrap();
+        let expect_hdr = std::env::var("STARGAZE_TEST_EXPECT_HDR").is_ok_and(|v| v == "1");
+        let config = DecoderConfig {
+            width: 640,
+            height: 480,
+            codec: Codec::H265,
+            color: stargaze_core::color::ColorDescription::SDR_STREAM,
+        };
+        let mut decoder = init_decoder(&config).unwrap();
+        assert!(
+            decoder.hw_accel,
+            "test must exercise VAAPI, not software fallback"
+        );
+        decoder
+            .decoder
+            .send_packet(&ffmpeg_next::Packet::copy(&data))
+            .unwrap();
+        decoder.decoder.send_eof().unwrap();
+        let mut picture = ffmpeg_next::frame::Video::empty();
+        decoder.decoder.receive_frame(&mut picture).unwrap();
+        assert_eq!(picture.format(), ffmpeg_next::format::Pixel::VAAPI);
+        eprintln!(
+            "VAAPI fixture: {:?} {:?} {:?} {:?}",
+            picture.color_range(),
+            picture.color_space(),
+            picture.color_primaries(),
+            picture.color_transfer_characteristic()
+        );
+        if expect_hdr {
+            assert_eq!(
+                picture.color_transfer_characteristic(),
+                ffmpeg_next::color::TransferCharacteristic::SMPTE2084
+            );
+            assert_eq!(
+                picture.color_primaries(),
+                ffmpeg_next::color::Primaries::BT2020
+            );
+            assert!(validate_decoded_color(&picture).is_err());
+        } else {
+            assert_eq!(
+                picture.color_transfer_characteristic(),
+                ffmpeg_next::color::TransferCharacteristic::IEC61966_2_1
+            );
+            validate_negotiated_color(&picture, config.color).unwrap();
+            let mapped = map_to_drm_prime(&picture).expect("SDR dma-buf export");
+            assert_eq!(mapped.format(), ffmpeg_next::format::Pixel::DRM_PRIME);
+            let mut cpu = ffmpeg_next::frame::Video::empty();
+            assert_eq!(
+                unsafe {
+                    ffmpeg_sys_next::av_hwframe_transfer_data(cpu.as_mut_ptr(), picture.as_ptr(), 0)
+                },
+                0
+            );
+            assert_eq!(cpu.format(), ffmpeg_next::format::Pixel::NV12);
+            assert_eq!(
+                unsafe { ffmpeg_sys_next::av_frame_copy_props(cpu.as_mut_ptr(), picture.as_ptr()) },
+                0
+            );
+            validate_decoded_color(&cpu).unwrap();
+            // The documented SDR fixture is a neutral black frame.
+            assert!((i16::from(cpu.data(0)[0]) - 16).abs() <= 1);
+            assert!((i16::from(cpu.data(1)[0]) - 128).abs() <= 1);
+            assert!((i16::from(cpu.data(1)[1]) - 128).abs() <= 1);
+        }
+    }
+
+    #[test]
+    fn hdr_side_data_cannot_be_hidden_by_sdr_vui() {
+        let mut frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, 16, 16);
+        let side = unsafe {
+            ffmpeg_sys_next::av_frame_new_side_data(
+                frame.as_mut_ptr(),
+                ffmpeg_sys_next::AVFrameSideDataType::AV_FRAME_DATA_MASTERING_DISPLAY_METADATA,
+                1, // Guard checks presence, never interprets untrusted HDR payloads.
+            )
+        };
+        assert!(!side.is_null());
+        assert!(validate_decoded_color(&frame).is_err());
+    }
+
+    #[test]
     fn decoder_init_h265_succeeds() {
         let config = DecoderConfig {
             width: 1920,
             height: 1080,
             codec: Codec::H265,
+            color: stargaze_core::color::ColorDescription::LEGACY_SDR,
         };
         let result = init_decoder(&config);
         assert!(
@@ -871,6 +1090,7 @@ mod tests {
             width: 1920,
             height: 1080,
             codec: Codec::Av1,
+            color: stargaze_core::color::ColorDescription::LEGACY_SDR,
         };
         let result = init_decoder(&config);
         assert!(result.is_err(), "AV1 should be rejected");

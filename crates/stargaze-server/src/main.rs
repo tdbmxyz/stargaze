@@ -19,7 +19,7 @@ use capture::CaptureConfig;
 /// Stargaze streaming server — captures screen and audio, encodes, and streams to clients.
 // Doc comments here are clap help text rendered verbatim; list items align
 // continuation lines for terminal readability, not rustdoc conventions.
-#[allow(clippy::doc_overindented_list_items)]
+#[allow(clippy::doc_overindented_list_items, clippy::struct_excessive_bools)] // Independent CLI switches.
 #[derive(Parser, Debug)]
 #[command(name = "stargaze-server", version, about)]
 struct Cli {
@@ -134,6 +134,13 @@ struct Cli {
     ///          its own, at the cost of remote cursor feedback.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, verbatim_doc_comment)]
     show_cursor: bool,
+
+    /// Assert that untagged 8-bit RGB capture is full-range sRGB/SDR.
+    /// Needed by legacy portals that omit color metadata. Use only with a
+    /// known SDR source; this cannot detect unannounced SDR/HDR transitions.
+    /// Untagged 10-bit and explicit HDR are always rejected.
+    #[arg(long)]
+    allow_untagged_sdr: bool,
 
     /// Periodically log pipeline progress (captured/encoded frame counts).
     ///
@@ -264,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
         width: cfg.resolution.width,
         height: cfg.resolution.height,
         show_cursor: cfg.cursor.show_cursor,
+        require_color_metadata: !cli.allow_untagged_sdr,
     };
     let (capture_session, frames, resolution_rx) = capture::start_capture(capture_config).await?;
     info!("Capture started, waiting for PipeWire format negotiation...");
@@ -460,15 +468,20 @@ mod tests {
             width: 1920,
             height: 1080,
             show_cursor: true,
+            require_color_metadata: false,
         };
-        let (capture_session, frames, _resolution_rx) = capture::start_capture(capture_config)
+        let (capture_session, frames, resolution_rx) = capture::start_capture(capture_config)
             .await
             .expect("capture should start");
+        let resolution = tokio::time::timeout(std::time::Duration::from_secs(10), resolution_rx)
+            .await
+            .expect("format negotiation timeout")
+            .expect("capture resolution");
 
-        // Start encoder.
+        // Match the actual source, not the requested portal dimensions.
         let encoder_config = EncoderConfig {
-            width: 1920,
-            height: 1080,
+            width: resolution.width,
+            height: resolution.height,
             framerate: 30,
             bitrate_mbps: 10,
             tuning: stargaze_core::config::EncoderTuning::default(),
@@ -506,8 +519,10 @@ mod tests {
             eprintln!("Received {count} encoded packets in 3 seconds");
         }
 
-        encoder_session.stop().expect("encoder should stop cleanly");
+        // Stop the producer first so an idle desktop cannot leave the
+        // encoder blocked forever waiting for another captured frame.
         capture_session.stop().expect("capture should stop cleanly");
+        encoder_session.stop().expect("encoder should stop cleanly");
 
         assert!(
             count > 0,

@@ -1,3 +1,4 @@
+mod color;
 pub mod pipewire;
 pub mod portal;
 
@@ -22,6 +23,8 @@ pub struct CaptureConfig {
     pub height: u32,
     /// Whether to include the cursor in captured frames.
     pub show_cursor: bool,
+    /// Reject untagged RGB instead of the warned legacy SDR interpretation.
+    pub require_color_metadata: bool,
 }
 
 /// Handle to a running capture session.

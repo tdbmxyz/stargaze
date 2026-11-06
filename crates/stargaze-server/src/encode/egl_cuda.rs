@@ -140,14 +140,14 @@ extern "C" __global__ void rgba_to_nv12(
             int g = row[dx * 4 + g_off];
             int b = row[dx * 4 + b_off];
             rsum += r; gsum += g; bsum += b;
-            yrow[dx] = (unsigned char)(((47 * r + 157 * g + 16 * b + 128) >> 8) + 16);
+            yrow[dx] = (unsigned char)(((11966 * r + 40254 * g + 4064 * b + 32768) >> 16) + 16);
         }
     }
     int r = (rsum + 2) >> 2;
     int g = (gsum + 2) >> 2;
     int b = (bsum + 2) >> 2;
-    int u = ((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128;
-    int v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
+    int u = ((-6596 * r - 22189 * g + 28785 * b + 32768) >> 16) + 128;
+    int v = ((28785 * r - 26145 * g - 2640 * b + 32768) >> 16) + 128;
     unsigned char* uv = uv_plane + (unsigned long long)(yy / 2) * uv_pitch + x;
     uv[0] = (unsigned char)min(max(u, 16), 240);
     uv[1] = (unsigned char)min(max(v, 16), 240);

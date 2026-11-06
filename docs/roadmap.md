@@ -43,11 +43,15 @@ with CPU frames.
 
 ### 10-bit Display Formats
 
-Systems running 10-bit color depth (e.g. Hyprland with `misc:screen_bit_depth = 10`) expose 10-bit DRM formats (`xBGR2101010`, `ABGR2101010`) through the portal. Stargaze accepts these formats and converts to 8-bit in the encode pipeline.
+Bit depth does not identify HDR or color space. Explicitly described full-range
+sRGB 10-bit RGB can be reduced to SDR 8-bit; untagged 10-bit, HDR and unsupported
+colorimetry are rejected before conversion. The current SDL2/OpenGL presentation
+backend cannot signal native HDR10. No HDR-to-SDR tone/gamut mapper exists.
 
-If capture still fails with `no more input formats`, check your compositor:
-- **Hyprland ≥ v0.43**: `misc:screencopy_force_8b = true` (enabled by default) forces the portal to expose 8-bit formats only.
-- **Older Hyprland**: Set `misc:screen_bit_depth = 8` in `hyprland.conf`.
+See [the color/HDR audit](hdr-streaming.md) for actual Hyprland/PipeWire metadata,
+the explicit `--allow-untagged-sdr` migration option for known SDR sources,
+regression/hardware evidence and remaining native HDR implementation gates.
+Keep desktop HDR/calibration unchanged; forcing 8-bit output is not an HDR fix.
 
 ## 3. Latency Measurement
 

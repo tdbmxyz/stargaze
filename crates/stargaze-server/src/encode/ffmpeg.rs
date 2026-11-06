@@ -263,7 +263,10 @@ pub(crate) fn init_encoder(config: &EncoderConfig) -> Result<FfmpegEncoder, Enco
         (*raw_ctx).color_range = ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_MPEG;
         (*raw_ctx).colorspace = ffmpeg_sys_next::AVColorSpace::AVCOL_SPC_BT709;
         (*raw_ctx).color_primaries = ffmpeg_sys_next::AVColorPrimaries::AVCOL_PRI_BT709;
-        (*raw_ctx).color_trc = ffmpeg_sys_next::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+        // Matrix conversion preserves sRGB code values; it does not apply
+        // the BT.709 OETF. Signal the actual transfer, not just the matrix.
+        (*raw_ctx).color_trc =
+            ffmpeg_sys_next::AVColorTransferCharacteristic::AVCOL_TRC_IEC61966_2_1;
     }
 
     // Step 6: Open encoder with NVENC-specific options.
@@ -406,6 +409,12 @@ pub(crate) fn run_encode_loop(
             info!("Capture channel closed, flushing encoder");
             break;
         };
+        if !captured.color.is_supported_rgb() {
+            return Err(EncodeError::FfmpegError(format!(
+                "unsafe source color {:?}: no HDR tone/gamut mapping; stopping encoder",
+                captured.color
+            )));
+        }
         let frame = captured.frame;
 
         // Session requested a different bitrate: NVENC has no runtime
@@ -589,7 +598,8 @@ fn capture_format_to_ffmpeg(fmt: PixelFormat) -> ffmpeg_next::format::Pixel {
         PixelFormat::Bgra8 => ffmpeg_next::format::Pixel::BGRA,
         PixelFormat::Rgba8 => ffmpeg_next::format::Pixel::RGBA,
         PixelFormat::Nv12 => ffmpeg_next::format::Pixel::NV12,
-        PixelFormat::Bgra10 | PixelFormat::Rgba10 => ffmpeg_next::format::Pixel::X2BGR10LE,
+        PixelFormat::Bgra10 => ffmpeg_next::format::Pixel::X2BGR10LE,
+        PixelFormat::Rgba10 => ffmpeg_next::format::Pixel::X2RGB10LE,
     }
 }
 
@@ -847,6 +857,13 @@ fn send_hw_frame(
     force_idr: bool,
 ) -> Result<(), EncodeError> {
     hw_frame.set_pts(Some(pts.cast_signed()));
+    unsafe {
+        let raw = hw_frame.as_mut_ptr();
+        (*raw).color_range = ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_MPEG;
+        (*raw).colorspace = ffmpeg_sys_next::AVColorSpace::AVCOL_SPC_BT709;
+        (*raw).color_primaries = ffmpeg_sys_next::AVColorPrimaries::AVCOL_PRI_BT709;
+        (*raw).color_trc = ffmpeg_sys_next::AVColorTransferCharacteristic::AVCOL_TRC_IEC61966_2_1;
+    }
     if force_idr {
         unsafe {
             (*hw_frame.as_mut_ptr()).pict_type = ffmpeg_sys_next::AVPictureType::AV_PICTURE_TYPE_I;
@@ -890,18 +907,17 @@ fn upload_via_sws(
         }
     }
 
-    let scaler = encoder.sw_scaler.get_or_insert_with(|| {
-        ffmpeg_next::software::scaling::Context::get(
-            ffmpeg_fmt,
-            width,
-            height,
-            ffmpeg_next::format::Pixel::NV12,
-            width,
-            height,
-            ffmpeg_next::software::scaling::Flags::BILINEAR,
-        )
-        .expect("failed to create capture→NV12 scaler")
+    let needs_scaler = encoder.sw_scaler.as_ref().is_none_or(|scaler| {
+        let input = scaler.input();
+        input.format != ffmpeg_fmt || input.width != width || input.height != height
     });
+    if needs_scaler {
+        encoder.sw_scaler = Some(sdr_capture_scaler(ffmpeg_fmt, width, height)?);
+    }
+    let scaler = encoder
+        .sw_scaler
+        .as_mut()
+        .ok_or_else(|| EncodeError::FfmpegError("capture scaler unavailable".into()))?;
 
     scaler
         .run(&sw_frame, nv12_frame)
@@ -910,6 +926,44 @@ fn upload_via_sws(
             reason: format!("capture→NV12 scaling failed: {e}"),
         })
         .map(|_| ())
+}
+
+/// Full-range sRGB → limited-range 709 matrix, with no transfer conversion.
+/// This is SDR precision reduction, NOT an HDR tone mapper.
+fn sdr_capture_scaler(
+    format: ffmpeg_next::format::Pixel,
+    width: u32,
+    height: u32,
+) -> Result<ffmpeg_next::software::scaling::Context, EncodeError> {
+    let mut scaler = ffmpeg_next::software::scaling::Context::get(
+        format,
+        width,
+        height,
+        ffmpeg_next::format::Pixel::NV12,
+        width,
+        height,
+        ffmpeg_next::software::scaling::Flags::BILINEAR,
+    )
+    .map_err(|e| EncodeError::FfmpegError(format!("capture scaler: {e}")))?;
+    let ret = unsafe {
+        let coeffs = ffmpeg_sys_next::sws_getCoefficients(ffmpeg_sys_next::SWS_CS_ITU709);
+        ffmpeg_sys_next::sws_setColorspaceDetails(
+            scaler.as_mut_ptr(),
+            coeffs,
+            1,
+            coeffs,
+            0,
+            0,
+            1 << 16,
+            1 << 16,
+        )
+    };
+    if ret < 0 {
+        return Err(EncodeError::FfmpegError(format!(
+            "capture scaler color configuration: {ret}"
+        )));
+    }
+    Ok(scaler)
 }
 
 fn upload_dmabuf_and_encode(
@@ -1203,6 +1257,174 @@ mod tests {
     use std::os::raw::{c_int, c_void};
 
     use super::*;
+
+    #[test]
+    fn ten_bit_sdr_scaler_uses_correct_channel_order_range_and_matrix() {
+        ffmpeg_next::init().unwrap();
+        for capture in [PixelFormat::Bgra10, PixelFormat::Rgba10] {
+            let format = capture_format_to_ffmpeg(capture);
+            let mut scaler = sdr_capture_scaler(format, 16, 16).unwrap();
+            let mut src = ffmpeg_next::frame::Video::new(format, 16, 16);
+            let mut dst = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::NV12, 16, 16);
+            let mut check = |r: u32, g: u32, b: u32, expected: (u8, u8, u8)| {
+                let packed = match capture {
+                    PixelFormat::Bgra10 => r | (g << 10) | (b << 20),
+                    PixelFormat::Rgba10 => b | (g << 10) | (r << 20),
+                    _ => unreachable!(),
+                };
+                for pixel in src.data_mut(0).as_chunks_mut::<4>().0 {
+                    pixel.copy_from_slice(&packed.to_le_bytes());
+                }
+                scaler.run(&src, &mut dst).unwrap();
+                let actual = (dst.data(0)[0], dst.data(1)[0], dst.data(1)[1]);
+                for (actual, expected) in [actual.0, actual.1, actual.2]
+                    .into_iter()
+                    .zip([expected.0, expected.1, expected.2])
+                {
+                    assert!(
+                        (i16::from(actual) - i16::from(expected)).abs() <= 1,
+                        "{capture:?}: {actual} != {expected}"
+                    );
+                }
+            };
+            check(0, 0, 0, (16, 128, 128));
+            check(1023, 1023, 1023, (235, 128, 128));
+            check(1023, 0, 0, (63, 102, 240));
+            check(0, 1023, 0, (173, 42, 26));
+            check(0, 0, 1023, (32, 240, 118));
+            for gray in [1, 64, 256, 512, 768, 1023] {
+                let y = u8::try_from(16 + (219 * gray + 511) / 1023).unwrap();
+                check(gray, gray, gray, (y, 128, 128));
+            }
+        }
+    }
+
+    /// Checks every gray code on CUDA before lossy encoding, including
+    /// full-range RGB black/white and limited-range NV12 output endpoints.
+    /// `nix develop .#cuda -c cargo test -p stargaze-server cpu_gpu_sdr_gradient_agreement -- --ignored`.
+    #[test]
+    #[ignore = "requires NVIDIA GPU, NVENC, NVRTC"]
+    fn cpu_gpu_sdr_gradient_agreement() {
+        use cudarc::driver::sys as cu;
+        let (width, height) = (512_u32, 256_u32);
+        let config = EncoderConfig {
+            width,
+            height,
+            framerate: 145,
+            bitrate_mbps: 40,
+            tuning: stargaze_core::config::EncoderTuning::default(),
+        };
+        let encoder = init_encoder(&config).unwrap();
+        let _ctx = CudaCtxGuard::push(encoder.cuda_ctx, 0).unwrap();
+        let (w, h) = (width as usize, height as usize);
+        let data: Vec<u8> = (0..height)
+            .flat_map(|_| {
+                (0..width).flat_map(|x| {
+                    let gray = u8::try_from(x / 2).unwrap();
+                    [gray, gray, gray, 255]
+                })
+            })
+            .collect();
+        let mut cpu_y = vec![0; w * h];
+        let mut cpu_uv = vec![0; w * h / 2];
+        super::super::convert::convert_to_nv12(
+            &data,
+            w * 4,
+            w,
+            h,
+            (2, 1, 0),
+            &mut cpu_y,
+            w,
+            &mut cpu_uv,
+            w,
+        );
+        let mut hw = ffmpeg_next::frame::Video::empty();
+        assert_eq!(
+            unsafe {
+                ffmpeg_sys_next::av_hwframe_get_buffer(encoder.hw_frames_ctx, hw.as_mut_ptr(), 0)
+            },
+            0
+        );
+        let mut converter = super::super::egl_cuda::GpuNv12Converter::new(width, height).unwrap();
+        unsafe {
+            let raw = &*hw.as_ptr();
+            converter
+                .convert_host_frame(
+                    &data,
+                    w * 4,
+                    (2, 1, 0),
+                    raw.data[0] as cu::CUdeviceptr,
+                    usize::try_from(raw.linesize[0]).unwrap(),
+                    raw.data[1] as cu::CUdeviceptr,
+                    usize::try_from(raw.linesize[1]).unwrap(),
+                )
+                .unwrap();
+        }
+        let mut gpu = ffmpeg_next::frame::Video::empty();
+        assert_eq!(
+            unsafe { ffmpeg_sys_next::av_hwframe_transfer_data(gpu.as_mut_ptr(), hw.as_ptr(), 0) },
+            0
+        );
+        for row in 0..h {
+            assert_eq!(
+                &cpu_y[row * w..(row + 1) * w],
+                &gpu.data(0)[row * gpu.stride(0)..row * gpu.stride(0) + w]
+            );
+        }
+        for row in 0..h / 2 {
+            assert_eq!(
+                &cpu_uv[row * w..(row + 1) * w],
+                &gpu.data(1)[row * gpu.stride(1)..row * gpu.stride(1) + w]
+            );
+        }
+    }
+
+    #[test]
+    fn swscale_and_direct_sdr_paths_agree() {
+        ffmpeg_next::init().unwrap();
+        let mut scaler = sdr_capture_scaler(ffmpeg_next::format::Pixel::BGRA, 16, 16).unwrap();
+        let mut src = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, 16, 16);
+        let mut dst = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::NV12, 16, 16);
+        for (r, g, b) in [
+            (0, 0, 0),
+            (255, 255, 255),
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (45, 120, 200),
+        ] {
+            let data = [b, g, r, 255].repeat(16 * 16);
+            for row in 0..16 {
+                let stride = src.stride(0);
+                src.data_mut(0)[row * stride..row * stride + 64]
+                    .copy_from_slice(&data[row * 64..row * 64 + 64]);
+            }
+            scaler.run(&src, &mut dst).unwrap();
+            let mut y = vec![0; 16 * 16];
+            let mut uv = vec![0; 16 * 8];
+            super::super::convert::convert_to_nv12(
+                &data,
+                64,
+                16,
+                16,
+                (2, 1, 0),
+                &mut y,
+                16,
+                &mut uv,
+                16,
+            );
+            for (a, b) in [
+                (y[0], dst.data(0)[0]),
+                (uv[0], dst.data(1)[0]),
+                (uv[1], dst.data(1)[1]),
+            ] {
+                assert!(
+                    (i16::from(a) - i16::from(b)).abs() <= 1,
+                    "direct {a}, swscale {b}"
+                );
+            }
+        }
+    }
 
     // Minimal libgbm bindings for allocating a real DMA-BUF in tests.
     type GbmCreateDeviceFn = unsafe extern "C" fn(c_int) -> *mut c_void;
@@ -1870,6 +2092,16 @@ mod tests {
 
             let frame = decode_packets(&packets);
             assert_eq!(frame.format(), ffmpeg_next::format::Pixel::YUV420P);
+            assert_eq!(frame.color_range(), ffmpeg_next::color::Range::MPEG);
+            assert_eq!(frame.color_space(), ffmpeg_next::color::Space::BT709);
+            assert_eq!(
+                frame.color_primaries(),
+                ffmpeg_next::color::Primaries::BT709
+            );
+            assert_eq!(
+                frame.color_transfer_characteristic(),
+                ffmpeg_next::color::TransferCharacteristic::IEC61966_2_1
+            );
             for ((color, (ey, eu, ev)), (cx, cy)) in expected.iter().zip(centers) {
                 let (luma, cb, cr) = sample_yuv(&frame, cx, cy);
                 let ok = (i16::from(luma) - i16::from(*ey)).abs() <= 12

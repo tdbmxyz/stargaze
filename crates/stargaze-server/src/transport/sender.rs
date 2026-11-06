@@ -3,12 +3,14 @@
 //! Handles fragmenting [`EncodedPacket`] values into `QUIC` datagrams
 //! and processing incoming control messages.
 
+use stargaze_core::color::ColorDescription;
 use stargaze_core::config::ServerConfig;
 use stargaze_core::encode::EncodedPacket;
 use stargaze_core::input::InputEvent;
 use stargaze_core::transport::{
     ControlMessage, DatagramHeader, HEADER_SIZE_UPPER_BOUND, TransportError,
-    deserialize_control_message, serialize_control_message, serialize_header,
+    deserialize_color_request, deserialize_control_message, serialize_color_response,
+    serialize_header,
 };
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -57,7 +59,14 @@ pub(crate) async fn handle_session_handshake(
 
     // Compat parse: pre-v1.3.0 clients send the request without a
     // bitrate field.
-    let request = stargaze_core::transport::deserialize_session_request_compat(&body)?;
+    let (request, color_caps) = deserialize_color_request(&body)?;
+    color_caps
+        .validate(ColorDescription::SDR_STREAM)
+        .map_err(|reason| TransportError::SessionError(reason.into()))?;
+    info!(?color_caps, stream_color = ?ColorDescription::SDR_STREAM,
+        native_hdr = false,
+        reason = "capture/presentation HDR contract unavailable; no tone-mapping fallback",
+        "Session color negotiation");
 
     let (width, height, framerate, codec, requested_bitrate) = match request {
         ControlMessage::SessionRequest {
@@ -109,7 +118,7 @@ pub(crate) async fn handle_session_handshake(
         audio_channels: config.audio_channels,
     };
 
-    let response_bytes = serialize_control_message(&response)?;
+    let response_bytes = serialize_color_response(&response, ColorDescription::SDR_STREAM)?;
     send_stream
         .write_all(&response_bytes)
         .await

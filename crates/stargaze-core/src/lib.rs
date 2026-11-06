@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod avlog;
 pub mod capture;
+pub mod color;
 pub mod config;
 pub mod decode;
 pub mod encode;

@@ -109,6 +109,12 @@ stargaze-server --resolution 2560x1440 --framerate 60 --bitrate 20
 # docs/headless-screencast.md for an auto-approving portal setup.
 ```
 
+Capture color metadata is validated before conversion. If your portal omits it,
+add `--allow-untagged-sdr` **only for a known SDR 8-bit RGB source**; otherwise
+capture fails closed. Native HDR10 and HDR-to-SDR tone mapping are not supported.
+The client desktop can stay permanently HDR with its calibration unchanged.
+See the [color/HDR audit and deployment notes](docs/hdr-streaming.md).
+
 On the client machine, just launch `stargaze-client` (from the desktop
 menu or a terminal): a gamepad/touch-friendly launcher opens where you
 save hosts (name, address, port, per-host resolution/framerate/codec),

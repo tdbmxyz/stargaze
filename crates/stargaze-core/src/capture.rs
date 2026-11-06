@@ -12,13 +12,15 @@ pub enum PixelFormat {
     Rgba8,
     /// NV12 semi-planar YUV (possible direct from some sources).
     Nv12,
-    /// BGRA 10-bit per channel (`DRM_FORMAT_XRGB2101010` / `xBGR_210LE`).
+    /// Packed X2BGR10LE (`DRM_FORMAT_XBGR2101010` / `xBGR_210LE`),
+    /// with red in the least-significant 10 bits (legacy variant name).
     ///
-    /// Exposed by portals on 10-bit displays. The DMA-BUF or memory buffer
-    /// stores 2:10:10:10 packed pixels; downstream conversion to 8-bit
-    /// happens in the encoder (FFmpeg/NVENC).
+    /// Storage precision alone says nothing about transfer/dynamic range.
+    /// Only explicitly described sRGB is accepted for 10-bit capture;
+    /// HDR or ambiguous metadata must not reach the SDR converter.
     Bgra10,
-    /// RGBA 10-bit per channel (`DRM_FORMAT_XBGR2101010` / `ABGR_210LE`).
+    /// Packed X2RGB10LE (`DRM_FORMAT_XRGB2101010` / `xRGB_210LE`),
+    /// with blue in the least-significant 10 bits (legacy variant name).
     Rgba10,
 }
 
@@ -100,6 +102,8 @@ pub struct CapturedFrame {
     pub frame: Frame,
     /// When the frame was delivered by the capture pipeline.
     pub captured_at: std::time::Instant,
+    /// Source color, validated before conversion; independent of pixel layout.
+    pub color: crate::color::ColorDescription,
 }
 
 impl From<Frame> for CapturedFrame {
@@ -107,6 +111,7 @@ impl From<Frame> for CapturedFrame {
         Self {
             frame,
             captured_at: std::time::Instant::now(),
+            color: crate::color::ColorDescription::SRGB,
         }
     }
 }
