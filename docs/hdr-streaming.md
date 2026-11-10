@@ -4,15 +4,16 @@ Stargaze now has a native **HEVC Main10 / P010 / BT.2020 / PQ** path, including
 10-bit color-managed Wayland presentation. It targets zeus's NVIDIA/NVENC encoder
 and athena's AMD/VAAPI decoder, not a portable matrix of hardware backends.
 
-**Source and display HDR are independent.** The currently audited Hyprland 0.57
-portal path renders an **sRGB sharing copy**, and zeus's current headless desktop
-is SDR. That desktop therefore still streams as SDR. Enabling HDR on athena does
-not turn the source into HDR, and relabeling the portal copy as PQ would be wrong.
-Native HDR requires an actual HDR source, described below.
+**Output HDR and capture HDR are independent.** Zeus's headless `Main` now runs
+at 3440×1440/145 with XBGR2101010 buffers, the `hdr` preset and SDR mapping 0–160.
+However, the audited Hyprland 0.57 portal path still renders an **sRGB sharing
+copy**, confirmed again after enabling that HDR output. Normal desktop capture
+therefore still streams SDR. Relabeling this copy PQ would be wrong; native HDR
+requires a preserving source/export, described below.
 
 ## Use it
 
-### Current desktop: SDR source, permanently HDR client
+### Current portal: SDR capture, permanently HDR client
 
 Launch normally; no override or desktop switching is needed:
 
@@ -207,7 +208,8 @@ bounded media channels, decode-every-frame and render-latest policies remain.
 Baseline: `8316a84`, following the deployed revision
 `1628f7cc600a8180047c10670287b14ff7f07226`.
 
-Read-only checks found zeus's headless `Main` output at 3440×1440/145, XRGB8888,
+Before the user enabled the virtual HDR output, read-only checks found zeus's
+headless `Main` output at 3440×1440/145, XRGB8888,
 sRGB, on an RTX 3090/NVIDIA 595.112.07. Athena's MSI `DP-2` was 3440×1440/174.962,
 XRGB2101010/HDR, with SDR 0–160 and saturation 1. The live XDPH/consumer format
 pods contained BGRA/modifier/size/rates, **no color or HDR mastering fields**.
@@ -228,8 +230,8 @@ protocol documentation:
 - Hyprland **0.57.0**, commit
   `4b9ac40d71ceeeb027cfa06992c9212e3c3077b6` (Nix build marked dirty).
 - XDPH **1.5.0**, revision prefix `d1467fe`; xdg-desktop-portal **1.22.1**.
-- `hyprctl -i 0 monitors -j`: headless `Main`, 3440×1440 at 145 Hz,
-  XRGB8888, `colorManagementPreset: srgb`, backend `hdr: false`.
+- Initially, `hyprctl -i 0 monitors -j`: headless `Main`, 3440×1440 at 145 Hz,
+  XRGB8888, `colorManagementPreset: srgb`, EDID `hdr: false`.
 - The live registry offers wlr-screencopy v3, Hyprland toplevel-export v2,
   ext-output-image-capture-source v1, ext-image-copy-capture v1, workspace
   capture and color-manager v3. It does **not** offer wlr-export-dmabuf.
@@ -252,18 +254,35 @@ reading output color-management information, or attaching metadata cannot
 recover values mapped into the sRGB copy. Headless also rules out a physical
 KMS scanout capture workaround for `Main`.
 
-An **HDR virtual monitor is a viable source-side direction**, not ruled out by
-`hardwareDetails.hdr: false`. In this installed build, `CMonitor::supportsHDR`
-and `supportsWideColor` accept the monitor-rule overrides `supports_hdr = 1`
-and `supports_wide_color = 1`; `cm = "hdr"` constructs BT.2020/PQ output color,
-and `bitdepth = 10` requests ten-bit buffers. Aquamarine's headless backend can
-advertise RGB10 formats. These are source-audited capabilities, **not yet a
-runtime-verified HDR virtual output**. Actual allocation, advertised preferred
-surface color and HDR application behavior still need testing. A dedicated test
-output/session avoids changing `Main` or athena's settings. Physical-panel
-calibration values must not be fabricated as captured content metadata.
+### Runtime-verified virtual HDR output, still SDR capture
 
-That would solve the **source desktop** side, but not the sRGB **capture** copy.
+The user explicitly authorized configuring `Main` in `/etc/nixos`, applied that
+configuration and restarted the remote-desktop service. Configuration commit
+`2a57615` on `feature/zeus-headless-hdr` passes per-monitor color settings through
+the launcher, with `supports_hdr = 1`, `supports_wide_color = 1`, `cm = "hdr"`,
+`bitdepth = 10` and SDR mapping 0–160 for `Main` only. Other presets remain SDR;
+athena is unchanged.
+
+The user's output and an independent read-only check agree: `Main` has
+**XBGR2101010**, **hdr**, **3440×1440 at 145 Hz**, SDR minimum **0**, maximum
+**160**, brightness/saturation **1**, and direct scanout blocked. This verifies
+the selected ten-bit output format and active color preset, rather than just
+configuration-file intent. `hardwareDetails.hdr/chroma/bt2020` still report false: those fields
+read parsed EDID, which a headless output lacks, rather than the forced capability
+overrides. Preferred surface color, real HDR application behavior, captured
+highlight values and panel luminance still require separate validation.
+
+A fresh `test_capture_encode_pipeline` run from this branch against the restarted
+desktop passes but negotiates **BGRA8**, absent SPA range/matrix/transfer/primaries,
+and concrete NVIDIA DMA-BUF modifiers. It selects **sRGB → NV12/Main SDR**.
+The active older deployment on port 9002 independently logs BGRA8 capture and
+the NV12 GPU converter. `misc:screencopy_force_8b` currently reads true; that
+explains the eight-bit storage, but disabling it would not undo the sRGB export
+contract. It was left unchanged, and the active service was not interrupted by
+the test. No PQ labels or invented content mastering metadata were added.
+
+The **source desktop output** is now HDR-configured, but its **capture** copy is
+still SDR.
 The next capture implementation needs a compositor-side, opt-in color-described
 export contract and a matching consumer/portal bridge. It must render/export
 before irreversible SDR mapping, negotiate PQ/BT.2020 and >=10-bit storage for
@@ -284,8 +303,9 @@ References:
 
 ## Validation and packaging
 
-Hardware-tested on the actual machines, without changing either desktop's color
-configuration or replacing the deployed server:
+The original media-path hardware tests below did not change either desktop's
+color configuration or replace the deployed server. The subsequent user-applied
+virtual-output change and its capture regression are documented above:
 
 - **zeus:** Main10 VUI and static-SEI round trips; >8-bit gradients and colored
   RGB10/RGBA16 CPU/CUDA agreement; real RGB10 GBM DMA-BUF → RGBA16 → CUDA/P010
