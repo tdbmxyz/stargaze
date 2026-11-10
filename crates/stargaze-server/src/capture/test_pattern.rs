@@ -47,7 +47,7 @@ fn pattern(width: u32, height: u32) -> Vec<u8> {
 }
 
 pub(super) fn start(
-    config: CaptureConfig,
+    config: &CaptureConfig,
     framerate: u32,
 ) -> Result<
     (
@@ -68,24 +68,25 @@ pub(super) fn start(
             "HDR test pattern requires even dimensions >=2 and 1..1000 fps".into(),
         ));
     }
+    let (width, height) = (config.width, config.height);
     let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
     let (format_tx, format_rx) = oneshot::channel();
     let shutdown = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&shutdown);
     let thread_handle = std::thread::Builder::new().name("stargaze-hdr-pattern".into()).spawn(move || {
-        let pixels = pattern(config.width, config.height);
+        let pixels = pattern(width, height);
         let metadata = HdrMetadata {
             mastering: Some(MasteringDisplay { primaries: [[35400,14600],[8500,39850],[6550,2300]], white_point: [15635,16450],
                 min_luminance: 0, max_luminance: 100_000_000 }),
             content_light: Some(ContentLight { max_cll: 10000, max_fall: 10000 }),
         };
-        let _ = format_tx.send(CaptureFormat { resolution: Resolution { width: config.width, height: config.height }, color: ColorDescription::HDR10_RGB });
+        let _ = format_tx.send(CaptureFormat { resolution: Resolution { width, height }, color: ColorDescription::HDR10_RGB });
         tracing::info!(?metadata, "HDR10 diagnostic source: PQ absolute luminance bars, 10-bit gradient, BT.2020 primaries; NOT desktop capture");
         let period = std::time::Duration::from_secs_f64(1.0 / f64::from(framerate));
         let mut deadline = std::time::Instant::now();
         while !flag.load(Ordering::Relaxed) {
-            let mut frame = CapturedFrame::from(Frame::CpuMapped { data: pixels.clone(), width: config.width, height: config.height,
-                stride: config.width * 4, format: PixelFormat::Bgra10 });
+            let mut frame = CapturedFrame::from(Frame::CpuMapped { data: pixels.clone(), width, height,
+                stride: width * 4, format: PixelFormat::Bgra10 });
             frame.color = ColorDescription::HDR10_RGB;
             frame.hdr_metadata = metadata;
             if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(frame) { break; }

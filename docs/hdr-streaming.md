@@ -42,6 +42,67 @@ An HDR producer with HDR disabled is rejected before encoder creation, not
 truncated or relabeled as SDR. The existing Hyprland portal remains a genuinely
 SDR source with either setting.
 
+### Private Hyprland fork: direct color-managed desktop capture
+
+The private Hyprland v0.57.2 fork implements the default-off experimental
+`xx-image-capture-color-management-v1` extension. With that fork running on an
+**explicitly selected isolated socket**, select direct capture instead of the
+portal:
+
+```sh
+stargaze-server --wayland-output Main --port 9003 --framerate 60 --bitrate 80
+# Explicit precision-preserving CPU-memory diagnostic path:
+stargaze-server --wayland-output Main --wayland-shm --port 9003
+# Request genuine compositor-rendered sRGB instead of PQ:
+stargaze-server --wayland-output Main --use-hdr false --port 9003
+```
+
+This does not install/restart a compositor or enable its extension. The regular
+portal backend stays the default SDR path. Direct capture requires the fork's
+opt-in and the exact vendored experimental XML (wayland-protocols commit
+`aa62366fb800a0689f4e9de83811ff33f6a91f44`). An unsupported compositor, unknown
+output, failed allocation or permission denial stops capture; there is no silent
+portal/SDR fallback. `--wayland-output` conflicts with `--pipewire-node` and
+`--hdr-test-pattern`; `--wayland-shm` requires an output selector.
+
+A preferred BT.2020/PQ source description selects a **requested encoding**, not
+an assumed pixel interpretation. The backend creates an acknowledged parametric
+description and applies it to every frame before capture. It delivers only
+XBGR2101010 with that immutable color/geometry contract. Source loss, geometry
+or preferred-color changes stop the fixed-mode pipeline for a restart.
+`--use-hdr false` specifically requests sRGB from the compositor: unlike the
+strict PipeWire producer path, the compositor can render a genuine SDR export.
+HDR peers are still required for an HDR source; existing rejection rules apply.
+Static mastering/content-light metadata is not invented from output hints.
+
+The capture thread owns all Wayland/GBM wrappers. Every delivered DMA-BUF has
+independent storage and a transferred owned FD, valid even after capture stops.
+It is never reused while encoding. SHM is explicitly requested and copied into
+owned RGB10 memory. Capture pacing bounds request starts rather than adding a
+whole frame period after rendering. Per-frame allocation is correctness-first;
+there is no claim of sustained 3440×1440/145-fps performance yet.
+
+Fresh isolated RTX 3090 tests against the packaged fork pass: all 1,024 neutral
+and R/G/B SHM ramp values, real DMA-BUF → EGL/GL/CUDA → Main10, retained buffers
+encoded after capture shutdown, decoded PQ/BT.2020 and >8-bit gradients, SDR
+opt-out, full-channel shutdown, and unsupported-compositor rejection. The
+wrapped server Nix package builds and rejects an unknown output cleanly.
+Workspace fmt/check and all-target pedantic Clippy have no new capture/build
+diagnostics (existing warnings remain); nextest passes **286 tests, 32 skipped**.
+Logs: `/tmp/stargaze-wayland-final-quality.log`,
+`/tmp/stargaze-wayland-fresh-live.log`, and
+`/tmp/stargaze-wayland-unsupported.log`. The lab was stopped. This is reference
+fixture validation, not a deployed peer/display or sustained-throughput test.
+
+Reproduce using `/projects/Hyprland/debug-tools/hdr-capture/README.md`. Native
+fixtures contain bright highlights: use only their private headless lab, never
+the physical desktop. With its `lab.env` exported, run:
+
+```sh
+nix develop .#cuda -c cargo test -p stargaze-server wayland_native_rgb10_desktop -- --ignored
+nix develop .#cuda -c cargo test -p stargaze-server wayland_desktop_ -- --ignored --nocapture
+```
+
 ### Native HDR diagnostic stream
 
 This is an explicit HDR source, **not desktop capture**. It contains absolute-PQ
@@ -218,9 +279,9 @@ The deeper implementation audit establishes why: Hyprland 0.57's
 `ScreenshareFrame::beginCopy` and shared-memory copy explicitly assign
 `DEFAULT_SRGB_IMAGE_DESCRIPTION`; XDPH `build_format`/`fixate_format` does not
 forward SPA color fields. The wlr-screencopy protocol itself has no HDR color
-contract. This branch does not patch/restart Hyprland or falsely call that SDR
-copy native HDR capture. A future compositor/producer preserving HDR can use the
-strict node input; the native media/presentation pipeline is already implemented.
+contract. This historical audit describes the deployed portal, not the opt-in private
+fork/direct backend documented above. No test replaces or restarts the deployed
+Hyprland, and its SDR copy is never called native HDR capture.
 
 ### Installed-stack re-audit during the handoff
 
@@ -290,9 +351,10 @@ HDR, retain a genuine sRGB export for SDR/opt-out, and associate color/geometry
 changes with the correct buffers. A global change making legacy screenshares
 PQ is not acceptable. Build and test that stack in an isolated session before
 considering replacing zeus's compositor: restarting the current desktop would
-interrupt the deployment on port 9002. No compositor patch or HDR desktop
-capture implementation is included yet; this remains active work in
-`plans/hdr-safe-streaming.md`.
+interrupt the deployment on port 9002. That installed-stack audit preceded the private fork. The direct backend above
+now implements reference-validated HDR desktop capture only when the patched
+compositor and its extension are explicitly selected; it has not been deployed.
+Active integration work is tracked in `plans/wayland-hdr-capture.md`.
 
 References:
 
@@ -326,8 +388,10 @@ SDR Hyprland portal, or a guarantee of 3440×1440/145-fps sustained HDR throughp
 Visual/reference-meter calibration and a live HDR desktop producer remain
 separate validation tasks. Do not mistake an SDR sharing copy for HDR content.
 
-Builds now require libwayland-client, wayland-scanner and wayland-protocols with
-color-management-v1 (>=1.41). Nix supplies them for dev shells/packages.
+Builds require libwayland-client and wayland-scanner. The server additionally
+requires GBM, libdrm, and wayland-protocols >=1.49 (including color-management-v1
+references and image-copy capture); the client requires color-management-v1
+(>=1.41). Nix supplies these dependencies for dev shells/packages.
 `mkStargazeClient` explicitly includes wayland-protocols in its actual
 `buildInputs` (for both normal and portable clients): that derivation replaces
 the shared inputs, and placing it only in native inputs did not expose
@@ -337,7 +401,8 @@ loader/driver paths remain pinned together for the client. NVRTC stays pinned to
 CUDA 13.2: floating CUDA 13.4 produced PTX the deployed driver could not load,
 which otherwise silently forced CPU conversion.
 
-Current handoff validation on zeus: formatting and workspace check pass;
+Earlier media-path handoff validation on zeus (before the direct backend):
+formatting and workspace check pass;
 all-target pedantic Clippy has no new diagnostic categories/files against
 `b7904f6` (pre-existing warnings remain); workspace nextest passes **282 tests,
 28 skipped**. NVIDIA Main10/static-metadata round trip, CPU/GPU HDR conversion,

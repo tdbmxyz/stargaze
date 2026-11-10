@@ -151,8 +151,16 @@ struct Cli {
     strict_capture_color: bool,
 
     /// Capture a color-described producer on the user `PipeWire` instance, bypassing the SDR portal copy.
-    #[arg(long, conflicts_with = "hdr_test_pattern")]
+    #[arg(long, conflicts_with_all = ["hdr_test_pattern", "wayland_output"])]
     pipewire_node: Option<u32>,
+
+    /// Capture this named output directly via opt-in Wayland image-copy color management.
+    #[arg(long, conflicts_with = "hdr_test_pattern")]
+    wayland_output: Option<String>,
+
+    /// Use precision-preserving RGB10 SHM instead of DMA-BUF for direct Wayland capture.
+    #[arg(long, requires = "wayland_output")]
+    wayland_shm: bool,
 
     /// Stream native HDR10 reference bars/gradient instead of the desktop (diagnostics).
     #[arg(long, conflicts_with = "hdr_metadata")]
@@ -297,6 +305,10 @@ async fn main() -> anyhow::Result<()> {
         show_cursor: cfg.cursor.show_cursor,
         require_color_metadata: cli.strict_capture_color,
         node_id: cli.pipewire_node,
+        wayland_output: cli.wayland_output.clone(),
+        wayland_shm: cli.wayland_shm,
+        wayland_sdr: !cfg.use_hdr,
+        wayland_framerate: cfg.framerate,
         hdr_test_pattern: cli.hdr_test_pattern.then_some(cfg.framerate),
         hdr_metadata: if let Some(path) = &cli.hdr_metadata {
             let metadata =
@@ -308,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
         },
     };
     let (capture_session, frames, resolution_rx) = capture::start_capture(capture_config).await?;
-    info!("Capture started, waiting for PipeWire format negotiation...");
+    info!("Capture started, waiting for source format negotiation...");
 
     // Wait for PipeWire to negotiate the actual capture resolution.
     // This may differ from the configured resolution (e.g. 3440x1440 on an
@@ -471,6 +483,28 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_wayland_cli_is_explicit_and_exclusive() {
+        let default = Cli::try_parse_from(["stargaze-server"]).unwrap();
+        assert!(default.wayland_output.is_none());
+        assert!(!default.wayland_shm);
+        assert!(Cli::try_parse_from(["stargaze-server", "--wayland-shm"]).is_err());
+        for other in [vec!["--pipewire-node", "1"], vec!["--hdr-test-pattern"]] {
+            let mut args = vec!["stargaze-server", "--wayland-output", "Main"];
+            args.extend(other);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let direct = Cli::try_parse_from([
+            "stargaze-server",
+            "--wayland-output",
+            "Main",
+            "--wayland-shm",
+        ])
+        .unwrap();
+        assert_eq!(direct.wayland_output.as_deref(), Some("Main"));
+        assert!(direct.wayland_shm);
+    }
 
     #[test]
     fn hdr_cli_opt_out_requires_an_explicit_boolean() {
