@@ -34,18 +34,29 @@
   retained-buffer lifetime past shutdown, actual NVENC Main10 software decode,
   explicit SDR, full-channel shutdown, and unsupported-compositor rejection.
 - Workspace fmt/check and all-target pedantic Clippy have no new capture/build
-  diagnostics; nextest passes 286 tests with 32 hardware-dependent skips.
+  diagnostics; nextest passes 287 tests with 34 hardware-dependent skips.
+- Exact local Git packages build: Hyprland compositor `b9df23ef7`, server `42036cd`.
+  Commits are unsigned by user approval, pending rebase/signing.
+- Two-minute 3440×1440 DMA-BUF capture → Main10: 144.99 fps, stable FDs, <1 MiB
+  RSS growth. Phase-anchored pacing removes wake-up drift; no catch-up bursts.
+  SHM is correct but only 51.49 fps at that resolution.
+- FP16 Vulkan mpv photographic playback plus an independent SDR window: exact
+  raw composition/SHM-DMA agreement; ~59 dB YUV Main10 comparison; minute-long
+  dynamic 3440×1440 capture/encode at 144.67 fps. Its application content is
+  25 fps and the demo labels its HDR/SDR variants synthetic, not native-camera
+  HDR. Resize/color/removal terminate capture; SDR window movement is validated.
 - Evidence and reproduction: `docs/hdr-streaming.md` and the Hyprland lab README.
   All labs are stopped; no deployed service or system configuration was changed.
 
 ## Remaining work
 
-- Real HDR video/game sources and mixed windows; source movement, color/device
-  transitions, and long-running direct-capture shutdown/lifetime stress.
-- Sustained target-rate capture-to-encode-to-network/display measurement and AMD
-  client presentation. The reference fixture is not production validation.
-- Preserve tested immutable pins and rebuild them before any separately
-  user-approved deployment. Do not reuse DMA-BUF storage without a lease contract.
+- Native-camera HDR/game content, device migration, and hours-long capture
+  shutdown/lifetime stress. Minute-scale fixtures/application playback are not
+  production validation.
+- Target-rate transport/loss/reconnect testing and AMD client presentation.
+- Rebase/sign the authorized unsigned commits and rebuild final exact pins
+  before any separately approved deployment. Do not reuse DMA-BUF storage
+  without a lease contract.
 
 ## Tests
 

@@ -79,8 +79,9 @@ The capture thread owns all Wayland/GBM wrappers. Every delivered DMA-BUF has
 independent storage and a transferred owned FD, valid even after capture stops.
 It is never reused while encoding. SHM is explicitly requested and copied into
 owned RGB10 memory. Capture pacing bounds request starts rather than adding a
-whole frame period after rendering. Per-frame allocation is correctness-first;
-there is no claim of sustained 3440×1440/145-fps performance yet.
+whole frame period after rendering. Per-frame allocation is correctness-first; storage is not pooled or reused.
+The isolated capture-to-encode measurements below are not end-to-end transport
+or client-display results.
 
 Fresh isolated RTX 3090 tests against the packaged fork pass: all 1,024 neutral
 and R/G/B SHM ramp values, real DMA-BUF → EGL/GL/CUDA → Main10, retained buffers
@@ -88,7 +89,7 @@ encoded after capture shutdown, decoded PQ/BT.2020 and >8-bit gradients, SDR
 opt-out, full-channel shutdown, and unsupported-compositor rejection. The
 wrapped server Nix package builds and rejects an unknown output cleanly.
 Workspace fmt/check and all-target pedantic Clippy have no new capture/build
-diagnostics (existing warnings remain); nextest passes **286 tests, 32 skipped**.
+diagnostics (existing warnings remain); nextest passes **287 tests, 34 skipped**.
 Logs: `/tmp/stargaze-wayland-final-quality.log`,
 `/tmp/stargaze-wayland-fresh-live.log`, and
 `/tmp/stargaze-wayland-unsupported.log`. The lab was stopped. This is reference
@@ -102,6 +103,62 @@ the physical desktop. With its `lab.env` exported, run:
 nix develop .#cuda -c cargo test -p stargaze-server wayland_native_rgb10_desktop -- --ignored
 nix develop .#cuda -c cargo test -p stargaze-server wayland_desktop_ -- --ignored --nocapture
 ```
+
+#### Sustained validation and non-visual comparisons
+
+Unsigned local commits are authorized pending later rebasing/signing. Compositor
+`b9df23ef7` and server `42036cd` build as exact local Git pins. The revised SDR
+fixture/comparison helpers are at Hyprland `927759f52`, compiled locally; the
+compositor rendering code is unchanged by that helper commit.
+
+At 3440×1440, two-minute native RGB10 capture → independent DMA-BUF → NVENC
+Main10 delivered **144.99 fps** (17,399 frames), stable 76 FDs, and 688 KiB RSS
+growth. Anchoring deadlines to scheduled phase instead of actual wake-up time
+removed accumulated jitter (previously 143.88 fps). Missed slots are discarded
+without catch-up bursts. SHM remained correct but delivered only **51.49 fps**
+for a minute. The native decoded frame's full-raster PSNR against the RGB10 →
+BT.2020-NCL reference was 76.64/83.13/86.92 dB Y/U/V.
+
+A 4K/25-fps photographic AV1 PQ demo in **Vulkan mpv** selected an FP16
+pass-through swapchain and a ready BT.2020/PQ Wayland description. This avoids
+the earlier OpenGL eight-bit source limitation. Its mixed 1080p HDR image plus
+an independent sRGB white/gray window matched raw SHM/real DMA-BUF exactly;
+background and 160-nit SDR mapping matched every pixel. Main10 software decode
+measured **59.14/59.55/59.84 dB Y/U/V PSNR**, p99 error three ten-bit codes, with
+identical raw captures before/after encoding. Tone-mapped reference/decoded PNGs
+were also inspected. The demo labels its authored variants Synthetic_SDR and
+Synthetic_HDR: do not call it native-camera HDR or game validation.
+
+Playing that application at 3440×1440 delivered **144.67 capture/encode fps for
+60 seconds**, stable FDs, and approximately 10 MiB RSS growth, even with a Nix
+server build sharing the CPU. The underlying application is 25 fps, not 145
+unique frames. The native paced measurement had no competing build. Source
+resize, HDR→SDR output change and removal stop capture cleanly; moving an SDR
+window to a private SDR output and back restores the expected scene exactly.
+
+The ignored `wayland_capture_encode_endurance` test accepts
+`STARGAZE_TEST_SECONDS` (5–600, default 60), `STARGAZE_TEST_FPS` (default 145),
+`STARGAZE_TEST_SHM=1`, and `STARGAZE_TEST_NATIVE=0` for arbitrary content.
+`STARGAZE_TEST_REPORT` selects JSON output, with final `.hevc`/`.yuv` artifacts.
+It preserves production's infinite GOP, requesting only one recovery IDR near
+the end and retaining that short suffix for offline software validation. An
+initial harness that retained the whole infinite GOP falsely grew RSS; bounded
+retention fixes the test without changing production GOP policy.
+
+`wayland_capture_source_changes` mutates only a validated private lab; run it
+alone. Both tests require the lab marker, private runtime/socket, and matching
+IPC lock. No physical display, deployment, audio capture, or service restart is
+involved. Host packet timing is not complete scene-render/encoder/network/display
+latency. Minute-scale stability is not an hours-long soak test.
+
+Reproduction and durable numerical record:
+`/projects/Hyprland/debug-tools/hdr-capture/README.md` and
+`debug-tools/hdr-capture/validation/2026-11-10.json` in that repository. Temporary
+images: `/tmp/hh.AKRpkT/vulkan-reference-sdr.png` and `vulkan-encode-sdr.png`.
+Both continuation labs are stopped. Remaining gates are native-camera/game
+content, device migration, long soaks, transport/loss/reconnects, and AMD client
+presentation. Final deployment pins must be rebuilt after rebasing/signing;
+deployment still requires separate approval.
 
 ### Native HDR diagnostic stream
 
