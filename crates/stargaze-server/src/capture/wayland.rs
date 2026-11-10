@@ -257,7 +257,6 @@ fn run(
     };
     let period = Duration::from_secs_f64(1.0 / f64::from(rate));
     let mut deadline = Instant::now();
-    let mut request_started = None;
     let mut first = true;
     while !shutdown.load(Ordering::Relaxed) {
         while Instant::now() < deadline && !shutdown.load(Ordering::Relaxed) {
@@ -270,7 +269,6 @@ fn run(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        let requested_at = *request_started.get_or_insert_with(Instant::now);
         let Some(frame) = capture.next(format, config.hdr_metadata)? else {
             continue;
         };
@@ -282,17 +280,31 @@ fn run(
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
             Err(mpsc::error::TrySendError::Closed(_)) => break,
         }
-        request_started = None;
-        // Pace request starts, not completion plus a period. Rendering time
-        // must not unnecessarily lower a 60-fps request to 30-fps delivery.
-        deadline = requested_at + period;
+        // Keep the scheduled phase: using the actual wake-up time each frame
+        // accumulates sleep/dispatch jitter and undershoots the requested rate.
+        // On overrun discard missed slots rather than burst to catch up.
+        deadline = next_deadline(deadline, Instant::now(), period);
     }
     Ok(())
+}
+
+fn next_deadline(scheduled: Instant, completed: Instant, period: Duration) -> Instant {
+    (scheduled + period).max(completed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pacing_preserves_phase_without_catch_up_bursts() {
+        let start = Instant::now();
+        let period = Duration::from_millis(10);
+        let jittered = start + Duration::from_millis(3);
+        assert_eq!(next_deadline(start, jittered, period), start + period);
+        let late = start + Duration::from_millis(30);
+        assert_eq!(next_deadline(start, late, period), late);
+    }
 
     #[test]
     fn invalid_configuration_fails_before_connecting() {
