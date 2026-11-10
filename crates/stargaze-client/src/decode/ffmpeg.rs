@@ -85,6 +85,11 @@ pub struct DmaBufFrame {
 unsafe impl Send for DmaBufFrame {}
 
 impl DmaBufFrame {
+    /// Actual HDR static metadata retained on the exported frame.
+    #[must_use]
+    pub fn hdr_metadata(&self) -> stargaze_core::hdr::HdrMetadata {
+        unsafe { stargaze_core::hdr::HdrMetadata::from_avframe(self.frame.as_ptr()) }
+    }
     /// The DRM PRIME descriptor (objects, layers, planes) of this frame.
     ///
     /// Valid for as long as `self` is alive.
@@ -496,7 +501,12 @@ pub(crate) fn run_extract_loop(
         let frame = &raw.frame;
         let (width, height, format) = (frame.width(), frame.height(), frame.format());
 
-        let mut output = if format == ffmpeg_next::format::Pixel::NV12 {
+        let mut output = if matches!(
+            format,
+            ffmpeg_next::format::Pixel::P010LE | ffmpeg_next::format::Pixel::YUV420P10LE
+        ) {
+            extract_p010(frame, width, height)
+        } else if format == ffmpeg_next::format::Pixel::NV12 {
             extract_nv12(frame, width, height)
         } else if format == ffmpeg_next::format::Pixel::YUV420P {
             extract_yuv420p(frame, width, height)
@@ -540,6 +550,10 @@ fn map_to_drm_prime(src: &ffmpeg_next::frame::Video) -> Result<ffmpeg_next::fram
         if ret < 0 {
             return Err(format!("av_hwframe_map to DRM_PRIME failed (error {ret})"));
         }
+    }
+    let ret = unsafe { ffmpeg_sys_next::av_frame_copy_props(mapped.as_mut_ptr(), src.as_ptr()) };
+    if ret < 0 {
+        return Err(format!("copy DRM frame color/metadata: {ret}"));
     }
     Ok(mapped)
 }
@@ -707,6 +721,7 @@ fn extract_yuv420p(frame: &ffmpeg_next::frame::Video, width: u32, height: u32) -
 
     DecodedFrame {
         pixels: stargaze_core::decode::FramePixels::I420 { y, u, v },
+        hdr_metadata: stargaze_core::hdr::HdrMetadata::default(),
         width,
         height,
         pts: frame.pts().map_or(0, i64::cast_unsigned),
@@ -727,8 +742,43 @@ fn extract_nv12(frame: &ffmpeg_next::frame::Video, width: u32, height: u32) -> D
 
     DecodedFrame {
         pixels: stargaze_core::decode::FramePixels::Nv12 { y, uv },
+        hdr_metadata: stargaze_core::hdr::HdrMetadata::default(),
         width,
         height,
+        pts: frame.pts().map_or(0, i64::cast_unsigned),
+        stats: FrameStats::default(),
+    }
+}
+
+/// Keep P010 as-is, or repack planar Main10 words without reducing precision.
+fn extract_p010(frame: &ffmpeg_next::frame::Video, width: u32, height: u32) -> DecodedFrame {
+    let (w, h) = (width as usize, height as usize);
+    let mut y = copy_plane(frame.data(0), frame.stride(0), w * 2, h);
+    let uv = if frame.format() == ffmpeg_next::format::Pixel::P010LE {
+        copy_plane(frame.data(1), frame.stride(1), w * 2, h / 2)
+    } else {
+        for word in y.as_chunks_mut::<2>().0 {
+            *word = (u16::from_le_bytes(*word) << 6).to_le_bytes();
+        }
+        let mut uv = vec![0; w * h];
+        for row in 0..h / 2 {
+            for x in 0..w / 2 {
+                for (plane, offset) in [(1, 0), (2, 2)] {
+                    let at = row * frame.stride(plane) + x * 2;
+                    let value =
+                        u16::from_le_bytes([frame.data(plane)[at], frame.data(plane)[at + 1]]) << 6;
+                    let dst = row * w * 2 + x * 4 + offset;
+                    uv[dst..dst + 2].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        uv
+    };
+    DecodedFrame {
+        pixels: stargaze_core::decode::FramePixels::P010 { y, uv },
+        width,
+        height,
+        hdr_metadata: unsafe { stargaze_core::hdr::HdrMetadata::from_avframe(frame.as_ptr()) },
         pts: frame.pts().map_or(0, i64::cast_unsigned),
         stats: FrameStats::default(),
     }
@@ -770,8 +820,27 @@ fn validate_negotiated_color(
     frame: &ffmpeg_next::frame::Video,
     expected: stargaze_core::color::ColorDescription,
 ) -> Result<(), DecodeError> {
-    validate_decoded_color(frame)?;
     let raw = unsafe { &*frame.as_ptr() };
+    if expected.is_hdr10() {
+        validate_hdr_metadata(frame)?;
+        let format = decoded_sw_format(frame);
+        let valid = matches!(
+            format,
+            ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_P010LE
+                | ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_YUV420P10LE
+        ) && raw.color_range == ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_MPEG
+            && raw.colorspace == ffmpeg_sys_next::AVColorSpace::AVCOL_SPC_BT2020_NCL
+            && raw.color_primaries == ffmpeg_sys_next::AVColorPrimaries::AVCOL_PRI_BT2020
+            && raw.color_trc == ffmpeg_sys_next::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;
+        return if valid {
+            Ok(())
+        } else {
+            Err(DecodeError::FfmpegError(format!(
+                "decoded HDR precision/color differs from negotiated HDR10: {format:?}"
+            )))
+        };
+    }
+    validate_decoded_color(frame)?;
     if expected != stargaze_core::color::ColorDescription::LEGACY_SDR
         && (expected != stargaze_core::color::ColorDescription::SDR_STREAM
             || raw.color_range != ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_MPEG
@@ -785,6 +854,47 @@ fn validate_negotiated_color(
         )));
     }
     Ok(())
+}
+
+fn validate_hdr_metadata(frame: &ffmpeg_next::frame::Video) -> Result<(), DecodeError> {
+    let metadata = unsafe { stargaze_core::hdr::HdrMetadata::from_avframe(frame.as_ptr()) };
+    metadata
+        .validate()
+        .map_err(|e| DecodeError::FfmpegError(e.into()))?;
+    for (kind, missing) in [
+        (
+            ffmpeg_sys_next::AVFrameSideDataType::AV_FRAME_DATA_MASTERING_DISPLAY_METADATA,
+            metadata.mastering.is_none(),
+        ),
+        (
+            ffmpeg_sys_next::AVFrameSideDataType::AV_FRAME_DATA_CONTENT_LIGHT_LEVEL,
+            metadata.content_light.is_none(),
+        ),
+    ] {
+        if missing
+            && !unsafe { ffmpeg_sys_next::av_frame_get_side_data(frame.as_ptr(), kind) }.is_null()
+        {
+            return Err(DecodeError::FfmpegError(
+                "incomplete/invalid HDR static metadata; refusing unsafe presentation".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_ptr_alignment)] // FFmpeg's hardware frame allocation is aligned.
+fn decoded_sw_format(frame: &ffmpeg_next::frame::Video) -> ffmpeg_sys_next::AVPixelFormat {
+    let raw = unsafe { &*frame.as_ptr() };
+    if frame.format() == ffmpeg_next::format::Pixel::VAAPI && !raw.hw_frames_ctx.is_null() {
+        unsafe {
+            (*(*raw.hw_frames_ctx)
+                .data
+                .cast::<ffmpeg_sys_next::AVHWFramesContext>())
+            .sw_format
+        }
+    } else {
+        frame.format().into()
+    }
 }
 
 /// Check the original `AVFrame`, since hardware transfer need not copy metadata.
@@ -843,10 +953,117 @@ fn validate_decoded_color(frame: &ffmpeg_next::frame::Video) -> Result<(), Decod
     Ok(())
 }
 
+/// Shared hardware fixture helper for actual decode→presentation tests.
+#[cfg(test)]
+pub(crate) fn decode_hdr_fixture(data: &[u8], dma_buf: bool) -> VideoFrame {
+    let config = DecoderConfig {
+        width: 2048,
+        height: 256,
+        codec: Codec::H265,
+        color: stargaze_core::color::ColorDescription::HDR10,
+    };
+    let mut decoder = init_decoder(&config).unwrap();
+    assert!(decoder.hw_accel, "test must use real VAAPI Main10 decoding");
+    decoder
+        .decoder
+        .send_packet(&ffmpeg_next::Packet::copy(data))
+        .unwrap();
+    decoder.decoder.send_eof().unwrap();
+    let mut picture = ffmpeg_next::frame::Video::empty();
+    decoder.decoder.receive_frame(&mut picture).unwrap();
+    check_session_color(&mut decoder, &picture).unwrap();
+    if dma_buf {
+        VideoFrame::DmaBuf(DmaBufFrame {
+            width: picture.width(),
+            height: picture.height(),
+            pts: 0,
+            stats: FrameStats::default(),
+            frame: map_to_drm_prime(&picture).unwrap(),
+        })
+    } else {
+        let mut cpu = ffmpeg_next::frame::Video::empty();
+        assert_eq!(
+            unsafe {
+                ffmpeg_sys_next::av_hwframe_transfer_data(cpu.as_mut_ptr(), picture.as_ptr(), 0)
+            },
+            0
+        );
+        assert_eq!(cpu.format(), ffmpeg_next::format::Pixel::P010LE);
+        assert_eq!(
+            unsafe { ffmpeg_sys_next::av_frame_copy_props(cpu.as_mut_ptr(), picture.as_ptr()) },
+            0
+        );
+        VideoFrame::Cpu(extract_p010(&cpu, picture.width(), picture.height()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use stargaze_core::config::Codec;
+
+    #[test]
+    fn native_hdr_contract_requires_ten_bit_pq_2020_and_limited_range() {
+        use stargaze_core::color::ColorDescription;
+        let mut frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::P010LE, 16, 16);
+        unsafe {
+            let raw = &mut *frame.as_mut_ptr();
+            raw.color_range = ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_MPEG;
+            raw.colorspace = ffmpeg_sys_next::AVColorSpace::AVCOL_SPC_BT2020_NCL;
+            raw.color_primaries = ffmpeg_sys_next::AVColorPrimaries::AVCOL_PRI_BT2020;
+            raw.color_trc = ffmpeg_sys_next::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;
+        }
+        validate_negotiated_color(&frame, ColorDescription::HDR10).unwrap();
+        assert!(validate_negotiated_color(&frame, ColorDescription::SDR_STREAM).is_err());
+        unsafe {
+            (*frame.as_mut_ptr()).color_range = ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_JPEG;
+        }
+        assert!(validate_negotiated_color(&frame, ColorDescription::HDR10).is_err());
+        unsafe {
+            (*frame.as_mut_ptr()).color_range = ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_MPEG;
+            (*frame.as_mut_ptr()).color_trc =
+                ffmpeg_sys_next::AVColorTransferCharacteristic::AVCOL_TRC_ARIB_STD_B67;
+        }
+        assert!(validate_negotiated_color(&frame, ColorDescription::HDR10).is_err());
+        unsafe {
+            (*frame.as_mut_ptr()).color_trc =
+                ffmpeg_sys_next::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;
+        }
+        validate_negotiated_color(&frame, ColorDescription::HDR10).unwrap();
+    }
+
+    #[test]
+    fn software_main10_repacking_preserves_black_white_and_highlights() {
+        use stargaze_core::decode::FramePixels;
+        let mut frame =
+            ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P10LE, 16, 4);
+        let codes = [64_u16, 509, 573, 723, 940, 1023, 0, 512];
+        for row in 0..4 {
+            for x in 0..16 {
+                let at = row * frame.stride(0) + x * 2;
+                frame.data_mut(0)[at..at + 2]
+                    .copy_from_slice(&codes[x % codes.len()].to_le_bytes());
+            }
+        }
+        for plane in [1, 2] {
+            for word in frame.data_mut(plane).as_chunks_mut::<2>().0 {
+                *word = 512_u16.to_le_bytes();
+            }
+        }
+        let output = extract_p010(&frame, 16, 4);
+        let FramePixels::P010 { y, uv } = output.pixels else {
+            panic!("P010 output required");
+        };
+        for (x, word) in y.as_chunks::<2>().0.iter().enumerate() {
+            assert_eq!(u16::from_le_bytes(*word), codes[x % codes.len()] << 6);
+        }
+        assert!(
+            uv.as_chunks::<2>()
+                .0
+                .iter()
+                .all(|word| u16::from_le_bytes(*word) == 512 << 6)
+        );
+    }
 
     #[test]
     fn decoded_color_guard_rejects_unsafe_modes_before_export_or_transfer() {
@@ -1054,7 +1271,7 @@ mod tests {
                     assert_eq!(pair, [0xAA, 0x55], "UV must stay interleaved");
                 }
             }
-            FramePixels::I420 { .. } => panic!("expected NV12 pixels"),
+            _ => panic!("expected NV12 pixels"),
         }
         assert_eq!(out.pts, 42);
     }
@@ -1080,7 +1297,7 @@ mod tests {
                 assert!(u.iter().all(|&b| b == 2));
                 assert!(v.iter().all(|&b| b == 3));
             }
-            FramePixels::Nv12 { .. } => panic!("expected I420 pixels"),
+            _ => panic!("expected I420 pixels"),
         }
     }
 

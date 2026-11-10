@@ -63,7 +63,15 @@ pub(crate) async fn perform_handshake(
         codec: request.codec,
         bitrate_mbps: request.bitrate_mbps,
     };
-    let req_bytes = serialize_color_request(&req_msg, ColorCapabilities::SDR_ONLY)?;
+    let hdr10 = tokio::task::spawn_blocking(crate::render::wayland_hdr::supported)
+        .await
+        .unwrap_or(false);
+    let color_caps = ColorCapabilities { sdr: true, hdr10 };
+    info!(
+        ?color_caps,
+        "Presentation capabilities (native Wayland PQ/BT.2020; actual 10-bit EGL and decode creation must also succeed)"
+    );
+    let req_bytes = serialize_color_request(&req_msg, color_caps)?;
     send_stream
         .write_all(&req_bytes)
         .await
@@ -90,12 +98,16 @@ pub(crate) async fn perform_handshake(
         .map_err(|e| TransportError::SessionError(format!("read response body: {e}")))?;
 
     let (response, color) = deserialize_color_response(&body)?;
-    ColorCapabilities::SDR_ONLY
+    color_caps
         .validate(color)
         .map_err(|reason| TransportError::SessionError(reason.into()))?;
     info!(
         ?color,
-        presentation = "SDR sRGB surface (compositor maps to output)",
+        presentation = if color.is_hdr10() {
+            "10-bit PQ/BT.2020 Wayland surface"
+        } else {
+            "SDR sRGB surface (compositor maps to output)"
+        },
         legacy = color == ColorDescription::LEGACY_SDR,
         "Session color mode; desktop HDR state does not select stream HDR"
     );

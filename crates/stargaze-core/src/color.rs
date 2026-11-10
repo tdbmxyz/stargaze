@@ -19,6 +19,12 @@ pub struct ColorDescription {
     pub bit_depth: u8,
 }
 
+impl Default for ColorDescription {
+    fn default() -> Self {
+        Self::SDR_STREAM
+    }
+}
+
 impl ColorDescription {
     /// Full-range sRGB desktop pixels, with BT.709/sRGB primaries.
     pub const SRGB: Self = Self {
@@ -54,10 +60,45 @@ impl ColorDescription {
         bit_depth: 10,
     };
 
-    /// Whether the current SDR renderer can present this stream unchanged.
+    /// Full-range BT.2020/PQ RGB source, with 10-bit component precision.
+    pub const HDR10_RGB: Self = Self {
+        matrix: 0,
+        full_range: true,
+        ..Self::HDR10
+    };
+
+    /// Whether this is the supported native HDR10 stream description.
+    #[must_use]
+    pub fn is_hdr10(self) -> bool {
+        self == Self::HDR10
+    }
+
+    /// Select the stream matching source color, without tone or gamut mapping.
+    #[must_use]
+    pub fn stream(self) -> Option<Self> {
+        if self.is_supported_hdr_rgb() {
+            Some(Self::HDR10)
+        } else if self.is_supported_rgb() {
+            Some(Self::SDR_STREAM)
+        } else {
+            None
+        }
+    }
+
+    /// Whether source RGB is full-range BT.2020/PQ at adequate precision.
+    #[must_use]
+    pub fn is_supported_hdr_rgb(self) -> bool {
+        Self {
+            bit_depth: 10,
+            ..self
+        } == Self::HDR10_RGB
+            && matches!(self.bit_depth, 10 | 16)
+    }
+
+    /// Whether the implemented renderers support this stream description.
     #[must_use]
     pub fn is_supported_stream(self) -> bool {
-        self == Self::SDR_STREAM || self == Self::LEGACY_SDR
+        self == Self::SDR_STREAM || self == Self::LEGACY_SDR || self == Self::HDR10
     }
 
     /// Whether source RGB can use the SDR converters without tone/gamut mapping.
@@ -81,10 +122,16 @@ pub struct ColorCapabilities {
 }
 
 impl ColorCapabilities {
-    /// SDL2/OpenGL and SDL canvas currently expose only SDR presentation.
+    /// Capabilities for legacy peers and unmanaged/SDR-only presentation.
     pub const SDR_ONLY: Self = Self {
         sdr: true,
         hdr10: false,
+    };
+
+    /// Native Wayland HDR presentation plus SDR support.
+    pub const HDR10_AND_SDR: Self = Self {
+        sdr: true,
+        hdr10: true,
     };
 
     /// Validate a selected mode; never silently relabel HDR as SDR.
@@ -93,9 +140,16 @@ impl ColorCapabilities {
     /// Returns a diagnostic if the complete implemented pipeline cannot present it.
     pub fn validate(self, color: ColorDescription) -> Result<(), &'static str> {
         if !color.is_supported_stream() {
-            return Err(
-                "unsupported stream color: native HDR10 presentation and HDR-to-SDR tone/gamut mapping are not implemented",
-            );
+            return Err("unsupported stream color; no implicit tone/gamut mapping");
+        }
+        if color.is_hdr10() {
+            return if self.hdr10 {
+                Ok(())
+            } else {
+                Err(
+                    "HDR10 source requires a Main10 decoder and color-managed 10-bit Wayland presentation; peer is SDR-only",
+                )
+            };
         }
         if !self.sdr {
             return Err("peer does not support the server's SDR stream");
@@ -131,7 +185,7 @@ mod tests {
         for hdr10 in [false, true] {
             let caps = ColorCapabilities { sdr: true, hdr10 };
             assert!(caps.validate(ColorDescription::SDR_STREAM).is_ok());
-            assert!(caps.validate(ColorDescription::HDR10).is_err());
+            assert_eq!(caps.validate(ColorDescription::HDR10).is_ok(), hdr10);
         }
     }
 

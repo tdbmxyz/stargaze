@@ -315,11 +315,16 @@ impl StatsRecorder {
         let _ = writeln!(out, "stream color:      {:?}", meta.color);
         let _ = writeln!(
             out,
-            "presentation:      SDR sRGB/default surface; compositor output mapping"
+            "presentation:      {}",
+            if meta.color.is_hdr10() {
+                "10-bit BT.2020/PQ Wayland surface (native HDR10)"
+            } else {
+                "SDR sRGB/default surface; compositor output mapping"
+            }
         );
         let _ = writeln!(
             out,
-            "HDR fallback:      reject (no native HDR surface or tone/gamut mapper)"
+            "HDR fallback:      reject unsupported mode (no application tone/gamut mapper)"
         );
         let _ = writeln!(
             out,

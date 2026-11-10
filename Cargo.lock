@@ -1974,6 +1974,7 @@ version = "1.5.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "cc",
  "clap",
  "evdev",
  "ffmpeg-next",
@@ -1984,6 +1985,7 @@ dependencies = [
  "khronos-egl",
  "libc",
  "opus",
+ "pkg-config",
  "quinn",
  "rcgen",
  "rustls",

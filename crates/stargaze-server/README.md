@@ -40,12 +40,18 @@ stargaze-server --resolution 2560x1440 --framerate 120 --bitrate 40
 stargaze-server --config /path/to/server.toml
 ```
 
-Capture must have a supported color description. Hyprland's audited portal omits
-it: for a **known SDR** 8-bit RGB source, add `--allow-untagged-sdr` to explicitly
-assert the historical full-range sRGB interpretation. Otherwise missing metadata
-fails closed. This flag cannot detect unannounced source HDR transitions and
-never permits explicit HDR or untagged 10-bit. See the [color/HDR audit](../../docs/hdr-streaming.md).
-The client desktop may stay HDR with its calibration unchanged.
+Hyprland/XDPH's audited sRGB sharing copy works by default, including on a
+permanently HDR client. Actual HDR10 sources select Main10/P010 automatically:
+use `--pipewire-node NODE_ID` for a color-described full-range BT.2020/PQ RGB10
+producer, or `--hdr-test-pattern` for diagnostic luminance bars/gradients.
+`--hdr-metadata source.toml` adds authoritative source mastering/light metadata;
+it never forces HDR on an SDR source. `--strict-capture-color` opts out of the
+known Hyprland sRGB-copy contract. `--use-hdr false` (or `use_hdr = false` in
+`server.toml`) rejects HDR-only sources rather than tone mapping or relabeling
+them. It leaves genuine SDR capture and compositor settings unchanged.
+There is no implicit HDR→SDR tone mapper; real HDR desktop export still requires
+compositor-side work, not another flag on the existing sRGB portal.
+See [HDR usage and hardware evidence](../../docs/hdr-streaming.md).
 
 Configuration file: `~/.config/stargaze/server.toml` (CLI flags override file values; see the [root README](../../README.md#usage) for the format).
 

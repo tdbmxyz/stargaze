@@ -135,12 +135,33 @@ struct Cli {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, verbatim_doc_comment)]
     show_cursor: bool,
 
-    /// Assert that untagged 8-bit RGB capture is full-range sRGB/SDR.
-    /// Needed by legacy portals that omit color metadata. Use only with a
-    /// known SDR source; this cannot detect unannounced SDR/HDR transitions.
-    /// Untagged 10-bit and explicit HDR are always rejected.
-    #[arg(long)]
+    /// Permit native HDR for an HDR source [default: true].
+    /// False rejects HDR unless capture supplies a genuinely SDR source; it does
+    /// not tone map, relabel PQ, or change desktop HDR settings.
+    #[arg(long, action = clap::ArgAction::Set)]
+    use_hdr: Option<bool>,
+
+    /// Compatibility alias: Hyprland/XDPH sRGB capture is accepted by default.
+    #[arg(long, hide = true, conflicts_with = "strict_capture_color")]
     allow_untagged_sdr: bool,
+
+    /// Require explicit color metadata instead of Hyprland/XDPH's sRGB copy contract.
+    /// Use for capture producers other than the single-user Hyprland target.
+    #[arg(long)]
+    strict_capture_color: bool,
+
+    /// Capture a color-described producer on the user `PipeWire` instance, bypassing the SDR portal copy.
+    #[arg(long, conflicts_with = "hdr_test_pattern")]
+    pipewire_node: Option<u32>,
+
+    /// Stream native HDR10 reference bars/gradient instead of the desktop (diagnostics).
+    #[arg(long, conflicts_with = "hdr_metadata")]
+    hdr_test_pattern: bool,
+
+    /// TOML file containing authoritative source HDR mastering/content-light metadata.
+    /// This does not select HDR or override capture color metadata.
+    #[arg(long)]
+    hdr_metadata: Option<std::path::PathBuf>,
 
     /// Periodically log pipeline progress (captured/encoded frame counts).
     ///
@@ -211,6 +232,9 @@ fn build_config(cli: &Cli) -> anyhow::Result<ServerConfig> {
     if let Some(codec) = cli.codec {
         cfg.codec = codec;
     }
+    if let Some(use_hdr) = cli.use_hdr {
+        cfg.use_hdr = use_hdr;
+    }
     if let Some(ref preset) = cli.preset {
         cfg.encoder.preset.clone_from(preset);
     }
@@ -271,7 +295,17 @@ async fn main() -> anyhow::Result<()> {
         width: cfg.resolution.width,
         height: cfg.resolution.height,
         show_cursor: cfg.cursor.show_cursor,
-        require_color_metadata: !cli.allow_untagged_sdr,
+        require_color_metadata: cli.strict_capture_color,
+        node_id: cli.pipewire_node,
+        hdr_test_pattern: cli.hdr_test_pattern.then_some(cfg.framerate),
+        hdr_metadata: if let Some(path) = &cli.hdr_metadata {
+            let metadata =
+                stargaze_core::hdr::HdrMetadata::from_toml(&std::fs::read_to_string(path)?)?;
+            metadata.validate().map_err(anyhow::Error::msg)?;
+            metadata
+        } else {
+            stargaze_core::hdr::HdrMetadata::default()
+        },
     };
     let (capture_session, frames, resolution_rx) = capture::start_capture(capture_config).await?;
     info!("Capture started, waiting for PipeWire format negotiation...");
@@ -279,9 +313,14 @@ async fn main() -> anyhow::Result<()> {
     // Wait for PipeWire to negotiate the actual capture resolution.
     // This may differ from the configured resolution (e.g. 3440x1440 on an
     // ultrawide when the config says 1920x1080).
-    let capture_resolution = resolution_rx
+    let capture_format = resolution_rx
         .await
         .map_err(|_| anyhow::anyhow!("capture ended before format negotiation completed"))?;
+    let capture_resolution = capture_format.resolution;
+    let stream_color = cfg
+        .select_stream_color(capture_format.color)
+        .map_err(anyhow::Error::msg)?;
+    info!(source_color = ?capture_format.color, ?stream_color, "Selected native stream color from capture, not client HDR state");
     info!(
         "Capture resolution negotiated: {} (configured: {})",
         capture_resolution, cfg.resolution
@@ -293,6 +332,7 @@ async fn main() -> anyhow::Result<()> {
         height: capture_resolution.height,
         framerate: cfg.framerate,
         bitrate_mbps: cfg.bitrate,
+        color: stream_color,
         tuning: cfg.encoder.clone(),
     };
     let (encoder_session, packets, idr_tx, bitrate_tx) =
@@ -352,6 +392,7 @@ async fn main() -> anyhow::Result<()> {
     // session handshake advertises the correct dimensions to the client.
     let mut transport_cfg = cfg.clone();
     transport_cfg.resolution = capture_resolution;
+    transport_cfg.color = stream_color;
     let mut server_transport = transport::start_server_transport(
         &transport_cfg,
         packets,
@@ -431,6 +472,23 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn hdr_cli_opt_out_requires_an_explicit_boolean() {
+        assert_eq!(
+            Cli::try_parse_from(["stargaze-server"]).unwrap().use_hdr,
+            None
+        );
+        for (value, expected) in [("false", false), ("true", true)] {
+            assert_eq!(
+                Cli::try_parse_from(["stargaze-server", "--use-hdr", value])
+                    .unwrap()
+                    .use_hdr,
+                Some(expected)
+            );
+        }
+        assert!(Cli::try_parse_from(["stargaze-server", "--use-hdr"]).is_err());
+    }
+
     /// Verifies that the `hevc_nvenc` encoder is registered in `FFmpeg`.
     ///
     /// This does NOT require an NVIDIA GPU — the encoder is registered
@@ -469,6 +527,7 @@ mod tests {
             height: 1080,
             show_cursor: true,
             require_color_metadata: false,
+            ..CaptureConfig::default()
         };
         let (capture_session, frames, resolution_rx) = capture::start_capture(capture_config)
             .await
@@ -476,13 +535,15 @@ mod tests {
         let resolution = tokio::time::timeout(std::time::Duration::from_secs(10), resolution_rx)
             .await
             .expect("format negotiation timeout")
-            .expect("capture resolution");
+            .expect("capture resolution")
+            .resolution;
 
         // Match the actual source, not the requested portal dimensions.
         let encoder_config = EncoderConfig {
             width: resolution.width,
             height: resolution.height,
             framerate: 30,
+            color: stargaze_core::color::ColorDescription::SDR_STREAM,
             bitrate_mbps: 10,
             tuning: stargaze_core::config::EncoderTuning::default(),
         };
@@ -531,6 +592,68 @@ mod tests {
         assert!(got_keyframe, "should have received at least one keyframe");
     }
 
+    /// Capture a real color-described `PipeWire` RGB10 producer into Main10.
+    /// Start `tools/hdr-pipewire-source.c`, then set `STARGAZE_TEST_PW_NODE`.
+    /// `nix develop .#cuda -c cargo test -p stargaze-server hdr_pipewire_source -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "requires NVIDIA and STARGAZE_TEST_PW_NODE HDR producer"]
+    async fn hdr_pipewire_source() {
+        use stargaze_core::{color::ColorDescription, encode::EncoderConfig};
+        init_tracing();
+        let node_id = std::env::var("STARGAZE_TEST_PW_NODE")
+            .expect("HDR producer node id")
+            .parse()
+            .unwrap();
+        let config = CaptureConfig {
+            width: 2048,
+            height: 256,
+            node_id: Some(node_id),
+            require_color_metadata: true,
+            ..CaptureConfig::default()
+        };
+        let (capture, frames, format) = capture::start_capture(config).await.unwrap();
+        let format = tokio::time::timeout(std::time::Duration::from_secs(5), format)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(format.color, ColorDescription::HDR10_RGB);
+        let config = EncoderConfig {
+            width: format.resolution.width,
+            height: format.resolution.height,
+            framerate: 30,
+            bitrate_mbps: 40,
+            color: ColorDescription::HDR10,
+            tuning: stargaze_core::config::EncoderTuning::default(),
+        };
+        let (encoder, mut packets, _idr, _bitrate) = encode::start_encoder(config, frames).unwrap();
+        let packet = tokio::time::timeout(std::time::Duration::from_secs(5), packets.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        capture.stop().unwrap();
+        encoder.stop().unwrap();
+        let codec = ffmpeg_next::codec::decoder::find(ffmpeg_next::codec::Id::HEVC).unwrap();
+        let mut decoder = ffmpeg_next::codec::context::Context::new_with_codec(codec)
+            .decoder()
+            .video()
+            .unwrap();
+        decoder
+            .send_packet(&ffmpeg_next::Packet::copy(&packet.data))
+            .unwrap();
+        decoder.send_eof().unwrap();
+        let mut picture = ffmpeg_next::frame::Video::empty();
+        decoder.receive_frame(&mut picture).unwrap();
+        assert_eq!(picture.format(), ffmpeg_next::format::Pixel::YUV420P10LE);
+        assert_eq!(
+            picture.color_primaries(),
+            ffmpeg_next::color::Primaries::BT2020
+        );
+        assert_eq!(
+            picture.color_transfer_characteristic(),
+            ffmpeg_next::color::TransferCharacteristic::SMPTE2084
+        );
+    }
+
     /// GPU-only encoder test: feeds synthetic BGRA frames to NVENC
     /// and verifies encoded H.265 packets are produced.
     ///
@@ -560,6 +683,7 @@ mod tests {
             width,
             height,
             framerate,
+            color: stargaze_core::color::ColorDescription::SDR_STREAM,
             bitrate_mbps: 5,
             tuning: stargaze_core::config::EncoderTuning::default(),
         };
@@ -700,6 +824,7 @@ mod tests {
             height,
             framerate: 30,
             bitrate_mbps: 2,
+            color: stargaze_core::color::ColorDescription::SDR_STREAM,
             tuning: stargaze_core::config::EncoderTuning::default(),
         };
         let (encoder_session, mut packets, idr_tx, _bitrate_tx) =
@@ -837,6 +962,7 @@ mod tests {
             height,
             framerate: 30,
             bitrate_mbps: 2,
+            color: stargaze_core::color::ColorDescription::SDR_STREAM,
             tuning: stargaze_core::config::EncoderTuning::default(),
         };
         let (encoder_session, mut packets, _idr_tx, bitrate_tx) =
@@ -918,6 +1044,7 @@ mod tests {
             width,
             height,
             framerate,
+            color: stargaze_core::color::ColorDescription::SDR_STREAM,
             bitrate_mbps: 2,
             tuning: stargaze_core::config::EncoderTuning::default(),
         };

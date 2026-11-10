@@ -23,7 +23,7 @@ pub(crate) fn channel_order(format: PixelFormat) -> Option<(usize, usize, usize)
     match format {
         PixelFormat::Bgra8 => Some((2, 1, 0)),
         PixelFormat::Rgba8 => Some((0, 1, 2)),
-        PixelFormat::Nv12 | PixelFormat::Bgra10 | PixelFormat::Rgba10 => None,
+        PixelFormat::Nv12 | PixelFormat::Bgra10 | PixelFormat::Rgba10 | PixelFormat::Rgba16 => None,
     }
 }
 

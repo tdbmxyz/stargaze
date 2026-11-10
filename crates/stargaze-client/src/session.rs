@@ -74,7 +74,7 @@ pub async fn run_session(
         session_params.bitrate_mbps,
         session_params.codec,
     );
-    info!(stream_color = ?session_params.color, presentation = "SDR sRGB/default surface",
+    info!(stream_color = ?session_params.color, presentation = if session_params.color.is_hdr10() { "10-bit BT.2020/PQ Wayland surface" } else { "SDR sRGB/default surface" },
         "Session color diagnostics: output HDR mapping belongs to the compositor");
     if session_params.codec != cfg.codec {
         warn!(

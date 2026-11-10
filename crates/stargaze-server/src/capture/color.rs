@@ -20,9 +20,24 @@ impl SpaColor {
         format: PixelFormat,
         require_metadata: bool,
     ) -> Result<(ColorDescription, bool), &'static str> {
+        let ten_bit = matches!(
+            format,
+            PixelFormat::Bgra10 | PixelFormat::Rgba10 | PixelFormat::Rgba16
+        );
+        if self
+            == (Self {
+                range: 1,
+                matrix: 1,
+                transfer: 14,
+                primaries: 7,
+            })
+            && ten_bit
+        {
+            return Ok((ColorDescription::HDR10_RGB, false));
+        }
         if matches!(self.transfer, 14 | 15) {
             return Err(
-                "PQ/HLG capture rejected: no native HDR presentation or HDR-to-SDR tone/gamut mapping",
+                "HDR capture requires fully described full-range BT.2020/PQ RGB at >=10 bits; HLG/tone mapping unsupported",
             );
         }
         if self.primaries != 0 && self.primaries != 1 {
@@ -43,14 +58,14 @@ impl SpaColor {
         }
         let missing =
             self.range == 0 || self.matrix == 0 || self.transfer == 0 || self.primaries == 0;
-        let ten_bit = matches!(format, PixelFormat::Bgra10 | PixelFormat::Rgba10);
-        if missing && (require_metadata || ten_bit) {
+        if missing && require_metadata {
             return Err(
                 "capture color metadata missing: cannot infer HDR/SDR from bit depth; use a color-described SDR capture source",
             );
         }
-        // Compatibility contract, not detection: old portals omit all color
-        // fields. Preserve historical 8-bit SDR behavior with a warning.
+        // The single-user Hyprland/XDPH capture path explicitly renders
+        // DEFAULT_SRGB_IMAGE_DESCRIPTION, even for a 10-bit HDR output.
+        // This contract is not inference from buffer depth or client output.
         Ok((
             ColorDescription {
                 bit_depth: if ten_bit { 10 } else { 8 },
@@ -86,12 +101,37 @@ mod tests {
         assert!(
             SpaColor::default()
                 .validate(PixelFormat::Bgra10, false)
-                .is_err()
+                .unwrap()
+                .0
+                .is_supported_rgb()
         );
         assert!(
             SpaColor::default()
                 .validate(PixelFormat::Nv12, false)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn hdr_requires_real_source_metadata_not_output_state() {
+        let hdr = SpaColor {
+            range: 1,
+            matrix: 1,
+            transfer: 14,
+            primaries: 7,
+        };
+        assert_eq!(
+            hdr.validate(PixelFormat::Bgra10, true).unwrap().0,
+            ColorDescription::HDR10_RGB
+        );
+        assert!(hdr.validate(PixelFormat::Bgra8, false).is_err());
+        assert!(
+            SpaColor {
+                primaries: 0,
+                ..hdr
+            }
+            .validate(PixelFormat::Bgra10, false)
+            .is_err()
         );
     }
 

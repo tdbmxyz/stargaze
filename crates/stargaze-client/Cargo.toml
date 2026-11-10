@@ -25,6 +25,10 @@ fontdue = "0.9"
 khronos-egl = { version = "6", features = ["dynamic"] }
 gl = "0.14"
 
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
 [dev-dependencies]
 rcgen = "0.14.7"
 tempfile = "3"

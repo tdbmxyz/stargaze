@@ -3,14 +3,13 @@
 //! Handles fragmenting [`EncodedPacket`] values into `QUIC` datagrams
 //! and processing incoming control messages.
 
-use stargaze_core::color::ColorDescription;
 use stargaze_core::config::ServerConfig;
 use stargaze_core::encode::EncodedPacket;
 use stargaze_core::input::InputEvent;
 use stargaze_core::transport::{
     ControlMessage, DatagramHeader, HEADER_SIZE_UPPER_BOUND, TransportError,
     deserialize_color_request, deserialize_control_message, serialize_color_response,
-    serialize_header,
+    serialize_control_message, serialize_header,
 };
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -60,12 +59,23 @@ pub(crate) async fn handle_session_handshake(
     // Compat parse: pre-v1.3.0 clients send the request without a
     // bitrate field.
     let (request, color_caps) = deserialize_color_request(&body)?;
-    color_caps
-        .validate(ColorDescription::SDR_STREAM)
-        .map_err(|reason| TransportError::SessionError(reason.into()))?;
-    info!(?color_caps, stream_color = ?ColorDescription::SDR_STREAM,
-        native_hdr = false,
-        reason = "capture/presentation HDR contract unavailable; no tone-mapping fallback",
+    if let Err(reason) = color_caps.validate(config.color) {
+        let bytes = serialize_control_message(&ControlMessage::SessionRejected {
+            reason: reason.into(),
+        })?;
+        send_stream
+            .write_all(&bytes)
+            .await
+            .map_err(|e| TransportError::SessionError(e.to_string()))?;
+        let _ = send_stream.finish();
+        // Keep the connection alive long enough for the rejection to reach
+        // the client; this wait is never on the active media path.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), send_stream.stopped()).await;
+        return Err(TransportError::SessionError(reason.into()));
+    }
+    info!(?color_caps, stream_color = ?config.color,
+        native_hdr = config.color.is_hdr10(),
         "Session color negotiation");
 
     let (width, height, framerate, codec, requested_bitrate) = match request {
@@ -118,7 +128,7 @@ pub(crate) async fn handle_session_handshake(
         audio_channels: config.audio_channels,
     };
 
-    let response_bytes = serialize_color_response(&response, ColorDescription::SDR_STREAM)?;
+    let response_bytes = serialize_color_response(&response, config.color)?;
     send_stream
         .write_all(&response_bytes)
         .await

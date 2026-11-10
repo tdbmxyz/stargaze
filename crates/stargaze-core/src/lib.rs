@@ -6,6 +6,7 @@ pub mod config;
 pub mod decode;
 pub mod encode;
 pub mod error;
+pub mod hdr;
 pub mod input;
 pub mod logging;
 pub mod mic_forward;

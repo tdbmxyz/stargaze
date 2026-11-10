@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::os::unix::io::RawFd;
 use std::ptr;
 
-use stargaze_core::capture::DmaBufInfo;
+use stargaze_core::capture::{DmaBufInfo, PixelFormat};
 use stargaze_core::encode::EncodeError;
 use tracing::{debug, info, warn};
 
@@ -125,7 +125,7 @@ extern "C" __global__ void rgba_to_nv12(
     const unsigned char* __restrict__ src, unsigned long long src_pitch,
     unsigned char* __restrict__ y_plane, unsigned long long y_pitch,
     unsigned char* __restrict__ uv_plane, unsigned long long uv_pitch,
-    int width, int height, int r_off, int g_off, int b_off)
+    int width, int height, int r_off, int g_off, int b_off, int layout)
 {
     int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     int yy = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
@@ -168,21 +168,61 @@ pub(crate) struct GpuNv12Converter {
     host_buf: *mut c_void,
     width: u32,
     height: u32,
+    input_format: PixelFormat,
+    input_bytes: usize,
+    layout: i32,
 }
 
 impl GpuNv12Converter {
+    pub(crate) fn input_format(&self) -> PixelFormat {
+        self.input_format
+    }
     /// Compiles the kernel and allocates the staging buffer.
     ///
     /// Requires the CUDA context to be current on this thread. Fails
     /// gracefully (caller falls back to the CPU path) when NVRTC is not
     /// available at runtime.
+    #[cfg(test)]
     pub(crate) fn new(width: u32, height: u32) -> Result<Self, EncodeError> {
+        Self::new_format(width, height, PixelFormat::Rgba8, false)
+    }
+
+    pub(crate) fn new_format(
+        width: u32,
+        height: u32,
+        input_format: PixelFormat,
+        hdr: bool,
+    ) -> Result<Self, EncodeError> {
         use cudarc::driver::sys as cu;
+        let layout = if hdr {
+            match input_format {
+                PixelFormat::Bgra10 => 1,
+                PixelFormat::Rgba10 => 2,
+                PixelFormat::Rgba16 => 3,
+                _ => {
+                    return Err(EncodeError::UnsupportedFormat(
+                        "HDR CUDA requires >=10-bit RGB".into(),
+                    ));
+                }
+            }
+        } else {
+            0
+        };
+        let input_bytes = if input_format == PixelFormat::Rgba16 {
+            8
+        } else {
+            4
+        };
+        let kernel = if hdr {
+            include_str!("hdr.cu")
+        } else {
+            NV12_KERNEL_SRC
+        };
 
         // cudarc panics (rather than returning Err) when libnvrtc.so cannot
         // be dlopen'd — contain that so a missing NVRTC degrades to the CPU
         // conversion path instead of killing the encoder thread.
-        let ptx = std::panic::catch_unwind(|| cudarc::nvrtc::compile_ptx(NV12_KERNEL_SRC))
+        let ptx = std::panic::catch_unwind(|| cudarc::nvrtc::compile_ptx(kernel))
             .map_err(|_| {
                 EncodeError::InitError(
                     "libnvrtc not found (install the CUDA NVRTC runtime library)".to_string(),
@@ -202,7 +242,12 @@ impl GpuNv12Converter {
             }
 
             let mut func: cu::CUfunction = ptr::null_mut();
-            let res = cu::cuModuleGetFunction(&raw mut func, module, c"rgba_to_nv12".as_ptr());
+            let name = if hdr {
+                c"rgba_to_p010"
+            } else {
+                c"rgba_to_nv12"
+            };
+            let res = cu::cuModuleGetFunction(&raw mut func, module, name.as_ptr());
             if res != cu::CUresult::CUDA_SUCCESS {
                 cu::cuModuleUnload(module);
                 return Err(EncodeError::InitError(format!(
@@ -215,7 +260,7 @@ impl GpuNv12Converter {
             let res = cu::cuMemAllocPitch_v2(
                 &raw mut rgba_buf,
                 &raw mut rgba_pitch,
-                width as usize * 4,
+                width as usize * input_bytes,
                 height as usize,
                 16,
             );
@@ -228,7 +273,10 @@ impl GpuNv12Converter {
 
             info!(
                 width,
-                height, "GPU NV12 converter initialized (NVRTC kernel)"
+                height,
+                hdr,
+                ?input_format,
+                "GPU video converter initialized (NVRTC kernel)"
             );
             Ok(Self {
                 module,
@@ -238,6 +286,9 @@ impl GpuNv12Converter {
                 host_buf: ptr::null_mut(),
                 width,
                 height,
+                input_format,
+                input_bytes,
+                layout,
             })
         }
     }
@@ -266,7 +317,7 @@ impl GpuNv12Converter {
         use cudarc::driver::sys as cu;
 
         let h = self.height as usize;
-        let row_bytes = self.width as usize * 4;
+        let row_bytes = self.width as usize * self.input_bytes;
         let staging_size = self.rgba_pitch * h;
         if data.len() < (h - 1) * src_stride + row_bytes {
             return Err(EncodeError::EncodeFrameError {
@@ -348,7 +399,7 @@ impl GpuNv12Converter {
         let g_off = i32::try_from(order.1).unwrap_or(1);
         let b_off = i32::try_from(order.2).unwrap_or(2);
 
-        let mut params: [*mut c_void; 11] = [
+        let mut params: [*mut c_void; 12] = [
             ptr::from_ref(&self.rgba_buf).cast_mut().cast(),
             ptr::from_ref(&src_pitch).cast_mut().cast(),
             ptr::from_ref(&y_plane).cast_mut().cast(),
@@ -360,6 +411,7 @@ impl GpuNv12Converter {
             ptr::from_ref(&r_off).cast_mut().cast(),
             ptr::from_ref(&g_off).cast_mut().cast(),
             ptr::from_ref(&b_off).cast_mut().cast(),
+            ptr::from_ref(&self.layout).cast_mut().cast(),
         ];
 
         // One thread per 2x2 block.
@@ -654,6 +706,7 @@ pub(crate) struct EglCudaBridge {
     /// On-GPU NV12 converter. `None` when NVRTC is unavailable — frames
     /// then take the legacy GPU→CPU→GPU path.
     gpu_converter: Option<GpuNv12Converter>,
+    hdr: bool,
 }
 
 // Safety: EglCudaBridge is only used on the dedicated encoder thread.
@@ -665,10 +718,11 @@ impl EglCudaBridge {
     ///
     /// Must be called after CUDA context is already active on this thread
     /// (i.e., after `cuCtxPushCurrent`).
-    pub(crate) fn new(
+    pub(crate) fn new_color(
         width: u32,
         height: u32,
         cuda_ctx: cudarc::driver::sys::CUcontext,
+        hdr: bool,
     ) -> Result<Self, EncodeError> {
         // Step 1: Load EGL dynamically.
         let egl = unsafe {
@@ -816,12 +870,16 @@ impl EglCudaBridge {
             gl::TexImage2D(
                 gl::TEXTURE_2D,
                 0,
-                gl::RGBA8 as i32,
+                if hdr { gl::RGBA16 } else { gl::RGBA8 } as i32,
                 width as i32,
                 height as i32,
                 0,
                 gl::RGBA,
-                gl::UNSIGNED_BYTE,
+                if hdr {
+                    gl::UNSIGNED_SHORT
+                } else {
+                    gl::UNSIGNED_BYTE
+                },
                 ptr::null(),
             );
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
@@ -888,7 +946,12 @@ impl EglCudaBridge {
 
         // Compile the on-GPU NV12 converter while the CUDA context is
         // still current. Failure is non-fatal (CPU fallback path).
-        let gpu_converter = match GpuNv12Converter::new(width, height) {
+        let input_format = if hdr {
+            PixelFormat::Rgba16
+        } else {
+            PixelFormat::Rgba8
+        };
+        let gpu_converter = match GpuNv12Converter::new_format(width, height, input_format, hdr) {
             Ok(c) => Some(c),
             Err(e) => {
                 warn!("GPU NV12 converter unavailable ({e}), using CPU conversion fallback");
@@ -904,7 +967,9 @@ impl EglCudaBridge {
         info!(
             width,
             height,
-            gpu_nv12 = gpu_converter.is_some(),
+            hdr,
+            staging_format = if hdr { "RGBA16" } else { "RGBA8" },
+            gpu_video_convert = gpu_converter.is_some(),
             "EGL-GL-CUDA bridge initialized (headless, DMA-BUF import ready)"
         );
 
@@ -924,6 +989,7 @@ impl EglCudaBridge {
             gbm_destroy_fn,
             drm_fd,
             gpu_converter,
+            hdr,
         })
     }
 
@@ -1297,7 +1363,7 @@ impl EglCudaBridge {
                     dstArray: ptr::null_mut(),
                     dstPitch: converter.rgba_pitch,
 
-                    WidthInBytes: self.width as usize * 4,
+                    WidthInBytes: self.width as usize * converter.input_bytes,
                     Height: self.height as usize,
                 };
                 let copy_res = cu::cuMemcpy2D_v2(&raw const copy_desc);
@@ -1582,7 +1648,7 @@ impl EglCudaBridge {
             });
         }
 
-        let row_bytes = self.width as usize * 4;
+        let row_bytes = self.width as usize * if self.hdr { 8 } else { 4 };
         let buf_size = row_bytes * self.height as usize;
         let mut cpu_buf = vec![0u8; buf_size];
 

@@ -16,12 +16,15 @@ pub enum PixelFormat {
     /// with red in the least-significant 10 bits (legacy variant name).
     ///
     /// Storage precision alone says nothing about transfer/dynamic range.
-    /// Only explicitly described sRGB is accepted for 10-bit capture;
-    /// HDR or ambiguous metadata must not reach the SDR converter.
+    /// Full-range BT.2020/PQ requires an authoritative color description. The known
+    /// Hyprland sRGB-copy contract remains SDR; strict producers may not omit
+    /// color metadata. Neither path infers HDR from these bits.
     Bgra10,
     /// Packed X2RGB10LE (`DRM_FORMAT_XRGB2101010` / `xRGB_210LE`),
     /// with blue in the least-significant 10 bits (legacy variant name).
     Rgba10,
+    /// RGBA16 UNORM staging used to retain HDR DMA-BUF precision.
+    Rgba16,
 }
 
 impl fmt::Display for PixelFormat {
@@ -32,6 +35,7 @@ impl fmt::Display for PixelFormat {
             Self::Nv12 => write!(f, "NV12"),
             Self::Bgra10 => write!(f, "BGRA10"),
             Self::Rgba10 => write!(f, "RGBA10"),
+            Self::Rgba16 => write!(f, "RGBA16"),
         }
     }
 }
@@ -104,6 +108,8 @@ pub struct CapturedFrame {
     pub captured_at: std::time::Instant,
     /// Source color, validated before conversion; independent of pixel layout.
     pub color: crate::color::ColorDescription,
+    /// Actual optional source mastering/content-light metadata.
+    pub hdr_metadata: crate::hdr::HdrMetadata,
 }
 
 impl From<Frame> for CapturedFrame {
@@ -112,6 +118,7 @@ impl From<Frame> for CapturedFrame {
             frame,
             captured_at: std::time::Instant::now(),
             color: crate::color::ColorDescription::SRGB,
+            hdr_metadata: crate::hdr::HdrMetadata::default(),
         }
     }
 }

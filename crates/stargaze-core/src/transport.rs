@@ -137,6 +137,12 @@ pub enum ControlMessage {
     },
     /// Client -> Server: input event from keyboard, mouse, or gamepad.
     Input(InputEvent),
+    /// Server -> Client: explicit reason why a requested mode is unsafe/unavailable.
+    /// Appended variant; old peers fail closed rather than infer an SDR stream.
+    SessionRejected {
+        /// Human-readable rejection reason.
+        reason: String,
+    },
 }
 
 /// First bytes of a `QUIC` bidirectional stream carrying a tunneled USB
@@ -515,6 +521,12 @@ pub fn deserialize_color_request(
 pub fn deserialize_color_response(
     body: &[u8],
 ) -> Result<(ControlMessage, ColorDescription), TransportError> {
+    if let Ok((ControlMessage::SessionRejected { reason }, rest)) =
+        postcard::take_from_bytes::<ControlMessage>(body)
+        && rest.is_empty()
+    {
+        return Err(TransportError::SessionError(reason));
+    }
     if let Ok((msg @ ControlMessage::SessionResponse { .. }, suffix)) =
         postcard::take_from_bytes::<ControlMessage>(body)
     {
@@ -647,6 +659,17 @@ mod tests {
         for end in prefix + 1..bytes.len() - 4 {
             assert!(deserialize_color_request(&bytes[4..4 + end]).is_err());
         }
+    }
+
+    #[test]
+    fn hdr_rejection_reason_survives_the_handshake() {
+        let body = postcard::to_allocvec(&ControlMessage::SessionRejected {
+            reason: "HDR10 source requires native Wayland presentation".into(),
+        })
+        .unwrap();
+        assert!(
+            matches!(deserialize_color_response(&body), Err(TransportError::SessionError(reason)) if reason.contains("HDR10"))
+        );
     }
 
     #[test]

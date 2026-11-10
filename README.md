@@ -109,11 +109,13 @@ stargaze-server --resolution 2560x1440 --framerate 60 --bitrate 20
 # docs/headless-screencast.md for an auto-approving portal setup.
 ```
 
-Capture color metadata is validated before conversion. If your portal omits it,
-add `--allow-untagged-sdr` **only for a known SDR 8-bit RGB source**; otherwise
-capture fails closed. Native HDR10 and HDR-to-SDR tone mapping are not supported.
 The client desktop can stay permanently HDR with its calibration unchanged.
-See the [color/HDR audit and deployment notes](docs/hdr-streaming.md).
+Stargaze supports native Main10/P010 HDR10 from a color-described BT.2020/PQ
+source, with a real 10-bit color-managed Wayland surface. Hyprland 0.57's portal
+currently supplies an sRGB sharing copy: that desktop correctly stays an SDR
+stream, without a mandatory override. Use `--hdr-test-pattern` for a native HDR
+diagnostic source, or `--pipewire-node NODE_ID` for an actual HDR producer.
+See [HDR usage, source limitations and hardware evidence](docs/hdr-streaming.md).
 
 On the client machine, just launch `stargaze-client` (from the desktop
 menu or a terminal): a gamepad/touch-friendly launcher opens where you

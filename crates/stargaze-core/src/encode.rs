@@ -33,6 +33,8 @@ pub struct EncoderConfig {
     pub framerate: u32,
     /// Target bitrate in Mbps.
     pub bitrate_mbps: u32,
+    /// Actual stream color, selected from capture before encoder creation.
+    pub color: crate::color::ColorDescription,
     /// NVENC tuning (preset, multipass).
     pub tuning: crate::config::EncoderTuning,
 }
@@ -121,6 +123,7 @@ mod tests {
             height: 1080,
             framerate: 60,
             bitrate_mbps: 20,
+            color: crate::color::ColorDescription::SDR_STREAM,
             tuning: crate::config::EncoderTuning::default(),
         };
         assert_eq!(cfg.width, 1920);

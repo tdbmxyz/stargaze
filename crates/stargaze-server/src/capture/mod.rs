@@ -1,6 +1,7 @@
 mod color;
 pub mod pipewire;
 pub mod portal;
+mod test_pattern;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +16,7 @@ use tracing::{error, info};
 const FRAME_CHANNEL_CAPACITY: usize = 2;
 
 /// Configuration for the capture session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CaptureConfig {
     /// Desired capture width in pixels.
     pub width: u32,
@@ -23,8 +24,21 @@ pub struct CaptureConfig {
     pub height: u32,
     /// Whether to include the cursor in captured frames.
     pub show_cursor: bool,
-    /// Reject untagged RGB instead of the warned legacy SDR interpretation.
+    /// Reject untagged RGB instead of the known Hyprland sRGB-copy contract.
     pub require_color_metadata: bool,
+    /// Optional explicitly selected producer on the user's `PipeWire` instance.
+    pub node_id: Option<u32>,
+    /// Generate an HDR10 diagnostic source at this frame rate, without a portal.
+    pub hdr_test_pattern: Option<u32>,
+    /// Optional authoritative static HDR source metadata.
+    pub hdr_metadata: stargaze_core::hdr::HdrMetadata,
+}
+
+/// Negotiated source geometry and color, selected before encoder/transport init.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureFormat {
+    pub resolution: Resolution,
+    pub color: stargaze_core::color::ColorDescription,
 }
 
 /// Handle to a running capture session.
@@ -97,16 +111,25 @@ pub async fn start_capture(
     (
         CaptureSession,
         mpsc::Receiver<CapturedFrame>,
-        oneshot::Receiver<Resolution>,
+        oneshot::Receiver<CaptureFormat>,
     ),
     CaptureError,
 > {
-    // Step 1: Portal handshake (async, runs on tokio).
-    let (pw_fd, pw_node_id) = portal::create_screencast_session(config.show_cursor).await?;
+    if let Some(framerate) = config.hdr_test_pattern {
+        return test_pattern::start(config, framerate);
+    }
+    // An explicit producer must describe its color; it is not the known
+    // Hyprland/XDPH sRGB-copy contract.
+    let (pw_fd, pw_node_id) = if let Some(node_id) = config.node_id {
+        (None, node_id)
+    } else {
+        let (fd, node) = portal::create_screencast_session(config.show_cursor).await?;
+        (Some(fd), node)
+    };
 
     info!(
         node_id = pw_node_id,
-        "Portal session established, starting PipeWire capture"
+        "Capture source selected, starting PipeWire capture"
     );
 
     // Step 2: Create the frame channel and resolution oneshot.
