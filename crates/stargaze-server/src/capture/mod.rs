@@ -3,6 +3,8 @@ pub mod pipewire;
 pub mod portal;
 mod test_pattern;
 mod wayland;
+#[cfg(test)]
+mod wayland_live_tests;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
