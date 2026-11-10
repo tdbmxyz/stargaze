@@ -64,6 +64,8 @@
       pkgs.pipewire
       pkgs.dbus
       pkgs.SDL2
+      pkgs.wayland
+      pkgs.wayland-protocols
       pkgs.libopus
       pkgs.libclang
       pkgs.llvmPackages.libclang
@@ -74,6 +76,7 @@
     commonNativeBuildInputs = [
       toolchain
       pkgs.pkg-config
+      pkgs.wayland-scanner
     ];
 
     # ── Bindgen / LIBCLANG environment ─────────────────────────────
@@ -91,6 +94,7 @@
       pkgs.pipewire
       pkgs.dbus
       pkgs.SDL2
+      pkgs.wayland
       pkgs.libopus
       pkgs.libglvnd
       pkgs.mesa
@@ -113,6 +117,7 @@
 
       nativeBuildInputs = [
         pkgs.pkg-config
+        pkgs.wayland-scanner
         pkgs.makeWrapper
         pkgs.removeReferencesTo
       ];
@@ -174,6 +179,7 @@
       clientLibs = [
         ffmpegPkg
         sdl2Pkg
+        pkgs.wayland
         pkgs.libopus
         pkgs.libglvnd
         pkgs.mesa
@@ -192,6 +198,10 @@
             buildInputs =
               clientLibs
               ++ [
+                # build.rs queries wayland-protocols.pc; commonBuildInputs is
+                # replaced here, and nativeBuildInputs does not expose it on
+                # the target pkg-config search path.
+                pkgs.wayland-protocols
                 pkgs.libclang
                 pkgs.llvmPackages.libclang
               ];
@@ -349,6 +359,7 @@
               pkgsCuda.pipewire
               pkgsCuda.dbus
               pkgsCuda.SDL2
+              pkgsCuda.wayland
               pkgsCuda.libopus
               pkgsCuda.cudaPackages.cuda_cudart
               pkgsCuda.cudaPackages.cuda_nvml_dev
