@@ -43,15 +43,17 @@ with CPU frames.
 
 ### 10-bit Display Formats
 
-Bit depth does not identify HDR or color space. Explicitly described full-range
-sRGB 10-bit RGB can be reduced to SDR 8-bit; untagged 10-bit, HDR and unsupported
-colorimetry are rejected before conversion. The current SDL2/OpenGL presentation
-backend cannot signal native HDR10. No HDR-to-SDR tone/gamut mapper exists.
+Bit depth does not identify HDR or color space. The single-user NVIDIA→AMD path
+now supports native Main10/P010 BT.2020/PQ streaming and an explicitly described
+10-bit Wayland surface, including precision-preserving DMA-BUF and CPU paths.
+Hyprland 0.57's portal still renders an sRGB sharing copy; actual desktop HDR
+capture needs a producer that preserves HDR, not relabeling that copy. Its known
+sRGB contract works by default, while explicit node capture requires metadata.
 
-See [the color/HDR audit](hdr-streaming.md) for actual Hyprland/PipeWire metadata,
-the explicit `--allow-untagged-sdr` migration option for known SDR sources,
-regression/hardware evidence and remaining native HDR implementation gates.
-Keep desktop HDR/calibration unchanged; forcing 8-bit output is not an HDR fix.
+See [HDR usage, source limitations and hardware evidence](hdr-streaming.md).
+Remaining work includes a native-HDR compositor capture producer, sustained
+3440×1440/145-fps HDR throughput and panel-luminance validation, and an optional
+real HDR→SDR tone/gamut mapper. Keep desktop HDR/calibration unchanged.
 
 ## 3. Latency Measurement
 
