@@ -7,8 +7,8 @@ use crate::config::Codec;
 use thiserror::Error;
 
 /// Pixel data of a decoded 4:2:0 frame, in the layout the decoder
-/// produced it — the renderer uploads either layout directly, so no
-/// repacking happens on the decode path.
+/// produced it. Software Main10 is repacked losslessly into P010; other
+/// layouts are uploaded directly without reducing component precision.
 #[derive(Debug, Clone)]
 pub enum FramePixels {
     /// Planar YUV 4:2:0 (I420): separate Y, U, V planes.
@@ -20,6 +20,14 @@ pub enum FramePixels {
         u: Vec<u8>,
         /// V (chroma-red) plane, `(width/2) * (height/2)` bytes.
         v: Vec<u8>,
+    },
+    /// Ten-bit P010: little-endian 16-bit words with ten significant MSBs.
+    /// Also the lossless repacking target for planar software Main10 decode.
+    P010 {
+        /// Y plane, `width * height * 2` bytes.
+        y: Vec<u8>,
+        /// Interleaved UV plane, `width * height` bytes.
+        uv: Vec<u8>,
     },
     /// Semi-planar NV12: Y plane plus interleaved UV plane.
     /// Typical hardware-decode (VAAPI) output — kept as-is to avoid a
@@ -37,6 +45,8 @@ pub enum FramePixels {
 pub struct DecodedFrame {
     /// Pixel planes in the decoder's native 4:2:0 layout.
     pub pixels: FramePixels,
+    /// Static HDR metadata decoded from the bitstream, never display guesses.
+    pub hdr_metadata: crate::hdr::HdrMetadata,
     /// Frame width in pixels.
     pub width: u32,
     /// Frame height in pixels.
@@ -78,6 +88,8 @@ pub struct DecoderConfig {
     pub height: u32,
     /// Codec to decode.
     pub codec: Codec,
+    /// Negotiated color; legacy peers alone may omit VUI color fields.
+    pub color: crate::color::ColorDescription,
 }
 
 /// Errors from the video decoding subsystem.
@@ -149,6 +161,7 @@ mod tests {
         let y_size = (width * height) as usize;
         let chroma_size = ((width / 2) * (height / 2)) as usize;
         let frame = DecodedFrame {
+            hdr_metadata: crate::hdr::HdrMetadata::default(),
             pixels: FramePixels::I420 {
                 y: vec![128; y_size],
                 u: vec![128; chroma_size],
@@ -165,7 +178,7 @@ mod tests {
                 assert_eq!(u.len(), chroma_size);
                 assert_eq!(v.len(), chroma_size);
             }
-            FramePixels::Nv12 { .. } => panic!("expected I420"),
+            _ => panic!("expected I420"),
         }
         assert_eq!(frame.width, 1920);
         assert_eq!(frame.height, 1080);
@@ -180,6 +193,7 @@ mod tests {
         let uv_size = (width * height / 2) as usize;
 
         let frame = DecodedFrame {
+            hdr_metadata: crate::hdr::HdrMetadata::default(),
             pixels: FramePixels::Nv12 {
                 y: vec![0; y_size],
                 uv: vec![0; uv_size],
@@ -195,7 +209,7 @@ mod tests {
                 assert_eq!(y.len(), 307_200);
                 assert_eq!(uv.len(), 153_600);
             }
-            FramePixels::I420 { .. } => panic!("expected NV12"),
+            _ => panic!("expected NV12"),
         }
     }
 
@@ -205,6 +219,7 @@ mod tests {
             width: 1920,
             height: 1080,
             codec: Codec::H265,
+            color: crate::color::ColorDescription::LEGACY_SDR,
         };
         assert_eq!(cfg.width, 1920);
         assert_eq!(cfg.height, 1080);

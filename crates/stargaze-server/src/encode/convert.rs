@@ -23,14 +23,14 @@ pub(crate) fn channel_order(format: PixelFormat) -> Option<(usize, usize, usize)
     match format {
         PixelFormat::Bgra8 => Some((2, 1, 0)),
         PixelFormat::Rgba8 => Some((0, 1, 2)),
-        PixelFormat::Nv12 | PixelFormat::Bgra10 | PixelFormat::Rgba10 => None,
+        PixelFormat::Nv12 | PixelFormat::Bgra10 | PixelFormat::Rgba10 | PixelFormat::Rgba16 => None,
     }
 }
 
 /// BT.709 limited-range luma for one pixel.
 #[inline]
 fn luma(r: i32, g: i32, b: i32) -> u8 {
-    let y = (47 * r + 157 * g + 16 * b + 128) >> 8;
+    let y = (11966 * r + 40254 * g + 4064 * b + 32768) >> 16;
     u8::try_from(y + 16).unwrap_or(235)
 }
 
@@ -38,8 +38,9 @@ fn luma(r: i32, g: i32, b: i32) -> u8 {
 #[inline]
 #[allow(clippy::many_single_char_names)] // r/g/b/u/v are the domain names
 fn chroma(r: i32, g: i32, b: i32) -> (u8, u8) {
-    let u = ((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128;
-    let v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
+    // Coefficients sum to zero: every neutral gray has exactly U=V=128.
+    let u = ((-6596 * r - 22189 * g + 28785 * b + 32768) >> 16) + 128;
+    let v = ((28785 * r - 26145 * g - 2640 * b + 32768) >> 16) + 128;
     (
         u8::try_from(u).unwrap_or(if u < 0 { 16 } else { 240 }),
         u8::try_from(v).unwrap_or(if v < 0 { 16 } else { 240 }),
@@ -197,6 +198,21 @@ mod tests {
             (i16::from(actual) - i16::from(expected)).abs() <= 2,
             "{what}: got {actual}, expected ~{expected}"
         );
+    }
+
+    #[test]
+    fn neutral_gradient_preserves_blacks_white_and_chroma() {
+        let mut previous = 0;
+        for gray in 0..=255_u8 {
+            let (y, u, v) = convert_solid_bgra(gray, gray, gray, 2, 2);
+            assert_eq!((u, v), (128, 128), "gray {gray}");
+            assert!(y >= previous);
+            let expected = 16.0 + 219.0 * f64::from(gray) / 255.0;
+            assert!((f64::from(y) - expected).abs() <= 0.51);
+            previous = y;
+        }
+        assert_eq!(convert_solid_bgra(0, 0, 0, 2, 2), (16, 128, 128));
+        assert_eq!(convert_solid_bgra(255, 255, 255, 2, 2), (235, 128, 128));
     }
 
     #[test]

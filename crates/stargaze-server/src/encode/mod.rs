@@ -7,6 +7,7 @@
 pub(crate) mod convert;
 pub(crate) mod egl_cuda;
 pub(crate) mod ffmpeg;
+mod hdr;
 pub(crate) mod opus_enc;
 
 use std::sync::Arc;

@@ -6,14 +6,15 @@
 //! touches CPU memory. CPU frames (zero-copy fallback, software decode)
 //! are uploaded into plane textures and drawn with the same shaders.
 //!
-//! Colorspace: the stream is BT.709 limited range end to end, and the
-//! conversion happens in our fragment shaders (or, for the whole-frame
-//! import strategy, via explicit EGL colorspace hints) — never left to a
-//! driver's default guess.
+//! SDR is limited BT.709/sRGB, HDR10 limited BT.2020/PQ. Shaders preserve
+//! the encoded transfer while expanding range/matrix. HDR uses a verified
+//! ten-bit EGL buffer and a compositor-acknowledged Wayland description;
+//! EGL input-import hints alone never describe a presentation surface.
 
 use std::ffi::{CString, c_void};
 
 use anyhow::anyhow;
+use stargaze_core::color::ColorDescription;
 use stargaze_core::decode::{DecodedFrame, FramePixels};
 use tracing::info;
 
@@ -64,13 +65,15 @@ void main() {
 /// BT.709 limited-range YUV → RGB, shared by the YUV fragment shaders.
 const BT709_FN: &str = "\
 vec3 bt709(float luma, float cb, float cr) {
-    float y = 1.16438 * (luma - 0.0625);
-    float u = cb - 0.5;
-    float v = cr - 0.5;
+    // Normalized textures contain code/255, not code/256. Exact digital
+    // offsets keep Y=16 black, Y=235 white and U=V=128 neutral.
+    float y = (luma - 16.0/255.0) * (255.0/219.0);
+    float u = (cb - 128.0/255.0) * (255.0/224.0);
+    float v = (cr - 128.0/255.0) * (255.0/224.0);
     return vec3(
-        y + 1.79274 * v,
-        y - 0.21325 * u - 0.53291 * v,
-        y + 2.11240 * u
+        y + 1.5748 * v,
+        y - 0.187324 * u - 0.468124 * v,
+        y + 1.8556 * u
     );
 }
 ";
@@ -188,6 +191,7 @@ enum CpuLayout {
     None,
     Nv12,
     I420,
+    P010,
 }
 
 /// One plane of a DRM PRIME frame, flattened from the descriptor.
@@ -201,6 +205,9 @@ struct PlaneInfo {
 }
 
 pub(super) struct GlRenderer {
+    // Must be destroyed before SDL destroys its native surface/display.
+    color_surface: Option<super::wayland_hdr::HdrSurface>,
+    color: ColorDescription,
     // Dropped before the window (fields drop in declaration order).
     _gl_context: sdl2::video::GLContext,
     window: sdl2::video::Window,
@@ -210,6 +217,9 @@ pub(super) struct GlRenderer {
     prog_nv12_ext: Option<Program>,
     prog_rgb_ext: Option<Program>,
     prog_overlay: Program,
+    prog_p010: Program,
+    prog_p010_norm: Program,
+    prog_p010_ext: Option<Program>,
     cpu_tex: [gl::types::GLuint; 3],
     cpu_layout: CpuLayout,
     cpu_dims: (u32, u32),
@@ -228,6 +238,7 @@ impl GlRenderer {
     /// programs can't be created. A missing EGL/dma-buf stack is *not* an
     /// error — dma-buf frames will then fail per-frame and the caller
     /// falls back to CPU frames.
+    #[cfg(test)]
     pub(super) fn new(
         video: &sdl2::VideoSubsystem,
         width: u32,
@@ -235,7 +246,30 @@ impl GlRenderer {
         fullscreen: bool,
         hidden: bool,
     ) -> Result<Self, anyhow::Error> {
+        Self::new_color(
+            video,
+            width,
+            height,
+            fullscreen,
+            hidden,
+            ColorDescription::SDR_STREAM,
+        )
+    }
+
+    pub(super) fn new_color(
+        video: &sdl2::VideoSubsystem,
+        width: u32,
+        height: u32,
+        fullscreen: bool,
+        hidden: bool,
+        color: ColorDescription,
+    ) -> Result<Self, anyhow::Error> {
+        let hdr = color.is_hdr10();
         let gl_attr = video.gl_attr();
+        gl_attr.set_red_size(if hdr { 10 } else { 8 });
+        gl_attr.set_green_size(if hdr { 10 } else { 8 });
+        gl_attr.set_blue_size(if hdr { 10 } else { 8 });
+        gl_attr.set_alpha_size(if hdr { 2 } else { 8 });
         gl_attr.set_context_profile(sdl2::video::GLProfile::GLES);
         gl_attr.set_context_version(3, 0);
 
@@ -276,9 +310,24 @@ impl GlRenderer {
             );
         }
 
+        let color_surface = if hdr {
+            Some(super::wayland_hdr::HdrSurface::attach(video, &window)?)
+        } else {
+            None
+        };
+        let hdr_cpu_program = link_program(super::gl_hdr::VERTEX, &super::gl_hdr::cpu_fragment())?;
+        let prog_p010_norm = link_program(VS_SRC, &super::gl_hdr::dmabuf_fragment(false))?;
+        let prog_p010_ext = link_program(VS_SRC, &super::gl_hdr::dmabuf_fragment(true)).ok();
         let prog_nv12 = link_program(VS_SRC, &fs_nv12())?;
         let prog_i420 = link_program(VS_SRC, &fs_i420())?;
-        let prog_overlay = link_program(VS_SRC, FS_OVERLAY)?;
+        let prog_overlay = link_program(
+            VS_SRC,
+            if hdr {
+                super::gl_hdr::OVERLAY
+            } else {
+                FS_OVERLAY
+            },
+        )?;
         // External-image programs need GL_OES_EGL_image_external; keep
         // going without them (the TwoPlane/TEXTURE_2D strategy and CPU
         // uploads still work).
@@ -289,33 +338,26 @@ impl GlRenderer {
             .map_err(|e| info!("external RGB shader unavailable: {e}"))
             .ok();
 
-        let mut quad_vbo = 0;
-        let mut textures = [0u32; 6];
-        unsafe {
-            // Unit quad as a triangle strip; a_pos is location 0 in every
-            // program (bound before linking).
-            let quad: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
-            gl::GenBuffers(1, &raw mut quad_vbo);
-            gl::BindBuffer(gl::ARRAY_BUFFER, quad_vbo);
-            gl::BufferData(
-                gl::ARRAY_BUFFER,
-                std::mem::size_of_val(&quad).cast_signed(),
-                quad.as_ptr().cast(),
-                gl::STATIC_DRAW,
-            );
-            gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, 0, std::ptr::null());
-            gl::EnableVertexAttribArray(0);
+        let textures = init_quad_textures();
 
-            gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
-            gl::GenTextures(
-                i32::try_from(textures.len()).expect("fixed-size array"),
-                textures.as_mut_ptr(),
-            );
-        }
-
+        info!(
+            ?color,
+            presentation = if hdr {
+                "10-bit BT.2020/PQ Wayland surface"
+            } else {
+                "SDR sRGB/default Wayland surface"
+            },
+            native_hdr = hdr,
+            "Presentation color mode (no PQ conversion or saturation adjustment)"
+        );
         let egl = init_egl();
 
         Ok(Self {
+            color_surface,
+            color,
+            prog_p010: hdr_cpu_program,
+            prog_p010_norm,
+            prog_p010_ext,
             _gl_context: gl_context,
             window,
             egl,
@@ -359,6 +401,13 @@ impl GlRenderer {
         frame: &VideoFrame,
         overlay: Option<&str>,
     ) -> Result<(), anyhow::Error> {
+        if let Some(surface) = &mut self.color_surface {
+            let metadata = match frame {
+                VideoFrame::Cpu(cpu) => cpu.hdr_metadata,
+                VideoFrame::DmaBuf(gpu) => gpu.hdr_metadata(),
+            };
+            surface.update_metadata(metadata)?;
+        }
         let (dw, dh) = self.window.drawable_size();
         unsafe {
             gl::Viewport(0, 0, dw.cast_signed(), dh.cast_signed());
@@ -385,7 +434,12 @@ impl GlRenderer {
         let layout = match &frame.pixels {
             FramePixels::Nv12 { .. } => CpuLayout::Nv12,
             FramePixels::I420 { .. } => CpuLayout::I420,
+            FramePixels::P010 { .. } => CpuLayout::P010,
         };
+        anyhow::ensure!(
+            (layout == CpuLayout::P010) == self.color.is_hdr10(),
+            "decoded pixel precision does not match presentation color"
+        );
         if self.cpu_layout != layout || self.cpu_dims != (w, h) {
             self.alloc_cpu_textures(layout, w, h);
         }
@@ -393,6 +447,10 @@ impl GlRenderer {
         let (cw, ch) = (w.div_euclid(2), h.div_euclid(2));
         unsafe {
             match &frame.pixels {
+                FramePixels::P010 { y, uv } => {
+                    upload_plane16(self.cpu_tex[0], w, h, gl::RED_INTEGER, y);
+                    upload_plane16(self.cpu_tex[1], cw, ch, gl::RG_INTEGER, uv);
+                }
                 FramePixels::Nv12 { y, uv } => {
                     upload_plane(self.cpu_tex[0], w, h, gl::RED, y);
                     upload_plane(self.cpu_tex[1], cw, ch, gl::RG, uv);
@@ -405,6 +463,7 @@ impl GlRenderer {
             }
 
             let (prog, planes) = match layout {
+                CpuLayout::P010 => (&self.prog_p010, 2),
                 CpuLayout::Nv12 => (&self.prog_nv12, 2),
                 _ => (&self.prog_i420, 3),
             };
@@ -422,12 +481,25 @@ impl GlRenderer {
         let (cw, ch) = (w.div_euclid(2), h.div_euclid(2));
         let plan: &[(u32, u32, gl::types::GLenum)] = match layout {
             CpuLayout::Nv12 => &[(w, h, gl::R8), (cw, ch, gl::RG8)],
+            CpuLayout::P010 => &[(w, h, gl::R16UI), (cw, ch, gl::RG16UI)],
             _ => &[(w, h, gl::R8), (cw, ch, gl::R8), (cw, ch, gl::R8)],
         };
         unsafe {
             for (i, (pw, ph, internal)) in plan.iter().enumerate() {
                 gl::BindTexture(gl::TEXTURE_2D, self.cpu_tex[i]);
                 set_sampling_params(gl::TEXTURE_2D);
+                if layout == CpuLayout::P010 {
+                    gl::TexParameteri(
+                        gl::TEXTURE_2D,
+                        gl::TEXTURE_MIN_FILTER,
+                        gl::NEAREST.cast_signed(),
+                    );
+                    gl::TexParameteri(
+                        gl::TEXTURE_2D,
+                        gl::TEXTURE_MAG_FILTER,
+                        gl::NEAREST.cast_signed(),
+                    );
+                }
                 gl::TexImage2D(
                     gl::TEXTURE_2D,
                     0,
@@ -435,12 +507,17 @@ impl GlRenderer {
                     pw.cast_signed(),
                     ph.cast_signed(),
                     0,
-                    if *internal == gl::RG8 {
-                        gl::RG
-                    } else {
-                        gl::RED
+                    match *internal {
+                        gl::RG16UI => gl::RG_INTEGER,
+                        gl::R16UI => gl::RED_INTEGER,
+                        gl::RG8 => gl::RG,
+                        _ => gl::RED,
                     },
-                    gl::UNSIGNED_BYTE,
+                    if layout == CpuLayout::P010 {
+                        gl::UNSIGNED_SHORT
+                    } else {
+                        gl::UNSIGNED_BYTE
+                    },
                     std::ptr::null(),
                 );
             }
@@ -458,7 +535,8 @@ impl GlRenderer {
     /// Imports and draws a dma-buf frame using the session's import
     /// strategy, probing the strategies on the first frame.
     fn draw_dmabuf(&mut self, frame: &DmaBufFrame) -> Result<(), anyhow::Error> {
-        let planes = nv12_planes(frame.descriptor()).map_err(|e| anyhow!(e))?;
+        let planes =
+            video_planes(frame.descriptor(), self.color.is_hdr10()).map_err(|e| anyhow!(e))?;
 
         match self.dmabuf_mode {
             DmabufMode::TwoPlane { target } => self.draw_two_plane(frame, &planes, target),
@@ -481,6 +559,9 @@ impl GlRenderer {
                 ];
                 let mut last_err = None;
                 for (name, mode) in attempts {
+                    if self.color.is_hdr10() && matches!(mode, DmabufMode::WholeFrame) {
+                        continue;
+                    }
                     let result = match mode {
                         DmabufMode::TwoPlane { target } => {
                             self.draw_two_plane(frame, &planes, target)
@@ -511,7 +592,15 @@ impl GlRenderer {
         planes: &(PlaneInfo, PlaneInfo),
         target: gl::types::GLenum,
     ) -> Result<(), anyhow::Error> {
-        let prog = if target == gl::TEXTURE_2D {
+        let prog = if self.color.is_hdr10() {
+            if target == gl::TEXTURE_2D {
+                &self.prog_p010_norm
+            } else {
+                self.prog_p010_ext
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("external P010 shader unavailable"))?
+            }
+        } else if target == gl::TEXTURE_2D {
             &self.prog_nv12
         } else {
             self.prog_nv12_ext
@@ -538,6 +627,26 @@ impl GlRenderer {
             unsafe {
                 bind_image(egl, target, self.dmabuf_tex[0], image_y)?;
                 bind_image(egl, target, self.dmabuf_tex[1], image_uv)?;
+                if self.color.is_hdr10()
+                    && target == gl::TEXTURE_2D
+                    && matches!(self.dmabuf_mode, DmabufMode::Undecided)
+                {
+                    let (mut internal, mut red_type) = (0, 0);
+                    gl::GetTexLevelParameteriv(
+                        target,
+                        0,
+                        gl::TEXTURE_INTERNAL_FORMAT,
+                        &raw mut internal,
+                    );
+                    gl::GetTexLevelParameteriv(target, 0, gl::TEXTURE_RED_TYPE, &raw mut red_type);
+                    info!(
+                        y_format = planes.0.format,
+                        uv_format = planes.1.format,
+                        ?internal,
+                        ?red_type,
+                        "HDR DMA-BUF texture layout"
+                    );
+                }
                 gl::ActiveTexture(gl::TEXTURE0);
                 gl::BindTexture(target, self.dmabuf_tex[0]);
                 gl::ActiveTexture(gl::TEXTURE1);
@@ -617,12 +726,36 @@ impl GlRenderer {
                 gl::UNSIGNED_BYTE,
                 pixels.as_ptr().cast(),
             );
-            gl::Enable(gl::BLEND);
+            if !self.color.is_hdr10() {
+                gl::Enable(gl::BLEND);
+            }
             gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
             draw_quad(&self.prog_overlay, [-1.0, y0.max(-1.0), x1.min(1.0), 1.0]);
             gl::Disable(gl::BLEND);
         }
     }
+}
+
+/// The GL context owns these objects until session teardown.
+fn init_quad_textures() -> [gl::types::GLuint; 6] {
+    let mut vertex_buffer = 0;
+    let mut textures = [0; 6];
+    unsafe {
+        let quad: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        gl::GenBuffers(1, &raw mut vertex_buffer);
+        gl::BindBuffer(gl::ARRAY_BUFFER, vertex_buffer);
+        gl::BufferData(
+            gl::ARRAY_BUFFER,
+            std::mem::size_of_val(&quad).cast_signed(),
+            quad.as_ptr().cast(),
+            gl::STATIC_DRAW,
+        );
+        gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, 0, std::ptr::null());
+        gl::EnableVertexAttribArray(0);
+        gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
+        gl::GenTextures(6, textures.as_mut_ptr());
+    }
+    textures
 }
 
 /// Loads EGL and resolves what dma-buf import needs. `None` (with a log)
@@ -670,15 +803,40 @@ fn init_egl() -> Option<EglState> {
     })
 }
 
-/// Flattens an NV12 DRM PRIME descriptor into (Y, UV) plane infos.
-///
-/// VAAPI exports either two single-plane layers (R8 + GR88) or one
-/// two-plane NV12 layer; both are handled.
-fn nv12_planes(
+/// Flatten NV12/P010 DRM PRIME descriptors, verifying actual plane precision.
+fn video_planes(
     desc: &ffmpeg_sys_next::AVDRMFrameDescriptor,
+    hdr: bool,
 ) -> Result<(PlaneInfo, PlaneInfo), String> {
     const DRM_FORMAT_GR88: u32 = fourcc(*b"GR88");
-
+    let object_count = usize::try_from(desc.nb_objects)
+        .ok()
+        .filter(|n| *n > 0 && *n <= desc.objects.len())
+        .ok_or("invalid DRM object count")?;
+    let expected_y = if hdr { fourcc(*b"R16 ") } else { DRM_FORMAT_R8 };
+    let expected_uv = if hdr {
+        fourcc(*b"GR32")
+    } else {
+        DRM_FORMAT_GR88
+    };
+    if desc.nb_layers == 2 {
+        if desc.layers[0].nb_planes != 1
+            || desc.layers[1].nb_planes != 1
+            || desc.layers[0].format != expected_y
+            || desc.layers[1].format != expected_uv
+        {
+            return Err("DMA-BUF plane formats do not match negotiated precision".into());
+        }
+    } else if desc.nb_layers == 1 {
+        let expected = if hdr {
+            fourcc(*b"P010")
+        } else {
+            DRM_FORMAT_NV12
+        };
+        if desc.layers[0].format != expected {
+            return Err("DMA-BUF frame format does not match stream precision".into());
+        }
+    }
     let plane_info = |layer: &ffmpeg_sys_next::AVDRMLayerDescriptor,
                       plane_idx: usize,
                       format: u32|
@@ -686,7 +844,7 @@ fn nv12_planes(
         let plane = &layer.planes[plane_idx];
         let obj_idx = usize::try_from(plane.object_index)
             .ok()
-            .filter(|i| *i < desc.nb_objects.unsigned_abs() as usize)
+            .filter(|i| *i < object_count)
             .ok_or_else(|| format!("bad object index {}", plane.object_index))?;
         let object = &desc.objects[obj_idx];
         Ok(PlaneInfo {
@@ -704,8 +862,20 @@ fn nv12_planes(
             plane_info(&desc.layers[1], 0, desc.layers[1].format)?,
         )),
         (1, 2) => Ok((
-            plane_info(&desc.layers[0], 0, DRM_FORMAT_R8)?,
-            plane_info(&desc.layers[0], 1, DRM_FORMAT_GR88)?,
+            plane_info(
+                &desc.layers[0],
+                0,
+                if hdr { fourcc(*b"R16 ") } else { DRM_FORMAT_R8 },
+            )?,
+            plane_info(
+                &desc.layers[0],
+                1,
+                if hdr {
+                    fourcc(*b"GR32")
+                } else {
+                    DRM_FORMAT_GR88
+                },
+            )?,
         )),
         (layers, planes) => Err(format!(
             "unsupported DRM frame layout ({layers} layers, {planes} planes)"
@@ -844,6 +1014,29 @@ unsafe fn upload_plane(
             h.cast_signed(),
             format,
             gl::UNSIGNED_BYTE,
+            data.as_ptr().cast(),
+        );
+    }
+}
+
+unsafe fn upload_plane16(
+    tex: gl::types::GLuint,
+    w: u32,
+    h: u32,
+    format: gl::types::GLenum,
+    data: &[u8],
+) {
+    unsafe {
+        gl::BindTexture(gl::TEXTURE_2D, tex);
+        gl::TexSubImage2D(
+            gl::TEXTURE_2D,
+            0,
+            0,
+            0,
+            w.cast_signed(),
+            h.cast_signed(),
+            format,
+            gl::UNSIGNED_SHORT,
             data.as_ptr().cast(),
         );
     }
@@ -995,11 +1188,332 @@ mod tests {
         };
 
         DecodedFrame {
+            hdr_metadata: stargaze_core::hdr::HdrMetadata::default(),
             pixels,
             width: w,
             height: h,
             pts: 0,
             stats: FrameStats::default(),
+        }
+    }
+
+    /// Real NVIDIA-produced Main10 → AMD VAAPI → P010 DMA-BUF/CPU → PQ surface.
+    /// `STARGAZE_TEST_HEVC=/tmp/native.hevc nix develop -c cargo test -p stargaze-client hdr10_vaapi_presentation -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "requires HDR10 fixture, VAAPI and 10-bit Wayland color management"]
+    fn hdr10_vaapi_presentation() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+        let data =
+            std::fs::read(std::env::var("STARGAZE_TEST_HEVC").expect("fixture path")).unwrap();
+        let sdl = sdl2::init().unwrap();
+        let video = sdl.video().unwrap();
+        let (w, h) = (2048_u32, 256_u32);
+        let mut renderer =
+            GlRenderer::new_color(&video, w, h, false, true, ColorDescription::HDR10).unwrap();
+        let (mut fbo, mut texture) = (0, 0);
+        unsafe {
+            gl::GenFramebuffers(1, &raw mut fbo);
+            gl::GenTextures(1, &raw mut texture);
+            gl::BindTexture(gl::TEXTURE_2D, texture);
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGB10_A2.cast_signed(),
+                w.cast_signed(),
+                h.cast_signed(),
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_INT_2_10_10_10_REV,
+                std::ptr::null(),
+            );
+            gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+            gl::FramebufferTexture2D(
+                gl::FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                gl::TEXTURE_2D,
+                texture,
+                0,
+            );
+            assert_eq!(
+                gl::CheckFramebufferStatus(gl::FRAMEBUFFER),
+                gl::FRAMEBUFFER_COMPLETE
+            );
+            gl::Viewport(0, 0, w.cast_signed(), h.cast_signed());
+        }
+        let mut reference: Option<Vec<u32>> = None;
+        for dma_buf in [false, true] {
+            let frame = crate::decode::ffmpeg::decode_hdr_fixture(&data, dma_buf);
+            let metadata = match &frame {
+                VideoFrame::Cpu(cpu) => cpu.hdr_metadata,
+                VideoFrame::DmaBuf(gpu) => gpu.hdr_metadata(),
+            };
+            assert_eq!(
+                metadata.mastering.unwrap().primaries,
+                [[35400, 14600], [8500, 39850], [6550, 2300]]
+            );
+            assert_eq!(metadata.content_light.unwrap().max_cll, 10000);
+            renderer
+                .color_surface
+                .as_mut()
+                .unwrap()
+                .update_metadata(metadata)
+                .unwrap();
+            match &frame {
+                VideoFrame::Cpu(cpu) => renderer.draw_cpu(cpu).unwrap(),
+                VideoFrame::DmaBuf(gpu) => renderer.draw_dmabuf(gpu).unwrap(),
+            }
+            let mut pixels = vec![0_u32; (w * h) as usize];
+            unsafe {
+                gl::ReadPixels(
+                    0,
+                    0,
+                    w.cast_signed(),
+                    h.cast_signed(),
+                    gl::RGBA,
+                    gl::UNSIGNED_INT_2_10_10_10_REV,
+                    pixels.as_mut_ptr().cast(),
+                );
+            }
+            check_gl_error("Main10 hardware readback").unwrap();
+            for x in [0, 512, 1024, 1536, 2047] {
+                let got = pixels[(h / 2 * w) as usize + x] & 1023;
+                assert!(
+                    got.abs_diff(u32::try_from(x / 2).unwrap()) <= 8,
+                    "DMA={dma_buf} x={x} got {got}"
+                );
+            }
+            if let Some(cpu) = &reference {
+                for (&a, &b) in pixels.iter().zip(cpu) {
+                    for shift in [0, 10, 20] {
+                        assert!(((a >> shift) & 1023).abs_diff((b >> shift) & 1023) <= 2);
+                    }
+                }
+            } else {
+                reference = Some(pixels);
+            }
+        }
+        unsafe {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            gl::DeleteFramebuffers(1, &raw const fbo);
+            gl::DeleteTextures(1, &raw const texture);
+        }
+        let frame = crate::decode::ffmpeg::decode_hdr_fixture(&data, true);
+        renderer.present(&frame, None).unwrap();
+    }
+
+    /// Verifies real 10-bit EGL configuration, compositor-acknowledged PQ
+    /// surface description and a >8-bit P010 gradient through an RGB10 FBO.
+    /// `nix develop -c cargo test -p stargaze-client hdr10_surface_and_gradient -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "requires Wayland color-management-v1 and a 10-bit EGL configuration"]
+    fn hdr10_surface_and_gradient() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+        assert!(super::super::wayland_hdr::supported());
+        let sdl = sdl2::init().unwrap();
+        let video = sdl.video().unwrap();
+        let (w, h) = (1024_u32, 32_u32);
+        let mut renderer =
+            GlRenderer::new_color(&video, w, h, false, true, ColorDescription::HDR10).unwrap();
+        let y: Vec<u8> = (0..h)
+            .flat_map(|_| {
+                (0..w).flat_map(|x| {
+                    u16::try_from(64 + (876 * x + 511) / 1023)
+                        .unwrap()
+                        .checked_shl(6)
+                        .unwrap()
+                        .to_le_bytes()
+                })
+            })
+            .collect();
+        let uv = (512_u16 << 6).to_le_bytes().repeat((w * h / 2) as usize);
+        let frame = DecodedFrame {
+            hdr_metadata: stargaze_core::hdr::HdrMetadata::default(),
+            pixels: FramePixels::P010 { y, uv },
+            width: w,
+            height: h,
+            pts: 0,
+            stats: FrameStats::default(),
+        };
+        let (mut fbo, mut texture) = (0, 0);
+        unsafe {
+            gl::GenFramebuffers(1, &raw mut fbo);
+            gl::GenTextures(1, &raw mut texture);
+            gl::BindTexture(gl::TEXTURE_2D, texture);
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGB10_A2.cast_signed(),
+                w.cast_signed(),
+                h.cast_signed(),
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_INT_2_10_10_10_REV,
+                std::ptr::null(),
+            );
+            gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+            gl::FramebufferTexture2D(
+                gl::FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                gl::TEXTURE_2D,
+                texture,
+                0,
+            );
+            assert_eq!(
+                gl::CheckFramebufferStatus(gl::FRAMEBUFFER),
+                gl::FRAMEBUFFER_COMPLETE
+            );
+            gl::Viewport(0, 0, w.cast_signed(), h.cast_signed());
+        }
+        renderer.draw_cpu(&frame).unwrap();
+        let mut pixels = vec![0_u32; (w * h) as usize];
+        unsafe {
+            gl::ReadPixels(
+                0,
+                0,
+                w.cast_signed(),
+                h.cast_signed(),
+                gl::RGBA,
+                gl::UNSIGNED_INT_2_10_10_10_REV,
+                pixels.as_mut_ptr().cast(),
+            );
+        }
+        check_gl_error("HDR gradient readback").unwrap();
+        for (x, &packed) in pixels[..w as usize].iter().enumerate() {
+            let red = packed & 1023;
+            let green = (packed >> 10) & 1023;
+            let blue = (packed >> 20) & 1023;
+            assert!(
+                i64::abs(i64::from(red) - i64::try_from(x).unwrap()) <= 1,
+                "PQ gradient {x}: {red}"
+            );
+            assert_eq!((red, red), (green, blue));
+        }
+        assert!(
+            pixels[..w as usize]
+                .windows(2)
+                .filter(|p| p[0] != p[1])
+                .count()
+                > 800
+        );
+        unsafe {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            gl::DeleteFramebuffers(1, &raw const fbo);
+            gl::DeleteTextures(1, &raw const texture);
+        }
+        renderer.present(&VideoFrame::Cpu(frame), None).unwrap();
+    }
+
+    /// Checks digital black, reference white and neutral gradients, without
+    /// applying gamma a second time. Run on SDR AND permanently HDR desktops:
+    /// `nix develop -c cargo test -p stargaze-client gl_renderer_neutral -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore = "requires a display (Wayland/X11) and a GPU"]
+    fn gl_renderer_neutral_levels_and_gradient() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+        let (w, h) = (256_u32, 32_u32);
+        let sdl = sdl2::init().expect("SDL init");
+        let video = sdl.video().expect("SDL video");
+        let mut renderer = GlRenderer::new(&video, w, h, false, true).expect("GL renderer");
+        // A swapped window's back buffer is undefined. Use an RGBA8 FBO
+        // for exact code-value checks, independent of window scaling and
+        // the compositor's SDR-to-HDR output mapping.
+        let (mut fbo, mut texture) = (0, 0);
+        unsafe {
+            gl::GenFramebuffers(1, &raw mut fbo);
+            gl::GenTextures(1, &raw mut texture);
+            gl::BindTexture(gl::TEXTURE_2D, texture);
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA8.cast_signed(),
+                w.cast_signed(),
+                h.cast_signed(),
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                std::ptr::null(),
+            );
+            gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+            gl::FramebufferTexture2D(
+                gl::FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                gl::TEXTURE_2D,
+                texture,
+                0,
+            );
+            assert_eq!(
+                gl::CheckFramebufferStatus(gl::FRAMEBUFFER),
+                gl::FRAMEBUFFER_COMPLETE
+            );
+            gl::Viewport(0, 0, w.cast_signed(), h.cast_signed());
+        }
+        for nv12 in [false, true] {
+            let y: Vec<u8> = (0..h)
+                .flat_map(|_| (0..w).map(|x| u8::try_from(16 + (219 * x + 127) / 255).unwrap()))
+                .collect();
+            let pixels = if nv12 {
+                FramePixels::Nv12 {
+                    y,
+                    uv: vec![128; (w * h / 2) as usize],
+                }
+            } else {
+                FramePixels::I420 {
+                    y,
+                    u: vec![128; (w * h / 4) as usize],
+                    v: vec![128; (w * h / 4) as usize],
+                }
+            };
+            let frame = VideoFrame::Cpu(DecodedFrame {
+                hdr_metadata: stargaze_core::hdr::HdrMetadata::default(),
+                pixels,
+                width: w,
+                height: h,
+                pts: 0,
+                stats: FrameStats::default(),
+            });
+            let VideoFrame::Cpu(frame) = frame else {
+                unreachable!()
+            };
+            renderer.draw_cpu(&frame).unwrap();
+            let mut readback = vec![0_u8; (w * h * 4) as usize];
+            unsafe {
+                gl::ReadPixels(
+                    0,
+                    0,
+                    w.cast_signed(),
+                    h.cast_signed(),
+                    gl::RGBA,
+                    gl::UNSIGNED_BYTE,
+                    readback.as_mut_ptr().cast(),
+                );
+            }
+            check_gl_error("gradient readback").unwrap();
+            for x in 0..w {
+                let off = ((h / 2 * w + x) * 4) as usize;
+                let rgb = &readback[off..off + 3];
+                for &channel in rgb {
+                    assert!(
+                        (i32::from(channel) - i32::try_from(x).unwrap()).abs() <= 2,
+                        "NV12={nv12}, gradient {x}: {rgb:?}"
+                    );
+                }
+                assert_eq!(rgb[0], rgb[1]);
+                assert_eq!(rgb[1], rgb[2]);
+            }
+            assert_eq!(&readback[..3], &[0, 0, 0]);
+            let white = ((w - 1) * 4) as usize;
+            assert_eq!(&readback[white..white + 3], &[255, 255, 255]);
+        }
+        unsafe {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            gl::DeleteFramebuffers(1, &raw const fbo);
+            gl::DeleteTextures(1, &raw const texture);
         }
     }
 

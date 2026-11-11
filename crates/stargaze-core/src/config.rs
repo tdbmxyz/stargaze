@@ -191,6 +191,12 @@ pub struct ServerConfig {
     pub bitrate: u32,
     /// Video codec to use.
     pub codec: Codec,
+    /// Permit native HDR when the source is HDR. Disabling rejects HDR sources;
+    /// it does not tone map them or change the desktop's output configuration.
+    pub use_hdr: bool,
+    /// Actual video stream color (runtime-selected from source metadata).
+    #[serde(skip)]
+    pub color: crate::color::ColorDescription,
     /// NVENC encoder tuning.
     pub encoder: EncoderTuning,
     /// Mic forwarding configuration.
@@ -212,11 +218,33 @@ impl Default for ServerConfig {
             framerate: 60,
             bitrate: 20,
             codec: Codec::default(),
+            use_hdr: true,
+            color: crate::color::ColorDescription::SDR_STREAM,
             encoder: EncoderTuning::default(),
             mic_forward: MicForwardConfig::default(),
             cursor: CursorConfig::default(),
             audio_channels: 2,
         }
+    }
+}
+
+impl ServerConfig {
+    /// Select stream color from the source, respecting the HDR opt-out.
+    ///
+    /// # Errors
+    /// Rejects unsupported source color or HDR when disabled. No implicit
+    /// tone/gamut mapping or precision-truncating fallback is performed.
+    pub fn select_stream_color(
+        &self,
+        source: crate::color::ColorDescription,
+    ) -> Result<crate::color::ColorDescription, &'static str> {
+        let stream = source.stream().ok_or("unsupported source color")?;
+        if stream.is_hdr10() && !self.use_hdr {
+            return Err(
+                "HDR source rejected: use_hdr is false; select a genuinely SDR capture source (no HDR-to-SDR tone/gamut mapper is implemented)",
+            );
+        }
+        Ok(stream)
     }
 }
 
@@ -494,6 +522,7 @@ mod tests {
         assert_eq!(config.framerate, 60);
         assert_eq!(config.bitrate, 20);
         assert_eq!(config.codec, Codec::H265);
+        assert!(config.use_hdr);
         assert!(!config.mic_forward.enabled);
         assert_eq!(config.mic_forward.port, 9001);
         assert_eq!(config.mic_forward.rsonance_binary, "rsonance");
@@ -501,6 +530,44 @@ mod tests {
         assert_eq!(config.audio_channels, 2);
         assert_eq!(config.encoder.preset, "p1");
         assert_eq!(config.encoder.multipass, "disabled");
+    }
+
+    #[test]
+    fn hdr_opt_out_preserves_sdr_and_rejects_hdr_without_relabeling() {
+        use crate::color::ColorDescription;
+
+        for use_hdr in [false, true] {
+            let config: ServerConfig = toml::from_str(&format!("use_hdr = {use_hdr}")).unwrap();
+            assert_eq!(config.use_hdr, use_hdr);
+            for depth in [8, 10] {
+                assert_eq!(
+                    config.select_stream_color(ColorDescription {
+                        bit_depth: depth,
+                        ..ColorDescription::SRGB
+                    }),
+                    Ok(ColorDescription::SDR_STREAM)
+                );
+            }
+            let selected = config.select_stream_color(ColorDescription::HDR10_RGB);
+            if use_hdr {
+                assert_eq!(selected, Ok(ColorDescription::HDR10));
+            } else {
+                assert!(selected.unwrap_err().contains("no HDR-to-SDR"));
+            }
+            assert!(
+                config
+                    .select_stream_color(ColorDescription {
+                        transfer: 18,
+                        ..ColorDescription::HDR10_RGB
+                    })
+                    .is_err()
+            );
+            let saved = toml::to_string(&config).unwrap();
+            assert_eq!(
+                toml::from_str::<ServerConfig>(&saved).unwrap().use_hdr,
+                use_hdr
+            );
+        }
     }
 
     #[test]

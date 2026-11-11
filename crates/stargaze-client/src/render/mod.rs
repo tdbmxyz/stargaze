@@ -1,8 +1,10 @@
 mod audio;
 mod gl;
+mod gl_hdr;
 mod input;
 mod sdl;
 mod stats;
+pub(crate) mod wayland_hdr;
 
 use stargaze_core::decode::DecoderConfig;
 use stargaze_core::input::InputEvent;

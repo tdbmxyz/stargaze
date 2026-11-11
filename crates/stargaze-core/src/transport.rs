@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::color::{ColorCapabilities, ColorDescription};
 use crate::config::Codec;
 use crate::input::InputEvent;
 
@@ -136,6 +137,12 @@ pub enum ControlMessage {
     },
     /// Client -> Server: input event from keyboard, mouse, or gamepad.
     Input(InputEvent),
+    /// Server -> Client: explicit reason why a requested mode is unsafe/unavailable.
+    /// Appended variant; old peers fail closed rather than infer an SDR stream.
+    SessionRejected {
+        /// Human-readable rejection reason.
+        reason: String,
+    },
 }
 
 /// First bytes of a `QUIC` bidirectional stream carrying a tunneled USB
@@ -406,9 +413,280 @@ pub fn deserialize_session_request_compat(body: &[u8]) -> Result<ControlMessage,
     }
 }
 
+/// Versioned trailing session extension. Legacy peers ignore the suffix;
+/// absent extensions mean legacy SDR, never implicit HDR capability.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ColorExtension<T> {
+    magic: [u8; 4],
+    version: u8,
+    value: T,
+}
+
+fn serialize_color_session<T: Serialize>(
+    msg: &ControlMessage,
+    value: T,
+) -> Result<Vec<u8>, TransportError> {
+    let mut body = postcard::to_allocvec(msg)
+        .map_err(|e| TransportError::SerializationError(e.to_string()))?;
+    let extension = ColorExtension {
+        magic: *b"SGCL",
+        version: 1,
+        value,
+    };
+    body.extend(
+        postcard::to_allocvec(&extension)
+            .map_err(|e| TransportError::SerializationError(e.to_string()))?,
+    );
+    let len =
+        u32::try_from(body.len()).map_err(|e| TransportError::SerializationError(e.to_string()))?;
+    let mut bytes = len.to_le_bytes().to_vec();
+    bytes.extend(body);
+    Ok(bytes)
+}
+
+fn parse_color_extension<T: serde::de::DeserializeOwned>(
+    suffix: &[u8],
+    legacy: T,
+) -> Result<T, TransportError> {
+    if suffix.is_empty() {
+        return Ok(legacy);
+    }
+    let (ext, rest) = postcard::take_from_bytes::<ColorExtension<T>>(suffix)
+        .map_err(|e| TransportError::SerializationError(format!("invalid color extension: {e}")))?;
+    if ext.magic != *b"SGCL" || ext.version != 1 || !rest.is_empty() {
+        return Err(TransportError::SerializationError(
+            "unsupported color extension".into(),
+        ));
+    }
+    Ok(ext.value)
+}
+
+/// Serialize a session request with end-to-end color capabilities.
+///
+/// # Errors
+/// Returns a serialization error if encoding fails.
+pub fn serialize_color_request(
+    msg: &ControlMessage,
+    caps: ColorCapabilities,
+) -> Result<Vec<u8>, TransportError> {
+    serialize_color_session(msg, caps)
+}
+
+/// Serialize a session response with its actual stream color description.
+///
+/// # Errors
+/// Returns a serialization error if encoding fails.
+pub fn serialize_color_response(
+    msg: &ControlMessage,
+    color: ColorDescription,
+) -> Result<Vec<u8>, TransportError> {
+    serialize_color_session(msg, color)
+}
+
+/// Parse capabilities, retaining SDR-only compatibility with old clients.
+/// Malformed extensions must never fall back to a legacy interpretation.
+///
+/// # Errors
+/// Returns an error for malformed or unsupported extensions/requests.
+pub fn deserialize_color_request(
+    body: &[u8],
+) -> Result<(ControlMessage, ColorCapabilities), TransportError> {
+    if let Ok((msg @ ControlMessage::SessionRequest { .. }, suffix)) =
+        postcard::take_from_bytes::<ControlMessage>(body)
+    {
+        return Ok((
+            msg,
+            parse_color_extension(suffix, ColorCapabilities::SDR_ONLY)?,
+        ));
+    }
+    // Only exact legacy messages are accepted here, not truncated modern ones
+    // with a partly readable prefix and silently ignored trailing bytes.
+    if let Ok((_, rest)) = postcard::take_from_bytes::<LegacyControlMessageV1>(body)
+        && rest.is_empty()
+    {
+        return Ok((
+            deserialize_session_request_compat(body)?,
+            ColorCapabilities::SDR_ONLY,
+        ));
+    }
+    Err(TransportError::SerializationError(
+        "invalid color session request".into(),
+    ))
+}
+
+/// Parse the selected stream color; old servers are explicitly legacy SDR.
+///
+/// # Errors
+/// Returns an error for malformed or unsupported extensions/responses.
+pub fn deserialize_color_response(
+    body: &[u8],
+) -> Result<(ControlMessage, ColorDescription), TransportError> {
+    if let Ok((ControlMessage::SessionRejected { reason }, rest)) =
+        postcard::take_from_bytes::<ControlMessage>(body)
+        && rest.is_empty()
+    {
+        return Err(TransportError::SessionError(reason));
+    }
+    if let Ok((msg @ ControlMessage::SessionResponse { .. }, suffix)) =
+        postcard::take_from_bytes::<ControlMessage>(body)
+    {
+        return Ok((
+            msg,
+            parse_color_extension(suffix, ColorDescription::LEGACY_SDR)?,
+        ));
+    }
+    if let Ok((LegacyControlMessageV2::SessionResponse { .. }, rest)) =
+        postcard::take_from_bytes::<LegacyControlMessageV2>(body)
+        && rest.is_empty()
+    {
+        return Ok((
+            deserialize_session_response_compat(body)?,
+            ColorDescription::LEGACY_SDR,
+        ));
+    }
+    Err(TransportError::SerializationError(
+        "invalid color session response".into(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn color_request() -> ControlMessage {
+        ControlMessage::SessionRequest {
+            width: 3440,
+            height: 1440,
+            framerate: 145,
+            codec: Codec::H265,
+            bitrate_mbps: 80,
+        }
+    }
+
+    fn color_response() -> ControlMessage {
+        ControlMessage::SessionResponse {
+            width: 3440,
+            height: 1440,
+            framerate: 145,
+            bitrate_mbps: 80,
+            codec: Codec::H265,
+            max_datagram_size: 1400,
+            cursor_embedded: true,
+            server_command: String::new(),
+            audio_channels: 2,
+        }
+    }
+
+    #[test]
+    fn color_extensions_preserve_legacy_prefixes() {
+        let request = color_request();
+        let bytes = serialize_color_request(&request, ColorCapabilities::SDR_ONLY).unwrap();
+        assert_eq!(deserialize_control_message(&bytes[4..]).unwrap(), request);
+        assert_eq!(
+            deserialize_color_request(&bytes[4..]).unwrap(),
+            (request, ColorCapabilities::SDR_ONLY)
+        );
+        let response = color_response();
+        let bytes = serialize_color_response(&response, ColorDescription::SDR_STREAM).unwrap();
+        assert_eq!(deserialize_control_message(&bytes[4..]).unwrap(), response);
+        assert_eq!(
+            deserialize_color_response(&bytes[4..]).unwrap(),
+            (response, ColorDescription::SDR_STREAM)
+        );
+    }
+
+    #[test]
+    fn missing_extensions_mean_legacy_sdr_not_hdr() {
+        let bytes = postcard::to_allocvec(&color_response()).unwrap();
+        assert_eq!(
+            deserialize_color_response(&bytes).unwrap().1,
+            ColorDescription::LEGACY_SDR
+        );
+        let bytes = postcard::to_allocvec(&color_request()).unwrap();
+        assert_eq!(
+            deserialize_color_request(&bytes).unwrap().1,
+            ColorCapabilities::SDR_ONLY
+        );
+        let old_response = LegacyControlMessageV2::SessionResponse {
+            width: 640,
+            height: 480,
+            framerate: 60,
+            bitrate_mbps: 20,
+            codec: Codec::H265,
+            max_datagram_size: 1400,
+            cursor_embedded: false,
+            server_command: String::new(),
+        };
+        assert_eq!(
+            deserialize_color_response(&postcard::to_allocvec(&old_response).unwrap())
+                .unwrap()
+                .1,
+            ColorDescription::LEGACY_SDR
+        );
+        // Pre-bitrate client, tag 0 and the four original fields.
+        let old_request =
+            postcard::to_allocvec(&(0_u8, 640_u32, 480_u32, 60_u32, Codec::H265)).unwrap();
+        assert_eq!(
+            deserialize_color_request(&old_request).unwrap().1,
+            ColorCapabilities::SDR_ONLY
+        );
+    }
+
+    #[test]
+    fn malformed_color_suffix_never_downgrades_to_legacy() {
+        let response = color_response();
+        let bytes = serialize_color_response(&response, ColorDescription::HDR10).unwrap();
+        let prefix = postcard::to_allocvec(&response).unwrap().len();
+        for end in prefix + 1..bytes.len() - 4 {
+            assert!(
+                deserialize_color_response(&bytes[4..4 + end]).is_err(),
+                "truncation {end}"
+            );
+        }
+        let mut body = bytes[4..].to_vec();
+        body[prefix] ^= 1;
+        assert!(deserialize_color_response(&body).is_err());
+        let mut body = bytes[4..].to_vec();
+        body[prefix + 4] = 2; // unknown version
+        assert!(deserialize_color_response(&body).is_err());
+        let mut body = bytes[4..].to_vec();
+        body.push(0);
+        assert!(deserialize_color_response(&body).is_err());
+
+        let request = color_request();
+        let prefix = postcard::to_allocvec(&request).unwrap().len();
+        let bytes = serialize_color_request(&request, ColorCapabilities::SDR_ONLY).unwrap();
+        for end in prefix + 1..bytes.len() - 4 {
+            assert!(deserialize_color_request(&bytes[4..4 + end]).is_err());
+        }
+    }
+
+    #[test]
+    fn hdr_rejection_reason_survives_the_handshake() {
+        let body = postcard::to_allocvec(&ControlMessage::SessionRejected {
+            reason: "HDR10 source requires native Wayland presentation".into(),
+        })
+        .unwrap();
+        assert!(
+            matches!(deserialize_color_response(&body), Err(TransportError::SessionError(reason)) if reason.contains("HDR10"))
+        );
+    }
+
+    #[test]
+    fn explicit_hdr_selection_is_not_reinterpreted_as_sdr() {
+        let bytes = serialize_color_response(&color_response(), ColorDescription::HDR10).unwrap();
+        let (_, color) = deserialize_color_response(&bytes[4..]).unwrap();
+        assert_eq!(color, ColorDescription::HDR10);
+        assert!(ColorCapabilities::SDR_ONLY.validate(color).is_err());
+        assert!(
+            ColorCapabilities {
+                sdr: false,
+                hdr10: true
+            }
+            .validate(ColorDescription::SDR_STREAM)
+            .is_err()
+        );
+    }
 
     #[test]
     fn datagram_header_round_trip() {

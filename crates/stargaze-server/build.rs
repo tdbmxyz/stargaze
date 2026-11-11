@@ -19,6 +19,78 @@ fn main() {
 
     emit_ffmpeg_link_flags(&ld_path, &pkg_config_path);
     emit_opus_link_paths(&ld_path, &pkg_config_path);
+    build_wayland_capture_bridge();
+}
+
+fn build_wayland_capture_bridge() {
+    use std::path::{Path, PathBuf};
+
+    println!("cargo:rerun-if-changed=src/capture/wayland_capture.c");
+    println!("cargo:rerun-if-changed=src/capture/wayland_capture.h");
+    let mut build = cc::Build::new();
+    for library in ["wayland-client", "gbm", "libdrm"] {
+        let library =
+            pkg_config::probe_library(library).expect("Wayland capture development files");
+        build.includes(library.include_paths);
+    }
+    pkg_config::Config::new()
+        .atleast_version("1.49")
+        .probe("wayland-protocols")
+        .expect("wayland-protocols >= 1.49 development files");
+    let protocols = pkg_config::get_variable("wayland-protocols", "pkgdatadir")
+        .expect("wayland-protocols pkgdatadir");
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    for (name, xml) in [
+        (
+            "color-management-v1",
+            Path::new(&protocols).join("staging/color-management/color-management-v1.xml"),
+        ),
+        (
+            "ext-image-capture-source-v1",
+            Path::new(&protocols)
+                .join("staging/ext-image-capture-source/ext-image-capture-source-v1.xml"),
+        ),
+        (
+            "ext-foreign-toplevel-list-v1",
+            Path::new(&protocols)
+                .join("staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml"),
+        ),
+        (
+            "ext-image-copy-capture-v1",
+            Path::new(&protocols)
+                .join("staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml"),
+        ),
+        (
+            "linux-dmabuf-v1",
+            Path::new(&protocols).join("stable/linux-dmabuf/linux-dmabuf-v1.xml"),
+        ),
+        (
+            "xx-image-capture-color-management-v1",
+            PathBuf::from("protocols/xx-image-capture-color-management-v1.xml"),
+        ),
+    ] {
+        println!("cargo:rerun-if-changed={}", xml.display());
+        for (mode, suffix) in [
+            ("client-header", "client-protocol.h"),
+            ("private-code", "protocol.c"),
+        ] {
+            let status = std::process::Command::new("wayland-scanner")
+                .arg(mode)
+                .arg(&xml)
+                .arg(out.join(format!("{name}-{suffix}")))
+                .status()
+                .expect("wayland-scanner");
+            assert!(status.success(), "wayland-scanner failed for {name}");
+        }
+        build.file(out.join(format!("{name}-protocol.c")));
+    }
+    build
+        .file("src/capture/wayland_capture.c")
+        .include(&out)
+        .flag_if_supported("-std=c11")
+        .opt_level(2)
+        .warnings(true)
+        .compile("stargaze_wayland_capture");
 }
 
 /// Queries `pkg-config` for `FFmpeg` transitive link flags and emits them.

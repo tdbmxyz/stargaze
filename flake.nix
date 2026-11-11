@@ -64,6 +64,10 @@
       pkgs.pipewire
       pkgs.dbus
       pkgs.SDL2
+      pkgs.wayland
+      pkgs.wayland-protocols
+      pkgs.libdrm
+      pkgs.libgbm
       pkgs.libopus
       pkgs.libclang
       pkgs.llvmPackages.libclang
@@ -74,6 +78,7 @@
     commonNativeBuildInputs = [
       toolchain
       pkgs.pkg-config
+      pkgs.wayland-scanner
     ];
 
     # ── Bindgen / LIBCLANG environment ─────────────────────────────
@@ -91,6 +96,7 @@
       pkgs.pipewire
       pkgs.dbus
       pkgs.SDL2
+      pkgs.wayland
       pkgs.libopus
       pkgs.libglvnd
       pkgs.mesa
@@ -113,6 +119,7 @@
 
       nativeBuildInputs = [
         pkgs.pkg-config
+        pkgs.wayland-scanner
         pkgs.makeWrapper
         pkgs.removeReferencesTo
       ];
@@ -141,6 +148,10 @@
     serverBuildInputs = [
       pkgs.pipewire
       pkgs.dbus
+      pkgs.wayland
+      pkgs.wayland-protocols
+      pkgs.libdrm
+      pkgs.libgbm
     ];
 
     # Client-specific native deps (SDL2 for rendering + audio playback).
@@ -174,6 +185,7 @@
       clientLibs = [
         ffmpegPkg
         sdl2Pkg
+        pkgs.wayland
         pkgs.libopus
         pkgs.libglvnd
         pkgs.mesa
@@ -192,6 +204,10 @@
             buildInputs =
               clientLibs
               ++ [
+                # build.rs queries wayland-protocols.pc; commonBuildInputs is
+                # replaced here, and nativeBuildInputs does not expose it on
+                # the target pkg-config search path.
+                pkgs.wayland-protocols
                 pkgs.libclang
                 pkgs.llvmPackages.libclang
               ];
@@ -326,8 +342,10 @@
             pkgsCuda.cudaPackages.cuda_cudart
             pkgsCuda.cudaPackages.cuda_nvml_dev
             # Runtime kernel compilation (GPU NV12 converter dlopens libnvrtc).
-            # Pinned to CUDA 13 to match cudarc's "cuda-13020" feature.
-            pkgsCuda.cudaPackages_13.cuda_nvrtc
+            # Match cudarc's cuda-13020 AND deployed 595 drivers (CUDA 13.2).
+            # The floating cudaPackages_13 moved to 13.4 and emits PTX the
+            # driver cannot load, silently forcing slow CPU conversion.
+            pkgsCuda.cudaPackages_13_2.cuda_nvrtc
           ];
 
         env =
@@ -347,10 +365,11 @@
               pkgsCuda.pipewire
               pkgsCuda.dbus
               pkgsCuda.SDL2
+              pkgsCuda.wayland
               pkgsCuda.libopus
               pkgsCuda.cudaPackages.cuda_cudart
               pkgsCuda.cudaPackages.cuda_nvml_dev
-              pkgsCuda.cudaPackages_13.cuda_nvrtc
+              pkgsCuda.cudaPackages_13_2.cuda_nvrtc
               pkgsCuda.libglvnd
               pkgsCuda.mesa
             ]
@@ -384,7 +403,7 @@
             pkgs.mesa
             pkgsCuda.cudaPackages.cuda_cudart # libcuda_cudart.so
             pkgsCuda.cudaPackages.cuda_nvml_dev # libnvidia-ml.so
-            pkgsCuda.cudaPackages_13.cuda_nvrtc # libnvrtc.so (GPU NV12 converter)
+            pkgsCuda.cudaPackages_13_2.cuda_nvrtc # Match deployed driver PTX support.
           ];
         libPath = pkgs.lib.makeLibraryPath serverBuildInputs';
         drv = rustPlatform.buildRustPackage (commonPackageAttrs

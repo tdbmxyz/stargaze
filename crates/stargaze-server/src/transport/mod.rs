@@ -365,6 +365,86 @@ mod tests {
         (endpoint, connection)
     }
 
+    async fn negotiate_test_color(
+        color: stargaze_core::color::ColorDescription,
+        caps: Option<stargaze_core::color::ColorCapabilities>,
+    ) -> anyhow::Result<stargaze_core::color::ColorDescription> {
+        let config = ServerConfig {
+            bind_address: "127.0.0.1".into(),
+            port: 0,
+            color,
+            ..ServerConfig::default()
+        };
+        let (_video, video_rx) = mpsc::channel(4);
+        let (_audio, audio_rx) = mpsc::channel(4);
+        let (idr, _idr_rx) = tokio::sync::watch::channel(0_u64);
+        let (bitrate, _bitrate_rx) = tokio::sync::watch::channel(20_u32);
+        let (input, _input_rx) = mpsc::channel(8);
+        let transport = start_server_transport(&config, video_rx, audio_rx, idr, bitrate, input)?;
+        let crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth();
+        let cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+        ));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
+        endpoint.set_default_client_config(cfg);
+        let connection = endpoint
+            .connect(transport.local_addr(), "stargaze-server")?
+            .await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let request = ControlMessage::SessionRequest {
+            width: 1920,
+            height: 1080,
+            framerate: 60,
+            codec: stargaze_core::config::Codec::H265,
+            bitrate_mbps: 0,
+        };
+        let bytes = if let Some(caps) = caps {
+            stargaze_core::transport::serialize_color_request(&request, caps)?
+        } else {
+            serialize_control_message(&request)?
+        };
+        send.write_all(&bytes).await?;
+        let mut length = [0; 4];
+        recv.read_exact(&mut length).await?;
+        let mut body = vec![0; u32::from_le_bytes(length) as usize];
+        recv.read_exact(&mut body).await?;
+        let (_, selected) = stargaze_core::transport::deserialize_color_response(&body)?;
+        connection.close(quinn::VarInt::from_u32(0), b"test finished");
+        Ok(selected)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hdr_negotiation_keeps_sdr_and_rejects_old_peers_clearly() {
+        use stargaze_core::color::{ColorCapabilities as Caps, ColorDescription as Color};
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let run = async {
+            assert_eq!(
+                negotiate_test_color(Color::SDR_STREAM, Some(Caps::HDR10_AND_SDR))
+                    .await
+                    .unwrap(),
+                Color::SDR_STREAM
+            );
+            assert_eq!(
+                negotiate_test_color(Color::HDR10, Some(Caps::HDR10_AND_SDR))
+                    .await
+                    .unwrap(),
+                Color::HDR10
+            );
+            for caps in [None, Some(Caps::SDR_ONLY)] {
+                let error = negotiate_test_color(Color::HDR10, caps).await.unwrap_err();
+                assert!(error.to_string().contains("SDR-only"), "{error}");
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("color negotiation timeout");
+    }
+
     /// Regression test: after a client disconnects, the server must go
     /// back to accepting so a new client can join the running session.
     #[tokio::test(flavor = "multi_thread")]
