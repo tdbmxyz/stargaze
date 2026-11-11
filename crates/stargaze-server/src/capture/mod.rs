@@ -2,6 +2,9 @@ mod color;
 pub mod pipewire;
 pub mod portal;
 mod test_pattern;
+mod wayland;
+#[cfg(test)]
+mod wayland_live_tests;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +19,8 @@ use tracing::{error, info};
 const FRAME_CHANNEL_CAPACITY: usize = 2;
 
 /// Configuration for the capture session.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent source/cursor/transport policy switches.
 pub struct CaptureConfig {
     /// Desired capture width in pixels.
     pub width: u32,
@@ -28,6 +32,14 @@ pub struct CaptureConfig {
     pub require_color_metadata: bool,
     /// Optional explicitly selected producer on the user's `PipeWire` instance.
     pub node_id: Option<u32>,
+    /// Direct color-managed image-copy capture of this named Wayland output.
+    pub wayland_output: Option<String>,
+    /// Explicit RGB10 SHM diagnostic path instead of DMA-BUF allocation.
+    pub wayland_shm: bool,
+    /// Request a genuine SDR compositor rendering instead of selecting PQ.
+    pub wayland_sdr: bool,
+    /// Upper bound on direct capture requests; zero uses 60 fps.
+    pub wayland_framerate: u32,
     /// Generate an HDR10 diagnostic source at this frame rate, without a portal.
     pub hdr_test_pattern: Option<u32>,
     /// Optional authoritative static HDR source metadata.
@@ -43,37 +55,37 @@ pub struct CaptureFormat {
 
 /// Handle to a running capture session.
 ///
-/// Signals the `PipeWire` thread to shut down on drop.
+/// Signals the capture thread to shut down on drop.
 /// The caller must keep this alive for the duration of capture.
 pub struct CaptureSession {
-    /// Join handle for the dedicated `PipeWire` thread.
+    /// Join handle for the dedicated capture thread.
     thread_handle: Option<thread::JoinHandle<()>>,
-    /// Shared flag to signal the `PipeWire` thread to stop.
+    /// Shared flag to signal the capture thread to stop.
     shutdown: Arc<AtomicBool>,
 }
 
 impl CaptureSession {
-    /// Gracefully stops the capture session and waits for the `PipeWire` thread to exit.
+    /// Gracefully stops the capture session and waits for the capture thread to exit.
     ///
     /// # Errors
     ///
-    /// Returns `CaptureError::PipeWireError` if the `PipeWire` thread panicked.
+    /// Returns `CaptureError::PipeWireError` if the capture thread panicked.
     pub fn stop(mut self) -> Result<(), CaptureError> {
         self.signal_shutdown();
         self.join_thread()
     }
 
-    /// Signals the `PipeWire` thread to shut down.
+    /// Signals the capture thread to shut down.
     fn signal_shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
     }
 
-    /// Joins the `PipeWire` thread, returning any error.
+    /// Joins the capture thread, returning any error.
     fn join_thread(&mut self) -> Result<(), CaptureError> {
         if let Some(handle) = self.thread_handle.take() {
             handle
                 .join()
-                .map_err(|_| CaptureError::PipeWireError("PipeWire thread panicked".to_string()))?;
+                .map_err(|_| CaptureError::PipeWireError("Capture thread panicked".to_string()))?;
         }
         Ok(())
     }
@@ -89,7 +101,10 @@ impl Drop for CaptureSession {
     }
 }
 
-/// Starts screen capture via xdg-desktop-portal and `PipeWire`.
+/// Starts capture from the selected source (portal/`PipeWire` by default).
+///
+/// Direct Wayland capture and the diagnostic source bypass the portal when
+/// explicitly selected. They report their acknowledged source color and geometry.
 ///
 /// Performs the portal handshake asynchronously (D-Bus), then spawns a
 /// dedicated thread for the `PipeWire` main loop. Returns a session handle,
@@ -115,8 +130,16 @@ pub async fn start_capture(
     ),
     CaptureError,
 > {
+    if config.wayland_output.is_some() {
+        if config.node_id.is_some() || config.hdr_test_pattern.is_some() {
+            return Err(CaptureError::NegotiationError(
+                "direct Wayland capture conflicts with PipeWire/test-pattern sources".into(),
+            ));
+        }
+        return wayland::start(config);
+    }
     if let Some(framerate) = config.hdr_test_pattern {
-        return test_pattern::start(config, framerate);
+        return test_pattern::start(&config, framerate);
     }
     // An explicit producer must describe its color; it is not the known
     // Hyprland/XDPH sRGB-copy contract.

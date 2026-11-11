@@ -42,6 +42,124 @@ An HDR producer with HDR disabled is rejected before encoder creation, not
 truncated or relabeled as SDR. The existing Hyprland portal remains a genuinely
 SDR source with either setting.
 
+### Private Hyprland fork: direct color-managed desktop capture
+
+The private Hyprland v0.57.2 fork implements the default-off experimental
+`xx-image-capture-color-management-v1` extension. With that fork running on an
+**explicitly selected isolated socket**, select direct capture instead of the
+portal:
+
+```sh
+stargaze-server --wayland-output Main --port 9003 --framerate 60 --bitrate 80
+# Explicit precision-preserving CPU-memory diagnostic path:
+stargaze-server --wayland-output Main --wayland-shm --port 9003
+# Request genuine compositor-rendered sRGB instead of PQ:
+stargaze-server --wayland-output Main --use-hdr false --port 9003
+```
+
+This does not install/restart a compositor or enable its extension. The regular
+portal backend stays the default SDR path. Direct capture requires the fork's
+opt-in and the exact vendored experimental XML (wayland-protocols commit
+`aa62366fb800a0689f4e9de83811ff33f6a91f44`). An unsupported compositor, unknown
+output, failed allocation or permission denial stops capture; there is no silent
+portal/SDR fallback. `--wayland-output` conflicts with `--pipewire-node` and
+`--hdr-test-pattern`; `--wayland-shm` requires an output selector.
+
+A preferred BT.2020/PQ source description selects a **requested encoding**, not
+an assumed pixel interpretation. The backend creates an acknowledged parametric
+description and applies it to every frame before capture. It delivers only
+XBGR2101010 with that immutable color/geometry contract. Source loss, geometry
+or preferred-color changes stop the fixed-mode pipeline for a restart.
+`--use-hdr false` specifically requests sRGB from the compositor: unlike the
+strict PipeWire producer path, the compositor can render a genuine SDR export.
+HDR peers are still required for an HDR source; existing rejection rules apply.
+Static mastering/content-light metadata is not invented from output hints.
+
+The capture thread owns all Wayland/GBM wrappers. Every delivered DMA-BUF has
+independent storage and a transferred owned FD, valid even after capture stops.
+It is never reused while encoding. SHM is explicitly requested and copied into
+owned RGB10 memory. Capture pacing bounds request starts rather than adding a
+whole frame period after rendering. Per-frame allocation is correctness-first; storage is not pooled or reused.
+The isolated capture-to-encode measurements below are not end-to-end transport
+or client-display results.
+
+Fresh isolated RTX 3090 tests against the packaged fork pass: all 1,024 neutral
+and R/G/B SHM ramp values, real DMA-BUF → EGL/GL/CUDA → Main10, retained buffers
+encoded after capture shutdown, decoded PQ/BT.2020 and >8-bit gradients, SDR
+opt-out, full-channel shutdown, and unsupported-compositor rejection. The
+wrapped server Nix package builds and rejects an unknown output cleanly.
+Workspace fmt/check and all-target pedantic Clippy have no new capture/build
+diagnostics (existing warnings remain); nextest passes **287 tests, 34 skipped**.
+Logs: `/tmp/stargaze-wayland-final-quality.log`,
+`/tmp/stargaze-wayland-fresh-live.log`, and
+`/tmp/stargaze-wayland-unsupported.log`. The lab was stopped. This is reference
+fixture validation, not a deployed peer/display or sustained-throughput test.
+
+Reproduce using `/projects/Hyprland/debug-tools/hdr-capture/README.md`. Native
+fixtures contain bright highlights: use only their private headless lab, never
+the physical desktop. With its `lab.env` exported, run:
+
+```sh
+nix develop .#cuda -c cargo test -p stargaze-server wayland_native_rgb10_desktop -- --ignored
+nix develop .#cuda -c cargo test -p stargaze-server wayland_desktop_ -- --ignored --nocapture
+```
+
+#### Sustained validation and non-visual comparisons
+
+Unsigned local commits are authorized pending later rebasing/signing. Compositor
+`b9df23ef7` and server `42036cd` build as exact local Git pins. The revised SDR
+fixture/comparison helpers are at Hyprland `927759f52`, compiled locally; the
+compositor rendering code is unchanged by that helper commit.
+
+At 3440×1440, two-minute native RGB10 capture → independent DMA-BUF → NVENC
+Main10 delivered **144.99 fps** (17,399 frames), stable 76 FDs, and 688 KiB RSS
+growth. Anchoring deadlines to scheduled phase instead of actual wake-up time
+removed accumulated jitter (previously 143.88 fps). Missed slots are discarded
+without catch-up bursts. SHM remained correct but delivered only **51.49 fps**
+for a minute. The native decoded frame's full-raster PSNR against the RGB10 →
+BT.2020-NCL reference was 76.64/83.13/86.92 dB Y/U/V.
+
+A 4K/25-fps photographic AV1 PQ demo in **Vulkan mpv** selected an FP16
+pass-through swapchain and a ready BT.2020/PQ Wayland description. This avoids
+the earlier OpenGL eight-bit source limitation. Its mixed 1080p HDR image plus
+an independent sRGB white/gray window matched raw SHM/real DMA-BUF exactly;
+background and 160-nit SDR mapping matched every pixel. Main10 software decode
+measured **59.14/59.55/59.84 dB Y/U/V PSNR**, p99 error three ten-bit codes, with
+identical raw captures before/after encoding. Tone-mapped reference/decoded PNGs
+were also inspected. The demo labels its authored variants Synthetic_SDR and
+Synthetic_HDR: do not call it native-camera HDR or game validation.
+
+Playing that application at 3440×1440 delivered **144.67 capture/encode fps for
+60 seconds**, stable FDs, and approximately 10 MiB RSS growth, even with a Nix
+server build sharing the CPU. The underlying application is 25 fps, not 145
+unique frames. The native paced measurement had no competing build. Source
+resize, HDR→SDR output change and removal stop capture cleanly; moving an SDR
+window to a private SDR output and back restores the expected scene exactly.
+
+The ignored `wayland_capture_encode_endurance` test accepts
+`STARGAZE_TEST_SECONDS` (5–600, default 60), `STARGAZE_TEST_FPS` (default 145),
+`STARGAZE_TEST_SHM=1`, and `STARGAZE_TEST_NATIVE=0` for arbitrary content.
+`STARGAZE_TEST_REPORT` selects JSON output, with final `.hevc`/`.yuv` artifacts.
+It preserves production's infinite GOP, requesting only one recovery IDR near
+the end and retaining that short suffix for offline software validation. An
+initial harness that retained the whole infinite GOP falsely grew RSS; bounded
+retention fixes the test without changing production GOP policy.
+
+`wayland_capture_source_changes` mutates only a validated private lab; run it
+alone. Both tests require the lab marker, private runtime/socket, and matching
+IPC lock. No physical display, deployment, audio capture, or service restart is
+involved. Host packet timing is not complete scene-render/encoder/network/display
+latency. Minute-scale stability is not an hours-long soak test.
+
+Reproduction and durable numerical record:
+`/projects/Hyprland/debug-tools/hdr-capture/README.md` and
+`debug-tools/hdr-capture/validation/2026-11-10.json` in that repository. Temporary
+images: `/tmp/hh.AKRpkT/vulkan-reference-sdr.png` and `vulkan-encode-sdr.png`.
+Both continuation labs are stopped. Remaining gates are native-camera/game
+content, device migration, long soaks, transport/loss/reconnects, and AMD client
+presentation. Final deployment pins must be rebuilt after rebasing/signing;
+deployment still requires separate approval.
+
 ### Native HDR diagnostic stream
 
 This is an explicit HDR source, **not desktop capture**. It contains absolute-PQ
@@ -218,9 +336,9 @@ The deeper implementation audit establishes why: Hyprland 0.57's
 `ScreenshareFrame::beginCopy` and shared-memory copy explicitly assign
 `DEFAULT_SRGB_IMAGE_DESCRIPTION`; XDPH `build_format`/`fixate_format` does not
 forward SPA color fields. The wlr-screencopy protocol itself has no HDR color
-contract. This branch does not patch/restart Hyprland or falsely call that SDR
-copy native HDR capture. A future compositor/producer preserving HDR can use the
-strict node input; the native media/presentation pipeline is already implemented.
+contract. This historical audit describes the deployed portal, not the opt-in private
+fork/direct backend documented above. No test replaces or restarts the deployed
+Hyprland, and its SDR copy is never called native HDR capture.
 
 ### Installed-stack re-audit during the handoff
 
@@ -290,9 +408,10 @@ HDR, retain a genuine sRGB export for SDR/opt-out, and associate color/geometry
 changes with the correct buffers. A global change making legacy screenshares
 PQ is not acceptable. Build and test that stack in an isolated session before
 considering replacing zeus's compositor: restarting the current desktop would
-interrupt the deployment on port 9002. No compositor patch or HDR desktop
-capture implementation is included yet; this remains active work in
-`plans/hdr-safe-streaming.md`.
+interrupt the deployment on port 9002. That installed-stack audit preceded the private fork. The direct backend above
+now implements reference-validated HDR desktop capture only when the patched
+compositor and its extension are explicitly selected; it has not been deployed.
+Active integration work is tracked in `plans/wayland-hdr-capture.md`.
 
 References:
 
@@ -326,8 +445,10 @@ SDR Hyprland portal, or a guarantee of 3440×1440/145-fps sustained HDR throughp
 Visual/reference-meter calibration and a live HDR desktop producer remain
 separate validation tasks. Do not mistake an SDR sharing copy for HDR content.
 
-Builds now require libwayland-client, wayland-scanner and wayland-protocols with
-color-management-v1 (>=1.41). Nix supplies them for dev shells/packages.
+Builds require libwayland-client and wayland-scanner. The server additionally
+requires GBM, libdrm, and wayland-protocols >=1.49 (including color-management-v1
+references and image-copy capture); the client requires color-management-v1
+(>=1.41). Nix supplies these dependencies for dev shells/packages.
 `mkStargazeClient` explicitly includes wayland-protocols in its actual
 `buildInputs` (for both normal and portable clients): that derivation replaces
 the shared inputs, and placing it only in native inputs did not expose
@@ -337,7 +458,8 @@ loader/driver paths remain pinned together for the client. NVRTC stays pinned to
 CUDA 13.2: floating CUDA 13.4 produced PTX the deployed driver could not load,
 which otherwise silently forced CPU conversion.
 
-Current handoff validation on zeus: formatting and workspace check pass;
+Earlier media-path handoff validation on zeus (before the direct backend):
+formatting and workspace check pass;
 all-target pedantic Clippy has no new diagnostic categories/files against
 `b7904f6` (pre-existing warnings remain); workspace nextest passes **282 tests,
 28 skipped**. NVIDIA Main10/static-metadata round trip, CPU/GPU HDR conversion,

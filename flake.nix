@@ -66,6 +66,8 @@
       pkgs.SDL2
       pkgs.wayland
       pkgs.wayland-protocols
+      pkgs.libdrm
+      pkgs.libgbm
       pkgs.libopus
       pkgs.libclang
       pkgs.llvmPackages.libclang
@@ -146,6 +148,10 @@
     serverBuildInputs = [
       pkgs.pipewire
       pkgs.dbus
+      pkgs.wayland
+      pkgs.wayland-protocols
+      pkgs.libdrm
+      pkgs.libgbm
     ];
 
     # Client-specific native deps (SDL2 for rendering + audio playback).
