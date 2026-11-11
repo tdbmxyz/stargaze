@@ -40,6 +40,23 @@ stargaze-server --resolution 2560x1440 --framerate 120 --bitrate 40
 stargaze-server --config /path/to/server.toml
 ```
 
+Hyprland/XDPH's audited sRGB sharing copy works by default, including on a
+permanently HDR client. Actual HDR10 sources select Main10/P010 automatically:
+use `--wayland-output Main` for direct color-managed desktop capture with the
+supported personal Hyprland fork and its opt-in experimental extension,
+`--pipewire-node NODE_ID` for a color-described full-range BT.2020/PQ RGB10
+producer, or `--hdr-test-pattern` for diagnostic luminance bars/gradients.
+`--hdr-metadata source.toml` adds authoritative source mastering/light metadata;
+it never forces HDR on an SDR source. `--strict-capture-color` opts out of the
+known Hyprland sRGB-copy contract. `--use-hdr false` (or `use_hdr = false` in
+`server.toml`) requests a genuine compositor-rendered SDR export on the direct
+Wayland backend and rejects HDR-only PipeWire/test-pattern sources instead of
+relabeling them. `--wayland-shm` explicitly selects the slower precision-preserving
+CPU-memory capture path for diagnostics. There is no implicit application
+HDR→SDR tone mapper, silent portal fallback or compositor-setting change.
+The direct desktop HDR path has been tested in real NVIDIA → AMD streaming.
+See [HDR usage and hardware evidence](../../docs/hdr-streaming.md).
+
 Configuration file: `~/.config/stargaze/server.toml` (CLI flags override file values; see the [root README](../../README.md#usage) for the format).
 
 ## Tests

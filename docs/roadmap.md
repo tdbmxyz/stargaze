@@ -43,11 +43,32 @@ with CPU frames.
 
 ### 10-bit Display Formats
 
-Systems running 10-bit color depth (e.g. Hyprland with `misc:screen_bit_depth = 10`) expose 10-bit DRM formats (`xBGR2101010`, `ABGR2101010`) through the portal. Stargaze accepts these formats and converts to 8-bit in the encode pipeline.
+Bit depth does not identify HDR or color space. The single-user NVIDIA→AMD path
+now supports native Main10/P010 BT.2020/PQ streaming and an explicitly described
+10-bit Wayland surface, including precision-preserving DMA-BUF and CPU paths.
+Hyprland's ordinary portal still renders an sRGB sharing copy; its known SDR
+contract works by default, while explicit PipeWire node capture requires
+metadata. Native desktop capture is implemented with `--wayland-output Main`
+and the personal Hyprland fork's opt-in experimental color-management extension.
+The NVIDIA → AMD desktop stream has been tested in a real session; isolated
+capture-to-Main10 sustained 144.99 fps at 3440×1440 for two minutes.
 
-If capture still fails with `no more input formats`, check your compositor:
-- **Hyprland ≥ v0.43**: `misc:screencopy_force_8b = true` (enabled by default) forces the portal to expose 8-bit formats only.
-- **Older Hyprland**: Set `misc:screen_bit_depth = 8` in `hyprland.conf`.
+See [HDR usage, source limitations and hardware evidence](hdr-streaming.md).
+Remaining work:
+
+- Hours-long capture/transport/decode/presentation soaks, controlled native HDR
+  game/camera comparisons, loss/reconnect stress and device migration. The short
+  user session and isolated throughput result are not panel-luminance or
+  glass-to-glass latency measurements.
+- Seamless source SDR/HDR and geometry changes. The current immutable contract
+  stops capture safely for a supervisor restart and fresh negotiation.
+- Startup keyframe readiness and decoder-backpressure/recovery diagnostics;
+  clearer HDR rejection messages for older SDR-only peers.
+- Correct encode timing statistics before drawing performance conclusions from
+  near-zero reported encode time.
+- An optional real application HDR→SDR tone/gamut mapper. Direct capture can
+  request genuine compositor-rendered sRGB; HDR-only producer input is otherwise
+  rejected, never truncated or relabelled. Keep desktop HDR/calibration unchanged.
 
 ## 3. Latency Measurement
 

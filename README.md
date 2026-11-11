@@ -9,7 +9,8 @@ Stargaze streams a Wayland desktop from a host machine (the **server**) to anoth
 
 ## Features
 
-- **Video**: PipeWire screen capture (DMA-BUF zero-copy or CPU path) → NVENC H.265 → QUIC → VAAPI or multi-threaded software decode → SDL2
+- **Video**: PipeWire or direct color-managed Wayland capture (DMA-BUF or CPU path) → NVENC H.265 → QUIC → VAAPI or multi-threaded software decode → SDL2/OpenGL
+- **Native HDR10**: explicit BT.2020/PQ capture → Main10/P010 → ten-bit color-managed Wayland presentation, with precision-preserving CPU fallbacks and HDR static metadata. Direct desktop HDR requires the [personal Hyprland fork and opt-in capture extension](docs/hdr-streaming.md#private-hyprland-fork-direct-color-managed-desktop-capture); the ordinary portal remains SDR.
 - **Audio**: PipeWire capture → Opus (stereo by default; mono/5.1/7.1 selectable, 48 kHz) → SDL2 playback. Surround is opt-in on the server (`audio_channels`) and advertised to the client in the handshake — see [docs/surround-audio.md](docs/surround-audio.md)
 - **Input**: keyboard, mouse, and game controller events forwarded from the client and injected on the server via uinput. Controllers are passed through at the evdev level — the host sees the real device (name, vendor/product ids, exact button/axis layout) — with automatic per-device fallback to Xbox 360 pad emulation (`--gamepad-passthrough false` forces emulation). Known Valve controller USB hardware (original and 2026 Steam Controllers and receivers, plus opt-in Steam Deck controls) is forwarded wholesale as a USB device — USB/IP tunneled through the session connection — because Steam only accepts it with its real USB topology; needs a one-time permission setup, see [docs/steam-controller-usbip.md](docs/steam-controller-usbip.md)
 - **Mic forwarding** (optional): client microphone streamed back to the server via an [rsonance](https://github.com/tdbmxyz/rsonance) subprocess
@@ -108,6 +109,20 @@ stargaze-server --resolution 2560x1440 --framerate 60 --bitrate 20
 # Headless host (no display to approve the dialog)? See
 # docs/headless-screencast.md for an auto-approving portal setup.
 ```
+
+The client desktop can stay permanently HDR with its calibration unchanged.
+Stargaze supports native Main10/P010 HDR10 from a color-described BT.2020/PQ
+source, with a real 10-bit color-managed Wayland surface. Hyprland 0.57's portal
+currently supplies an sRGB sharing copy: that desktop correctly stays an SDR
+stream, without a mandatory override. With the supported Hyprland fork and its
+experimental capture extension enabled, `--wayland-output Main` captures the
+color-described desktop directly and selects SDR or HDR from the source.
+`--use-hdr false` requests a genuine compositor-rendered SDR export on that
+backend; there is no implicit application tone mapper. `--hdr-test-pattern`
+provides a diagnostic HDR source, and `--pipewire-node NODE_ID` accepts an
+explicitly color-described producer. The NVIDIA → AMD native HDR desktop path
+has been tested in a real streaming session.
+See [HDR usage, source limitations and hardware evidence](docs/hdr-streaming.md).
 
 On the client machine, just launch `stargaze-client` (from the desktop
 menu or a terminal): a gamepad/touch-friendly launcher opens where you

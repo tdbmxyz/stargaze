@@ -258,6 +258,11 @@ impl CanvasBackend {
         let wanted_format = match &frame.pixels {
             FramePixels::I420 { .. } => sdl2::pixels::PixelFormatEnum::IYUV,
             FramePixels::Nv12 { .. } => sdl2::pixels::PixelFormatEnum::NV12,
+            FramePixels::P010 { .. } => {
+                return Err(anyhow!(
+                    "HDR P010 requires the color-managed GL backend; no SDR canvas fallback"
+                ));
+            }
         };
 
         static RENDER_DIAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -288,6 +293,9 @@ impl CanvasBackend {
 
         let y_pitch = frame.width as usize;
         match &frame.pixels {
+            FramePixels::P010 { .. } => {
+                return Err(anyhow!("HDR cannot be uploaded to an SDR canvas"));
+            }
             FramePixels::I420 { y, u, v } => {
                 tex.update_yuv(None, y, y_pitch, u, y_pitch / 2, v, y_pitch / 2)
                     .map_err(|e| anyhow!("texture update failed: {e}"))?;
@@ -402,6 +410,8 @@ pub(super) fn run_sdl_loop(
     let max_queued_audio_bytes = super::audio::max_queued_audio_bytes(audio_channels);
     let audio_bytes_per_ms = super::audio::audio_bytes_per_ms(audio_channels);
 
+    info!(stream_color = ?config.color, presentation = if config.color.is_hdr10() { "10-bit BT.2020/PQ Wayland surface" } else { "SDR sRGB/default surface" },
+        native_hdr = config.color.is_hdr10(), "Presentation color mode; compositor controls SDR luminance on HDR outputs");
     // The stream is BT.709 limited range (the server's converter and the
     // encoder both advertise it). SDL's automatic mode picks BT.601 —
     // sdl2-compat does so even for HD — which subtly shifts every color.
@@ -435,10 +445,22 @@ pub(super) fn run_sdl_loop(
     // Hardware decode → GL renderer (it can import the decoder's dma-bufs
     // directly); software decode → SDL canvas. If the GL renderer can't
     // start, clear the zero-copy flag so the decoder ships CPU frames.
-    let mut backend = if zero_copy.load(Ordering::Relaxed) {
-        match GlRenderer::new(&video, config.width, config.height, fullscreen, false) {
+    let mut backend = if zero_copy.load(Ordering::Relaxed) || config.color.is_hdr10() {
+        match GlRenderer::new_color(
+            &video,
+            config.width,
+            config.height,
+            fullscreen,
+            false,
+            config.color,
+        ) {
             Ok(gl) => Backend::Gl(gl),
             Err(e) => {
+                if config.color.is_hdr10() {
+                    return Err(
+                        e.context("HDR presentation initialization failed (no SDR fallback)")
+                    );
+                }
                 warn!("GL renderer unavailable ({e}), using SDL canvas rendering");
                 zero_copy.store(false, Ordering::Relaxed);
                 Backend::Canvas(CanvasBackend::new(&video, config, fullscreen)?)
@@ -766,6 +788,7 @@ pub(super) fn run_sdl_loop(
     if let Some(path) = stats_file {
         let meta = ReportMeta {
             video: &video_desc,
+            color: config.color,
             server_command: &commands.server,
             client_command: &commands.client,
         };

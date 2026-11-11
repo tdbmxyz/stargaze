@@ -239,6 +239,8 @@ fn summarize(values: &[f64], worst_is_high: bool) -> Option<Summary> {
 
 /// Session-identifying metadata printed at the top of the report.
 pub(super) struct ReportMeta<'a> {
+    /// Negotiated stream description, not the desktop's output HDR state.
+    pub(super) color: stargaze_core::color::ColorDescription,
     /// Session geometry string (e.g. "3440x1440").
     pub(super) video: &'a str,
     /// Server command line, sanitized of addresses and ports.
@@ -310,6 +312,24 @@ impl StatsRecorder {
         let _ = writeln!(out, "Stargaze client session report");
         let _ = writeln!(out, "==============================");
         let _ = writeln!(out, "video:             {}", meta.video);
+        let _ = writeln!(out, "stream color:      {:?}", meta.color);
+        let _ = writeln!(
+            out,
+            "presentation:      {}",
+            if meta.color.is_hdr10() {
+                "10-bit BT.2020/PQ Wayland surface (native HDR10)"
+            } else {
+                "SDR sRGB/default surface; compositor output mapping"
+            }
+        );
+        let _ = writeln!(
+            out,
+            "HDR fallback:      reject unsupported mode (no application tone/gamut mapper)"
+        );
+        let _ = writeln!(
+            out,
+            "source color:      see server capture metadata logs; never inferred from output"
+        );
         let _ = writeln!(out, "server command:    {}", meta.server_command);
         let _ = writeln!(out, "client command:    {}", meta.client_command);
         let _ = writeln!(out, "duration:          {duration:.1} s");
@@ -593,6 +613,7 @@ mod tests {
         let n = net(10_000_000, 60, 5);
         let meta = ReportMeta {
             video: "3440x1440",
+            color: stargaze_core::color::ColorDescription::SDR_STREAM,
             server_command: "stargaze-server --preset p1",
             client_command: "stargaze-client --fullscreen true",
         };
@@ -600,6 +621,8 @@ mod tests {
 
         assert!(report.contains("Stargaze client session report"));
         assert!(report.contains("video:             3440x1440"));
+        assert!(report.contains("stream color:"));
+        assert!(report.contains("HDR fallback:      reject"));
         assert!(report.contains("server command:    stargaze-server --preset p1"));
         assert!(report.contains("client command:    stargaze-client --fullscreen true"));
         assert!(report.contains("frames received:   60"));
@@ -669,6 +692,7 @@ mod tests {
         let path = dir.join("report.txt");
         let meta = ReportMeta {
             video: "1x1",
+            color: stargaze_core::color::ColorDescription::LEGACY_SDR,
             server_command: "stargaze-server",
             client_command: "stargaze-client",
         };

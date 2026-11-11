@@ -1,5 +1,5 @@
 # CI: format, lint, and test on every push/PR to the long-lived
-# branches (Git flow: develop = integration, main = releases).
+# branches (develop = integration, main = releases).
 #
 # Hardware-dependent tests (NVENC, uinput, live compositor) are
 # #[ignore]d and do not run here — a green suite is not hardware
@@ -9,6 +9,7 @@ name: ci
 on:
   push:
     branches: [main, develop]
+  workflow_dispatch:
   pull_request:
     branches: [main, develop]
 
