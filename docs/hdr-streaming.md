@@ -411,7 +411,8 @@ considering replacing zeus's compositor: restarting the current desktop would
 interrupt the deployment on port 9002. That installed-stack audit preceded the private fork. The direct backend above
 now implements reference-validated HDR desktop capture only when the patched
 compositor and its extension are explicitly selected; it has not been deployed.
-Active integration work is tracked in `plans/wayland-hdr-capture.md`.
+The direct backend is integrated into `feature/hdr-safe-streaming`; remaining
+deployment/end-to-end work is tracked in `plans/hdr-safe-streaming.md`.
 
 References:
 
